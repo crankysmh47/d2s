@@ -87,3 +87,29 @@ def validate_permutation(permutation: Tensor, intermediate_size: int) -> Tensor:
     if torch.unique(permutation).numel() != intermediate_size:
         raise ValueError("permutation must contain each index exactly once")
     return permutation.detach().to(dtype=torch.long).clone()
+
+
+def permute_swiglu_parameters(
+    parameters: SwiGLUParameters,
+    permutation: Tensor,
+) -> SwiGLUParameters:
+    """Return a new parameter bundle with every neuron axis permuted together."""
+
+    indices = validate_permutation(
+        permutation,
+        parameters.intermediate_size,
+    ).to(device=parameters.gate_weight.device)
+
+    def _permute_bias(bias: Tensor | None) -> Tensor | None:
+        return None if bias is None else bias.index_select(0, indices).clone()
+
+    return SwiGLUParameters(
+        gate_weight=parameters.gate_weight.index_select(0, indices).clone(),
+        up_weight=parameters.up_weight.index_select(0, indices).clone(),
+        down_weight=parameters.down_weight.index_select(1, indices).clone(),
+        gate_bias=_permute_bias(parameters.gate_bias),
+        up_bias=_permute_bias(parameters.up_bias),
+        down_bias=(
+            None if parameters.down_bias is None else parameters.down_bias.clone()
+        ),
+    )

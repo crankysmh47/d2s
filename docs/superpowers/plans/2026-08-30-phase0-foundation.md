@@ -222,7 +222,7 @@ git commit -m "feat: validate SwiGLU neuron parameters"
 - Consumes: `SwiGLUParameters`, plus a validated permutation.
 - Produces: `permute_swiglu_parameters(parameters: SwiGLUParameters, permutation: Tensor) -> SwiGLUParameters`.
 
-- [ ] **Step 1: Write the failing equivalence and non-mutation tests**
+- [x] **Step 1: Write the failing equivalence and non-mutation tests**
 
 ```python
 import torch
@@ -258,23 +258,23 @@ def test_permuting_all_three_neuron_axes_preserves_output_and_inputs():
     torch.testing.assert_close(permuted.down_bias, parameters.down_bias)
 ```
 
-- [ ] **Step 2: Observe RED**
+- [x] **Step 2: Observe RED**
 
 Run: `uv run pytest tests/test_permutation.py -v`
 
 Expected: import fails because `permute_swiglu_parameters` does not exist.
 
-- [ ] **Step 3: Implement consistent, non-mutating indexing**
+- [x] **Step 3: Implement consistent, non-mutating indexing**
 
 Use `index_select(0, permutation)` for gate/up weights and biases, `index_select(1, permutation)` for the down weight, and clone the unpermuted down bias. Return a new `SwiGLUParameters` object.
 
-- [ ] **Step 4: Observe GREEN and run the bootstrap regression**
+- [x] **Step 4: Observe GREEN and run the bootstrap regression**
 
 Run: `uv run pytest tests/test_neuron_triplet.py tests/test_permutation.py -v`
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Log and commit**
+- [x] **Step 5: Log and commit**
 
 ```powershell
 git add src/ppmoe/moefication/neuron.py tests/test_permutation.py PROJECT_LOG.md

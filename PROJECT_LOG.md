@@ -59,3 +59,12 @@ This file is an append-only record of material project actions, decisions, verif
   - matrix result contained only finite values
 - Transformers resolved to `5.16.1`; pytest resolved to `8.4.2`.
 - Next gate: complete-neuron permutation must preserve FP32 output and leave source tensors unchanged.
+
+### 11:20 PKT — Task 2 neuron-triplet permutation
+
+- RED: `uv run pytest tests/test_permutation.py -v` failed during collection because `permute_swiglu_parameters` was absent.
+- Implemented a non-mutating permutation that applies one validated order to gate rows, up rows, and down columns; gate/up biases move with neuron indices and the down bias is cloned without permutation.
+- GREEN regression: `uv run pytest tests/test_neuron_triplet.py tests/test_permutation.py -v` passed 12 tests in 2.44 seconds.
+- Seed 7 FP32 measurement: maximum absolute output difference `1.90734863e-06`; relative L2 error `7.84195393e-08`.
+- Source tensor non-mutation, requested index order, absent-bias behavior, and output equivalence are covered by tests.
+- Next gate: balanced partitions must be complete/disjoint and all-expert execution must match the dense FFN with the down bias added exactly once.
