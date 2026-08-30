@@ -118,3 +118,17 @@ This file is an append-only record of material project actions, decisions, verif
 - Full non-CUDA regression: 35 tests passed in 1.40 seconds.
 - Covered distinct token-wise selections, exact zero error, lexicographic ties, all-expert error, invalid K, and incompatible shapes.
 - Next gate: Gram-form scoring must return the identical subsets and errors, including an explicit cancellation case.
+
+### 11:45 PKT — Task 7 Gram exact oracle
+
+- RED: `uv run pytest tests/test_gram_oracle.py -v` failed because `exact_gram_oracle` was absent.
+- Implemented the expanded objective `||t||^2 - 2 m^T E^T t + m^T E^T E m`; subset selection uses unclamped scores and only the returned selected error is clamped for tiny negative roundoff.
+- GREEN oracle regression: 9 tests passed in 1.43 seconds, including explicit expert cancellation and lexicographic ties.
+- Seed 23 direct-versus-Gram evidence:
+  - K=1: subsets identical, maximum error delta `7.62939453e-06`
+  - K=2: subsets identical, maximum error delta `7.62939453e-06`
+  - K=4: subsets identical, maximum error delta `1.23977661e-05`
+  - K=8: subsets identical, maximum error delta `9.60961916e-06`
+- Full non-CUDA regression: 38 tests passed in 1.44 seconds.
+- The small objective deltas are FP32 algebra/accumulation-order effects; subset choices remained identical for all seeded cases.
+- Next gate: generate deterministic JSON Phase 0 reports and compare native BF16 versus FP32 expert accumulation on CUDA.

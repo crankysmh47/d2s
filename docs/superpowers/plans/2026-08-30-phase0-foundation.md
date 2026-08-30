@@ -628,7 +628,7 @@ git commit -m "feat: add fixed-K direct oracle"
 - Consumes: the same tensors and `k` as `exact_direct_oracle`.
 - Produces: `exact_gram_oracle(target: Tensor, expert_outputs: Tensor, k: int) -> OracleResult`.
 
-- [ ] **Step 1: Write failing randomized agreement and cancellation tests**
+- [x] **Step 1: Write failing randomized agreement and cancellation tests**
 
 ```python
 import torch
@@ -654,23 +654,23 @@ def test_gram_oracle_accounts_for_expert_cancellation():
     assert result.subsets.tolist() == [[0, 1]]
 ```
 
-- [ ] **Step 2: Observe RED**
+- [x] **Step 2: Observe RED**
 
 Run: `uv run pytest tests/test_gram_oracle.py -v`
 
 Expected: import failure because `exact_gram_oracle` is missing.
 
-- [ ] **Step 3: Implement the Gram objective**
+- [x] **Step 3: Implement the Gram objective**
 
 For every token calculate `target_norm = t^T t`, `target_expert = t^T e_i`, and `expert_gram = e_i^T e_j`. For subset indicator `m`, score `target_norm - 2*m^T*target_expert + m^T*expert_gram*m`. Clamp only tiny negative roundoff in the returned error to zero; never clamp values before subset selection.
 
-- [ ] **Step 4: Observe GREEN and run oracle regressions**
+- [x] **Step 4: Observe GREEN and run oracle regressions**
 
 Run: `uv run pytest tests/test_oracle_bruteforce.py tests/test_gram_oracle.py -v`
 
 Expected: direct and Gram subsets agree for every seeded case.
 
-- [ ] **Step 5: Log interaction evidence and commit**
+- [x] **Step 5: Log interaction evidence and commit**
 
 ```powershell
 git add src/ppmoe/oracle/exact.py tests/test_gram_oracle.py PROJECT_LOG.md

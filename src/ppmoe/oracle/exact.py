@@ -75,3 +75,49 @@ def exact_direct_oracle(
         subsets=combination_indices.index_select(0, best_combination),
         squared_errors=errors[token_indices, best_combination],
     )
+
+
+def exact_gram_oracle(
+    target: Tensor,
+    expert_outputs: Tensor,
+    k: int,
+) -> OracleResult:
+    """Choose each token's best K experts using the expanded Gram objective."""
+
+    _, num_experts, _ = _validate_oracle_inputs(target, expert_outputs, k)
+    combination_indices = _combination_indices(
+        num_experts,
+        k,
+        device=expert_outputs.device,
+    )
+    scoring_dtype = (
+        torch.float64 if expert_outputs.dtype == torch.float64 else torch.float32
+    )
+    experts = expert_outputs.to(dtype=scoring_dtype)
+    targets = target.to(dtype=scoring_dtype)
+    indicators = torch.zeros(
+        combination_indices.shape[0],
+        num_experts,
+        dtype=scoring_dtype,
+        device=expert_outputs.device,
+    )
+    indicators.scatter_(1, combination_indices, 1.0)
+
+    target_norm = targets.square().sum(dim=-1)
+    target_expert = torch.einsum("th,teh->te", targets, experts)
+    expert_gram = torch.einsum("teh,tfh->tef", experts, experts)
+    linear_term = torch.einsum("ce,te->tc", indicators, target_expert)
+    quadratic_term = torch.einsum(
+        "ce,tef,cf->tc",
+        indicators,
+        expert_gram,
+        indicators,
+    )
+    scores = target_norm[:, None] - 2.0 * linear_term + quadratic_term
+    best_combination = scores.argmin(dim=1)
+    token_indices = torch.arange(target.shape[0], device=target.device)
+    selected_scores = scores[token_indices, best_combination].clamp_min(0.0)
+    return OracleResult(
+        subsets=combination_indices.index_select(0, best_combination),
+        squared_errors=selected_scores,
+    )
