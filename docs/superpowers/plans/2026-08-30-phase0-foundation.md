@@ -53,6 +53,7 @@ tests/test_oracle_bruteforce.py         # direct fixed-K subset scoring
 tests/test_gram_oracle.py               # Gram/direct agreement
 tests/test_bf16_drift.py                # CUDA BF16 metrics
 tests/test_phase0_probe.py               # deterministic summary schema
+tests/test_phase0_cli.py                 # real CLI process and JSON output
 tests/test_qwen35_probe.py               # offline config/layout inspection
 PROJECT_LOG.md                           # append-only execution record
 ```
@@ -693,7 +694,7 @@ git commit -m "feat: add Gram exact oracle"
 - Consumes: `device: torch.device`, `dtype: torch.dtype`, integer seed, hidden/intermediate sizes, and expert count.
 - Produces: `run_phase0_probe(device, dtype, seed, hidden_size, intermediate_size, num_experts) -> dict[str, object]` with versioned JSON-safe fields.
 
-- [ ] **Step 1: Write the failing deterministic report-schema test**
+- [x] **Step 1: Write the failing deterministic report-schema test**
 
 ```python
 from ppmoe.phase0 import run_phase0_probe
@@ -708,7 +709,7 @@ def test_phase0_probe_is_deterministic_and_json_safe():
     assert first["oracle"]["direct_gram_subsets_equal"] is True
 ```
 
-- [ ] **Step 2: Observe RED, implement the probe, and observe GREEN**
+- [x] **Step 2: Observe RED, implement the probe, and observe GREEN**
 
 Run RED: `uv run pytest tests/test_phase0_probe.py -v`
 
@@ -716,7 +717,7 @@ The implementation seeds a local generator, constructs one dense FFN and a deter
 
 Run GREEN: `uv run pytest tests/test_phase0_probe.py -v`
 
-- [ ] **Step 3: Write the CUDA BF16 drift test and observe its first result**
+- [x] **Step 3: Write the CUDA BF16 drift test and observe its first result**
 
 Mark the test `@pytest.mark.cuda`. Skip only if CUDA is unavailable or `torch.cuda.is_bf16_supported()` is false. Compare native BF16 expert summation with expert outputs accumulated in FP32 and cast back to BF16. Assert metrics are finite and the FP32-accumulated normalized MSE is no worse than native BF16 beyond `1e-7` tolerance.
 
@@ -724,7 +725,7 @@ Run: `uv run pytest tests/test_bf16_drift.py -v`
 
 Expected: PASS on the RTX 5060 Ti or a precise skip reason. If FP32 accumulation is empirically worse, stop and investigate rather than weakening the assertion.
 
-- [ ] **Step 4: Add the JSON CLI and run both reports**
+- [x] **Step 4: Add the JSON CLI and run both reports**
 
 `scripts/verify_phase0.py` accepts `--device`, `--dtype`, `--seed`, `--hidden-size`, `--intermediate-size`, `--num-experts`, and required `--output`. It creates only the output parent directory and serializes the report with sorted keys and indentation.
 
@@ -737,7 +738,7 @@ uv run python scripts/verify_phase0.py --device cuda --dtype bfloat16 --seed 31 
 
 Expected: both commands exit zero; `results/` remains ignored by Git.
 
-- [ ] **Step 5: Run the full suite, log exact metrics, and commit**
+- [x] **Step 5: Run the full suite, log exact metrics, and commit**
 
 Run: `uv run pytest -v`
 

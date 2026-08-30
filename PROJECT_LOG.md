@@ -132,3 +132,31 @@ This file is an append-only record of material project actions, decisions, verif
 - Full non-CUDA regression: 38 tests passed in 1.44 seconds.
 - The small objective deltas are FP32 algebra/accumulation-order effects; subset choices remained identical for all seeded cases.
 - Next gate: generate deterministic JSON Phase 0 reports and compare native BF16 versus FP32 expert accumulation on CUDA.
+
+### 11:55 PKT — Task 8 reproducible FP32/BF16 reports
+
+- RED core: Phase 0 and BF16 tests failed during collection because `ppmoe.phase0` did not exist.
+- Implemented `run_phase0_probe` with deterministic seeds, versioned JSON-safe output, parameter counts, numerical metrics, and direct/Gram agreement across every K.
+- CPU probe tests passed 2/2; real CUDA BF16 drift test passed 1/1.
+- CLI RED: subprocess test failed with exit code 2 because `scripts/verify_phase0.py` did not exist.
+- Implemented the real JSON CLI; subprocess GREEN passed and verified exit code, output creation, schema, seed, and device.
+- Full suite including CUDA: 42 tests passed in 3.05 seconds with no skips.
+- `results/phase0-fp32.json` SHA256: `36157F5053644885C293DBF90B4450296B5EF5F0B5E417F3B0EFB191624D9964`.
+- FP32 report, seed 31, hidden 128, intermediate 512, 8 experts:
+  - maximum absolute error `1.1920928955078125e-07`
+  - relative L2 error `2.7393640199064574e-07`
+  - normalized MSE `7.50411523355806e-14`
+  - cosine similarity `0.9999999999999634`
+  - direct/Gram subsets identical for K=1 through K=8
+  - maximum direct/Gram squared-error delta `4.023313522338867e-07`
+- `results/phase0-bf16.json` SHA256: `C43B6CFC0040463D01AFAF7355E6AB04CA7DFAD367D9DA590ECC09C9B09B5380`.
+- CUDA BF16 report on RTX 5060 Ti:
+  - maximum absolute error `0.001953125`
+  - relative L2 error `0.0025266201633892898`
+  - normalized MSE `6.383809450045322e-06`
+  - cosine similarity `0.9999968138585839`
+  - peak allocated CUDA memory `35,479,040` bytes
+  - native BF16 and FP32 expert accumulation followed by BF16 cast produced identical reported metrics for this seed
+  - direct/Gram subsets identical for K=1 through K=8
+- Both dense and partitioned forms contain `196,608` parameters. Generated `results/` files remain ignored by Git.
+- Next gate: inspect the official Qwen3.5 config and text MLP layout without downloading weights.
