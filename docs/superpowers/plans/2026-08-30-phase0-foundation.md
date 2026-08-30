@@ -509,7 +509,7 @@ git commit -m "test: prove synthetic model gradient equivalence"
 - Consumes: equal-shaped reference and candidate tensors.
 - Produces: immutable `NumericalMetrics` and `compare_tensors(reference: Tensor, candidate: Tensor) -> NumericalMetrics`.
 
-- [ ] **Step 1: Write failing metric tests with hand-computable tensors**
+- [x] **Step 1: Write failing metric tests with hand-computable tensors**
 
 ```python
 import math
@@ -527,7 +527,7 @@ def test_compare_tensors_reports_expected_error_metrics():
     assert math.isclose(metrics.rms_error, math.sqrt(0.5))
     assert math.isclose(metrics.relative_error, 1.0 / math.sqrt(5.0))
     assert math.isclose(metrics.normalized_mse, 1.0 / 5.0)
-    assert math.isclose(metrics.cosine_similarity, 4.0 / math.sqrt(20.0))
+    assert math.isclose(metrics.cosine_similarity, 6.0 / math.sqrt(40.0))
 
 
 def test_compare_tensors_rejects_shape_mismatch():
@@ -535,7 +535,7 @@ def test_compare_tensors_rejects_shape_mismatch():
         compare_tensors(torch.zeros(2), torch.zeros(3))
 ```
 
-- [ ] **Step 2: Observe RED, implement in FP64, and observe GREEN**
+- [x] **Step 2: Observe RED, implement in FP64, and observe GREEN**
 
 Run RED: `uv run pytest tests/test_verify_metrics.py -v`
 
@@ -543,7 +543,7 @@ Implementation converts detached inputs to FP64 for metric calculation, defines 
 
 Run GREEN: `uv run pytest tests/test_verify_metrics.py -v`
 
-- [ ] **Step 3: Log and commit**
+- [x] **Step 3: Log and commit**
 
 ```powershell
 git add src/ppmoe/moefication/verify.py tests/test_verify_metrics.py PROJECT_LOG.md

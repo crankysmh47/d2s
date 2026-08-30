@@ -99,3 +99,12 @@ This file is an append-only record of material project actions, decisions, verif
   - relative L2 error `7.29517566e-08`
 - Full non-CUDA regression: 25 tests passed in 1.50 seconds.
 - All measurements pass the FP32 tolerances. Next gate: centralize numerical metrics with independently hand-computed expectations.
+
+### 11:35 PKT — Task 5 numerical metrics
+
+- Corrected a planning arithmetic error before implementation: cosine similarity for reference `[1, 2]` and candidate `[2, 2]` is `6 / sqrt(40)`, not `4 / sqrt(20)`.
+- RED: `uv run pytest tests/test_verify_metrics.py -v` failed because `ppmoe.moefication.verify` did not exist.
+- Implemented FP64 calculation of maximum absolute error, RMS error, relative L2 error, normalized MSE, and cosine similarity in immutable `NumericalMetrics`.
+- GREEN: 4 hand-computed and boundary tests passed in 1.01 seconds.
+- Full non-CUDA regression: 29 tests passed in 1.48 seconds.
+- Next gate: direct fixed-K subset enumeration must choose the hand-derived best subset independently for each token and resolve exact ties lexicographically.
