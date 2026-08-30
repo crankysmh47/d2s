@@ -216,3 +216,17 @@ This file is an append-only record of material project actions, decisions, verif
 - Pushed `exp` to the private GitHub repository and configured it to track `origin/exp`.
 - First remote verification matched local commit `813fe9df0c9659489f979d8433481d076cf404aa` before this logging commit.
 - Next research dependency: the original plan's Phase 2 learned router is blocked on Phase 1 local/rollout oracle results and oracle-derived labels. Do not train a router before the Phase 1 go/no-go gate.
+
+### Phase 1 V0 protocol approval and design lock
+
+- User clarified that current work continues the original plan's Phase 1; it must not be relabeled as Phase 2.
+- User approved deterministic FineWeb-Edu calibration plus raw WikiText-103 evaluation:
+  - model `Qwen/Qwen3.5-0.8B-Base` at revision `dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68`;
+  - FineWeb-Edu `sample-10BT/train` at revision `87f09149ef4734204d70ed1d046ddc9ca3f2b8f9`, exactly 100,000 Qwen tokenizer tokens;
+  - WikiText `wikitext-103-raw-v1/test` at revision `b08601e04326c79dfdd32d625aee71d232d685c3`;
+  - an initially 100,000-token disjoint FineWeb-Edu held-out evaluation.
+- Live dataset-server inspection verified FineWeb-Edu exposes `id`, `text`, `url`, and provenance-related fields; document IDs can therefore be recorded directly. Calibration and held-out sets will be disjoint at the whole-document level.
+- Approved execution is a gated funnel: loader verification, one-FFN/one-layer/full-stack equivalence, dense/all-expert PPL, 2,048-token oracle smoke, 100,000-token local oracle, then rollout oracle and both relative-PPL measurements.
+- The concrete Qwen loader and actual BF16 parameter verification are hard requirements because the generic automatic loader may drop the requested dtype for this composite checkpoint.
+- User requested fewer commits. Phase 1 commit cadence is limited to meaningful milestones: combined design/plan, verified implementation, and first real results.
+- All work remains on `exp`; `main` remains unchanged until the first real results are reviewed.
