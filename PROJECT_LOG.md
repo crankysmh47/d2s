@@ -29,3 +29,9 @@ This file is an append-only record of material project actions, decisions, verif
 - Treat FP32 all-expert equivalence as a hard correctness gate, not a best-effort metric.
 - Log BF16 drift separately; do not describe ordinary BF16 accumulation differences as exact equivalence.
 
+### 10:47 PKT — Design approval and dependency hazard
+
+- User approved `docs/superpowers/specs/2026-08-30-phase0-foundation-design.md` and authorized implementation planning.
+- Confirmed from the upstream Transformers Qwen3.5 implementation that the text MLP uses bias-free `gate_proj`, `up_proj`, and `down_proj` linear layers with the expected row/row/column neuron axes.
+- Identified an upstream Transformers compatibility hazard: composite Qwen3.5 checkpoints loaded through `AutoModelForCausalLM` have had a reported path where the requested `dtype` is silently dropped. This slice performs configuration-only inspection and does not load weights. Any later weight loader must use the concrete `Qwen3_5ForCausalLM` class and verify actual parameter dtypes after loading.
+- Implementation mode: inline execution on `phase0-foundation`; no delegated agents were requested.
