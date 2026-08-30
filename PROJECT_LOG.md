@@ -207,3 +207,12 @@ This file is an append-only record of material project actions, decisions, verif
   - `PHASE 1 WEIGHT DOWNLOAD: NOT STARTED`
 - Recommended next slice: resolve Hugging Face authentication/cache policy, record expected checkpoint bytes, load with concrete `Qwen3_5ForCausalLM`, verify parameter dtypes and VRAM, convert one text FFN, then one text layer, then the full text stack before perplexity evaluation.
 - Residual filesystem cleanup: `C:\Users\Hank47\Documents\d2s` remains an empty locked Git shell from task startup and can be removed after the Codex task releases it.
+
+### Branch publication — `exp`
+
+- User chose to keep `main` unchanged until the project has its first real Phase 1 results.
+- Renamed local branch `phase0-foundation` to `exp`.
+- Verified neither `exp` nor `dev` existed on the remote before publication.
+- Pushed `exp` to the private GitHub repository and configured it to track `origin/exp`.
+- First remote verification matched local commit `813fe9df0c9659489f979d8433481d076cf404aa` before this logging commit.
+- Next research dependency: the original plan's Phase 2 learned router is blocked on Phase 1 local/rollout oracle results and oracle-derived labels. Do not train a router before the Phase 1 go/no-go gate.
