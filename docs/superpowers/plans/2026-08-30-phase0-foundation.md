@@ -444,7 +444,7 @@ git commit -m "feat: add balanced reference experts"
 - Consumes: `DenseSwiGLU`, `PartitionedSwiGLU`, and each module's public projections.
 - Produces: test-only `TinySwiGLUBlock` and `TinySwiGLUTransformer`; no new production API.
 
-- [ ] **Step 1: Write a failing mapped-gradient equivalence test**
+- [x] **Step 1: Add a mapped-gradient characterization test**
 
 The test must clone one dense FFN into four experts, run the same scalar loss, and compare input gradients. For parameter gradients, concatenate each expert's gate/up gradients along dimension 0 and down gradients along dimension 1, restore original neuron order from the partitions, and compare with the dense gradients using `rtol=1e-5`, `atol=1e-6`.
 
@@ -457,21 +457,21 @@ torch.testing.assert_close(restored_up_grad, dense.up_proj.weight.grad, rtol=1e-
 torch.testing.assert_close(restored_down_grad, dense.down_proj.weight.grad, rtol=1e-5, atol=1e-6)
 ```
 
-- [ ] **Step 2: Observe gradient RED**
+- [x] **Step 2: Run the gradient characterization**
 
 Run: `uv run pytest tests/test_gradient_equivalence.py -v`
 
-Expected: FAIL if expert construction detached parameters incorrectly or gradient restoration is missing.
+Expected: PASS when the existing expert construction preserved autograd; any failure is a Task 3 defect and must be debugged before proceeding.
 
-- [ ] **Step 3: Make only the reference-module changes needed for GREEN**
+- [x] **Step 3: Confirm no production change is needed**
 
-Ensure expert weights are leaf `nn.Parameter` objects copied from dense slices and that no forward path uses `.detach()` on activations or expert parameters.
+Verify expert weights are leaf `nn.Parameter` objects copied from dense slices and that no forward path uses `.detach()` on activations or expert parameters. The characterization passed, so production code remained unchanged.
 
 Run: `uv run pytest tests/test_gradient_equivalence.py -v`
 
 Expected: PASS.
 
-- [ ] **Step 4: Add the failing two-layer integration test**
+- [x] **Step 4: Add the two-layer integration characterization**
 
 `tests/helpers.py` defines a seeded block with `RMSNorm`, `nn.MultiheadAttention(batch_first=True)`, a residual connection, a second `RMSNorm`, and `DenseSwiGLU`. Build a two-layer dense model, deep-copy it, replace both copied MLPs with `PartitionedSwiGLU`, and assert final output equivalence:
 
@@ -479,19 +479,15 @@ Expected: PASS.
 torch.testing.assert_close(converted(tokens), dense(tokens), rtol=1e-5, atol=1e-6)
 ```
 
-- [ ] **Step 5: Observe integration RED then GREEN**
+- [x] **Step 5: Run the integration characterization**
 
-Run RED before defining the fixture: `uv run pytest tests/test_model_equivalence.py -v`
-
-Expected RED: import failure for `TinySwiGLUTransformer`.
-
-Add the test fixture and replacement helper, then run:
+Add the test-only fixture and replacement helper, then run:
 
 `uv run pytest tests/test_gradient_equivalence.py tests/test_model_equivalence.py -v`
 
 Expected GREEN: both pass.
 
-- [ ] **Step 6: Run the complete CPU suite, log, and commit**
+- [x] **Step 6: Run the complete CPU suite, log, and commit**
 
 Run: `uv run pytest -v -m "not cuda"`
 

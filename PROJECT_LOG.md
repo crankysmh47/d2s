@@ -84,3 +84,18 @@ This file is an append-only record of material project actions, decisions, verif
   - partitioned parameters `1,616`
 - This passes the `1e-5` single-FFN FP32 gate and preserves the parameter count in the measured configuration.
 - Next gate: input and mapped parameter gradients plus two-layer synthetic model output must match.
+
+### 11:30 PKT — Task 4 gradient and model characterization
+
+- Plan deviation recorded before execution: gradient propagation was already part of the Task 3 reference implementation, so fabricating a RED failure would have been misleading. Task 4 added characterization tests only and made no production-code change.
+- `uv run pytest tests/test_gradient_equivalence.py tests/test_model_equivalence.py -v` passed 2 tests in 1.49 seconds on first execution.
+- Seed 17 maximum absolute gradient differences:
+  - input `1.39698386e-09`
+  - gate weight `5.58793545e-09`
+  - up weight `3.25962901e-09`
+  - down weight `4.65661287e-09`
+- Seed 19 two-layer synthetic Transformer:
+  - maximum absolute final-state difference `2.38418579e-07`
+  - relative L2 error `7.29517566e-08`
+- Full non-CUDA regression: 25 tests passed in 1.50 seconds.
+- All measurements pass the FP32 tolerances. Next gate: centralize numerical metrics with independently hand-computed expectations.
