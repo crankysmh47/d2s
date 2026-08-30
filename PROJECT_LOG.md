@@ -35,3 +35,27 @@ This file is an append-only record of material project actions, decisions, verif
 - Confirmed from the upstream Transformers Qwen3.5 implementation that the text MLP uses bias-free `gate_proj`, `up_proj`, and `down_proj` linear layers with the expected row/row/column neuron axes.
 - Identified an upstream Transformers compatibility hazard: composite Qwen3.5 checkpoints loaded through `AutoModelForCausalLM` have had a reported path where the requested `dtype` is silently dropped. This slice performs configuration-only inspection and does not load weights. Any later weight loader must use the concrete `Qwen3_5ForCausalLM` class and verify actual parameter dtypes after loading.
 - Implementation mode: inline execution on `phase0-foundation`; no delegated agents were requested.
+
+### 11:00 PKT — Task 1 environment resolution issue
+
+- `uv sync --group dev` resolved 58 packages and installed `torch==2.13.0+cpu`, `transformers==5.16.1`, and `pytest==8.4.2`.
+- Verification showed `torch.version.cuda is None` and `torch.cuda.is_available() is False`; therefore this lock cannot satisfy the required CUDA BF16 gate despite the host RTX 5060 Ti.
+- Root cause: the default PyPI Windows Torch artifact is CPU-only in this resolution path.
+- Official PyTorch wheel listings provide a CPython 3.11 Windows CUDA 13.0 build for Torch 2.13.0. NVIDIA driver 581.57 is from the CUDA 13-capable driver family.
+- Mitigation: configure an explicit uv source for `torch` at `https://download.pytorch.org/whl/cu130`, re-lock, and verify `torch.version.cuda` plus an actual CUDA tensor operation before accepting the environment.
+
+### 11:15 PKT — Task 1 RED/GREEN and environment recovery
+
+- RED: `uv run pytest tests/test_neuron_triplet.py -v` failed during collection with `ModuleNotFoundError: No module named 'ppmoe.moefication.neuron'`. This was the intended missing-production-module failure.
+- Implemented `SwiGLUParameters` shape/dtype/device validation and `validate_permutation` without adding permutation or partition behavior.
+- GREEN: the same command passed 9 tests in 1.05 seconds.
+- The first CUDA sync attempt timed out after updating `uv.lock`; a resumed sync installed `torch==2.13.0+cu130` but left an incomplete CPU `torch-2.13.0.dist-info` metadata directory.
+- Permanent deletion of that generated orphan was blocked by environment policy. It was recoverably moved to `.venv/orphaned-metadata/torch-2.13.0.dist-info`; a clean `uv sync --group dev` then reported 39 packages checked with no warning.
+- CUDA proof used the project venv and a real BF16 matrix multiplication:
+  - Torch `2.13.0+cu130`
+  - CUDA runtime 13.0
+  - GPU `NVIDIA GeForce RTX 5060 Ti`
+  - `torch.cuda.is_bf16_supported() == True`
+  - matrix result contained only finite values
+- Transformers resolved to `5.16.1`; pytest resolved to `8.4.2`.
+- Next gate: complete-neuron permutation must preserve FP32 output and leave source tensors unchanged.

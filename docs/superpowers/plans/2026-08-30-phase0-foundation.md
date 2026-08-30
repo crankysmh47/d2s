@@ -75,9 +75,9 @@ PROJECT_LOG.md                           # append-only execution record
 - Consumes: one-dimensional integer `torch.Tensor` permutations.
 - Produces: `validate_permutation(permutation: Tensor, intermediate_size: int) -> Tensor` and immutable `SwiGLUParameters`.
 
-- [ ] **Step 1: Add package metadata, ignore rules, and the failing validation tests**
+- [x] **Step 1: Add package metadata, ignore rules, and the failing validation tests**
 
-`pyproject.toml` must declare a `src` package, Python `>=3.11,<3.12`, runtime dependencies `torch>=2.6,<3` and `transformers>=5.12,<6`, plus `pytest>=8,<9` in the development group. `.gitignore` must cover `.venv/`, Python caches, pytest caches, Hugging Face caches, `*.safetensors`, `*.bin`, `*.pt`, `*.pth`, `checkpoints/`, `datasets/`, `outputs/`, and `results/` except explicitly checked-in small fixtures.
+`pyproject.toml` must declare a `src` package, Python `>=3.11,<3.12`, runtime dependencies `torch>=2.6,<3` and `transformers>=5.12,<6`, plus `pytest>=8,<9` in the development group. Route only `torch` through the explicit official `https://download.pytorch.org/whl/cu130` uv index so Windows does not resolve a CPU-only PyPI wheel. `.gitignore` must cover `.venv/`, Python caches, pytest caches, Hugging Face caches, `*.safetensors`, `*.bin`, `*.pt`, `*.pth`, `checkpoints/`, `datasets/`, `outputs/`, and `results/` except explicitly checked-in small fixtures.
 
 Create these tests:
 
@@ -117,19 +117,19 @@ def test_swiglu_parameters_checks_neuron_axes():
         )
 ```
 
-- [ ] **Step 2: Create and lock the environment**
+- [x] **Step 2: Create and lock the environment**
 
 Run: `uv sync --group dev`
 
 Expected: `.venv` and `uv.lock` are created; dependency resolution succeeds without fetching model weights.
 
-- [ ] **Step 3: Run the validation tests and observe RED**
+- [x] **Step 3: Run the validation tests and observe RED**
 
 Run: `uv run pytest tests/test_neuron_triplet.py -v`
 
 Expected: collection fails with `ModuleNotFoundError` or import failure for `ppmoe.moefication.neuron`.
 
-- [ ] **Step 4: Implement the minimal validated parameter bundle**
+- [x] **Step 4: Implement the minimal validated parameter bundle**
 
 Implement this complete validation behavior:
 
@@ -194,13 +194,13 @@ def validate_permutation(permutation: Tensor, intermediate_size: int) -> Tensor:
     return permutation.detach().to(dtype=torch.long).clone()
 ```
 
-- [ ] **Step 5: Run tests and observe GREEN**
+- [x] **Step 5: Run tests and observe GREEN**
 
 Run: `uv run pytest tests/test_neuron_triplet.py -v`
 
 Expected: all tests pass with no warnings.
 
-- [ ] **Step 6: Record and commit the bootstrap milestone**
+- [x] **Step 6: Record and commit the bootstrap milestone**
 
 Append the resolved Torch/Transformers versions, RED and GREEN commands, and result to `PROJECT_LOG.md`.
 
