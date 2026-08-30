@@ -55,6 +55,7 @@ tests/test_bf16_drift.py                # CUDA BF16 metrics
 tests/test_phase0_probe.py               # deterministic summary schema
 tests/test_phase0_cli.py                 # real CLI process and JSON output
 tests/test_qwen35_probe.py               # offline config/layout inspection
+tests/test_qwen35_cli.py                 # real local Transformers config CLI
 PROJECT_LOG.md                           # append-only execution record
 ```
 
@@ -762,7 +763,7 @@ git commit -m "feat: report Phase 0 numerical fidelity"
 - Consumes: a Transformers Qwen3.5 composite or text config and an `nn.Module` expected to be a text MLP.
 - Produces: `Qwen35ConfigReport`, `Qwen35MLPReport`, `inspect_qwen35_config(config)`, and `inspect_qwen35_mlp(module)`.
 
-- [ ] **Step 1: Write failing offline config-inspection tests**
+- [x] **Step 1: Write failing offline config-inspection tests**
 
 Use `types.SimpleNamespace` to create a composite config with `text_config.hidden_size=1024`, `intermediate_size=3584`, `num_hidden_layers=24`, `hidden_act="silu"`, and eight experts. Assert the report selects the nested text config, reports expert width 448, and rejects widths not divisible by eight.
 
@@ -774,11 +775,11 @@ assert report.expert_width == 448
 assert report.num_hidden_layers == 24
 ```
 
-- [ ] **Step 2: Write failing real-module layout tests**
+- [x] **Step 2: Write failing real-module layout tests**
 
 Construct small `nn.Linear` projections with names `gate_proj`, `up_proj`, and `down_proj` in a local test module. Assert `inspect_qwen35_mlp` reports row/row/column-compatible shapes and all three bias flags. Add negative cases for missing projections and incompatible shapes, with expected/actual shapes present in the error.
 
-- [ ] **Step 3: Observe RED, implement pure inspection, and observe GREEN**
+- [x] **Step 3: Observe RED, implement pure inspection, and observe GREEN**
 
 Run RED: `uv run pytest tests/test_qwen35_probe.py -v`
 
@@ -786,7 +787,7 @@ Implement only attribute/shape inspection; do not import or instantiate the full
 
 Run GREEN: `uv run pytest tests/test_qwen35_probe.py -v`
 
-- [ ] **Step 4: Add and run the opt-in network integration CLI**
+- [x] **Step 4: Add and run the opt-in network integration CLI**
 
 The script must call:
 
@@ -807,7 +808,7 @@ Run:
 
 Expected: config and tokenizer-sized metadata may enter the external Hugging Face cache; no model weights are downloaded. Report must show hidden size 1024, intermediate size 3584, 24 layers, expert width 448, and bias-free text MLP projections.
 
-- [ ] **Step 5: Record the dtype-loader hazard and commit**
+- [x] **Step 5: Record the dtype-loader hazard and commit**
 
 Log that later weight loading must avoid relying on `AutoModelForCausalLM(dtype=requested_dtype)` for this composite checkpoint. Require the future loader to use `Qwen3_5ForCausalLM`, verify representative parameter dtypes after load, and measure actual VRAM before conversion.
 

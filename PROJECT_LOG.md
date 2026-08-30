@@ -160,3 +160,26 @@ This file is an append-only record of material project actions, decisions, verif
   - direct/Gram subsets identical for K=1 through K=8
 - Both dense and partitioned forms contain `196,608` parameters. Generated `results/` files remain ignored by Git.
 - Next gate: inspect the official Qwen3.5 config and text MLP layout without downloading weights.
+
+### 12:05 PKT — Task 9 Qwen3.5 configuration readiness
+
+- Adapter RED: `uv run pytest tests/test_qwen35_probe.py -v` failed because `ppmoe.adapters.qwen35` did not exist.
+- Implemented pure config and `nn.Linear` MLP layout inspection with explicit missing-field and shape errors.
+- CLI RED: the real subprocess test failed with exit code 2 because `scripts/probe_qwen35.py` did not exist.
+- Implemented a CLI that calls `AutoConfig.from_pretrained(..., trust_remote_code=False)`, initializes only one untrained `Qwen3_5MLP`, and never calls a model `from_pretrained` method.
+- Offline GREEN: 7 adapter/CLI tests passed in 5.68 seconds using a locally saved real miniature `Qwen3_5Config`.
+- Official config probe: `uv run python scripts/probe_qwen35.py --output results/qwen35-config-probe.json` exited zero.
+- Official `Qwen/Qwen3.5-0.8B-Base` evidence:
+  - model type `qwen3_5`; text model type `qwen3_5_text`
+  - hidden size `1024`; intermediate size `3584`; 24 text layers; activation `silu`
+  - 8 balanced experts imply width `448`
+  - gate weight `[3584, 1024]`, up weight `[3584, 1024]`, down weight `[1024, 3584]`
+  - gate/up/down projections are bias-free
+  - Transformers `5.16.1`; `trust_remote_code=false`; `weights_loaded=false`
+- Repository weight-file scan before and after remained zero.
+- Probe SHA256: `C6819750E63090AFE56F89090B2B1887E4605C1496AC3953824627FFFC151EC5`.
+- Operational warnings for future Phase 1:
+  - Hugging Face requests are unauthenticated, giving lower rate limits.
+  - Windows Developer Mode/symlink support is disabled; Hugging Face cache falls back to a degraded mode that can duplicate data and use more disk.
+- Later weight loading must use concrete `Qwen3_5ForCausalLM`, verify actual parameter dtypes after load, and measure VRAM. Do not rely on `AutoModelForCausalLM(dtype=requested_dtype)` for this composite checkpoint.
+- Next gate: run final integrity/tests/reports and decide M0 PASS or FAIL. No weight download is authorized in this slice.
