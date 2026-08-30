@@ -829,7 +829,7 @@ git commit -m "feat: probe Qwen3.5 text FFN compatibility"
 - Consumes: all prior test suites and generated ignored JSON reports.
 - Produces: a durable Phase 0 gate result and explicit Phase 1 next action.
 
-- [ ] **Step 1: Verify repository integrity**
+- [x] **Step 1: Verify repository integrity**
 
 Run:
 
@@ -841,21 +841,21 @@ uv lock --check
 
 Expected: no untracked caches/weights/results, no whitespace errors, and the lock is current.
 
-- [ ] **Step 2: Run the complete test suite with explicit skip reporting**
+- [x] **Step 2: Run the complete test suite with explicit skip reporting**
 
 Run: `uv run pytest -v -ra`
 
 Expected: all CPU and CUDA tests pass; any skip names the unavailable capability precisely.
 
-- [ ] **Step 3: Re-run both Phase 0 reports and the Qwen configuration probe**
+- [x] **Step 3: Re-run both Phase 0 reports and the Qwen configuration probe**
 
 Use the exact commands from Tasks 8 and 9. Capture their exit codes, result paths, SHA256 hashes, numerical maxima, package versions, GPU name, driver, and peak allocated CUDA memory in `PROJECT_LOG.md`.
 
-- [ ] **Step 4: Make the gate decision**
+- [x] **Step 4: Make the gate decision**
 
-Record `M0 PASS` only if permutation, all-expert FFN, two-layer model, gradients, direct/Gram oracle agreement, BF16 measurement, and Qwen configuration inspection all meet their stated criteria. Otherwise record `M0 FAIL`, the first failing invariant, evidence, and the smallest next diagnostic; do not begin Phase 1 weight loading.
+Record `PHASE 0 FOUNDATION: PASS` only if permutation, all-expert FFN, two-layer model, gradients, direct/Gram oracle agreement, BF16 measurement, and Qwen configuration inspection all meet their stated criteria. Keep the original research plan's global `M0` pending until a fully converted Qwen model matches the dense teacher and perplexity shows no meaningful difference. If any synthetic invariant fails, record `PHASE 0 FOUNDATION: FAIL`, the first failing invariant, evidence, and the smallest next diagnostic; do not begin Phase 1 weight loading.
 
-- [ ] **Step 5: Commit the verified gate record**
+- [x] **Step 5: Commit the verified gate record**
 
 ```powershell
 git add PROJECT_LOG.md docs/superpowers/plans/2026-08-30-phase0-foundation.md

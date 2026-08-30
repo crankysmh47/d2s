@@ -183,3 +183,27 @@ This file is an append-only record of material project actions, decisions, verif
   - Windows Developer Mode/symlink support is disabled; Hugging Face cache falls back to a degraded mode that can duplicate data and use more disk.
 - Later weight loading must use concrete `Qwen3_5ForCausalLM`, verify actual parameter dtypes after load, and measure VRAM. Do not rely on `AutoModelForCausalLM(dtype=requested_dtype)` for this composite checkpoint.
 - Next gate: run final integrity/tests/reports and decide M0 PASS or FAIL. No weight download is authorized in this slice.
+
+### 12:15 PKT — Task 10 final verification and gate decision
+
+- Terminology correction: the implementation checklist initially called this synthetic completion decision `M0`. The original `plan.md` defines global M0 as a fully converted Qwen model matching the dense teacher with no meaningful perplexity difference. This slice did not load/convert Qwen weights or measure perplexity, so global M0 cannot honestly be marked PASS.
+- Fresh integrity verification:
+  - branch `phase0-foundation`
+  - `git diff --check` exited zero
+  - `uv lock --check` resolved 58 packages and exited zero
+  - all three generated result files are ignored by `.gitignore`
+  - repository model-weight file count is zero
+- Fresh test command: `uv run pytest -v -ra` passed 49 tests in 7.48 seconds with zero failures and zero skips, including the RTX 5060 Ti BF16 test.
+- Fresh report regeneration produced the same SHA256 hashes as Task 8/9:
+  - FP32 `36157F5053644885C293DBF90B4450296B5EF5F0B5E417F3B0EFB191624D9964`
+  - BF16 `C43B6CFC0040463D01AFAF7355E6AB04CA7DFAD367D9DA590ECC09C9B09B5380`
+  - Qwen config `C6819750E63090AFE56F89090B2B1887E4605C1496AC3953824627FFFC151EC5`
+- Fresh FP32 values: relative error `2.73936401990646e-07`, maximum absolute error `1.19209289550781e-07`, cosine `0.999999999999963`, equal parameter counts, identical direct/Gram subsets.
+- Fresh BF16 values: relative error `0.00252662016338929`, maximum absolute error `0.001953125`, cosine `0.999996813858584`, equal parameter counts, identical direct/Gram subsets, peak allocated CUDA memory `35,479,040` bytes.
+- Fresh official Qwen config values: hidden 1024, intermediate 3584, 24 layers, expert width 448, `weights_loaded=false`, `trust_remote_code=false`.
+- Gate decision:
+  - `PHASE 0 FOUNDATION: PASS`
+  - `GLOBAL M0 (FULL QWEN CONVERSION + PERPLEXITY): PENDING`
+  - `PHASE 1 WEIGHT DOWNLOAD: NOT STARTED`
+- Recommended next slice: resolve Hugging Face authentication/cache policy, record expected checkpoint bytes, load with concrete `Qwen3_5ForCausalLM`, verify parameter dtypes and VRAM, convert one text FFN, then one text layer, then the full text stack before perplexity evaluation.
+- Residual filesystem cleanup: `C:\Users\Hank47\Documents\d2s` remains an empty locked Git shell from task startup and can be removed after the Codex task releases it.
