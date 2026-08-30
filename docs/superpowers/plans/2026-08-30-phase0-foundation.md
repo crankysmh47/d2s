@@ -296,7 +296,7 @@ git commit -m "feat: preserve SwiGLU under neuron permutation"
 - Consumes: validated permutation, number of experts, and `SwiGLUParameters`.
 - Produces: `balanced_partition(permutation: Tensor, num_experts: int) -> Sequence[Tensor]`, `DenseSwiGLU`, `ExpertSwiGLU`, and `PartitionedSwiGLU.from_dense(dense, partitions)`.
 
-- [ ] **Step 1: Write failing balanced-partition tests**
+- [x] **Step 1: Write failing balanced-partition tests**
 
 ```python
 import pytest
@@ -316,7 +316,7 @@ def test_balanced_partition_rejects_non_divisible_width():
         balanced_partition(torch.arange(7), 4)
 ```
 
-- [ ] **Step 2: Observe partition RED, implement, and observe GREEN**
+- [x] **Step 2: Observe partition RED, implement, and observe GREEN**
 
 Run RED: `uv run pytest tests/test_partition.py -v`
 
@@ -324,7 +324,7 @@ Implement exact positive expert-count validation, divisibility validation, and `
 
 Run GREEN: `uv run pytest tests/test_partition.py -v`
 
-- [ ] **Step 3: Write the failing all-expert output and bias tests**
+- [x] **Step 3: Write the failing all-expert output and bias tests**
 
 ```python
 import torch
@@ -361,13 +361,13 @@ def test_selected_experts_returns_sum_for_requested_indices():
     torch.testing.assert_close(partitioned(x, selected_experts=(0, 2)), expected)
 ```
 
-- [ ] **Step 4: Observe reference execution RED**
+- [x] **Step 4: Observe reference execution RED**
 
 Run: `uv run pytest tests/test_ffn_equivalence.py -v`
 
 Expected: import failure for `ppmoe.moefication.reference`.
 
-- [ ] **Step 5: Implement minimal dense and partitioned modules**
+- [x] **Step 5: Implement minimal dense and partitioned modules**
 
 Implement the following concrete public surface; every method body follows the formulas immediately below the code block:
 
@@ -417,13 +417,13 @@ class PartitionedSwiGLU(nn.Module):
 
 `ExpertSwiGLU.__init__` creates bias-compatible gate/up linear layers and a bias-free down layer, then copies the dense rows/columns named by its partition inside `torch.no_grad()`. `PartitionedSwiGLU.__init__` validates that flattened partition indices are a complete permutation of `range(dense.intermediate_size)`, that all partitions have equal nonzero width, and that index tensors share the source device. It stores one cloned down bias as `nn.Parameter` when the dense module has one; it never installs that bias on an expert.
 
-- [ ] **Step 6: Observe GREEN and run all current tests**
+- [x] **Step 6: Observe GREEN and run all current tests**
 
 Run: `uv run pytest tests/test_neuron_triplet.py tests/test_permutation.py tests/test_partition.py tests/test_ffn_equivalence.py -v`
 
 Expected: all pass, and FP32 relative error stays below `1e-5`.
 
-- [ ] **Step 7: Log numerical maxima and commit**
+- [x] **Step 7: Log numerical maxima and commit**
 
 ```powershell
 git add src/ppmoe/moefication/partition.py src/ppmoe/moefication/reference.py tests/test_partition.py tests/test_ffn_equivalence.py PROJECT_LOG.md

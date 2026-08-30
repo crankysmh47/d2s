@@ -68,3 +68,19 @@ This file is an append-only record of material project actions, decisions, verif
 - Seed 7 FP32 measurement: maximum absolute output difference `1.90734863e-06`; relative L2 error `7.84195393e-08`.
 - Source tensor non-mutation, requested index order, absent-bias behavior, and output equivalence are covered by tests.
 - Next gate: balanced partitions must be complete/disjoint and all-expert execution must match the dense FFN with the down bias added exactly once.
+
+### 11:25 PKT — Task 3 balanced reference experts
+
+- Partition RED: `uv run pytest tests/test_partition.py -v` failed because `ppmoe.moefication.partition` did not exist.
+- Partition GREEN: 4 tests passed, covering ordered equal groups, non-divisible widths, non-positive expert counts, and invalid permutations.
+- FFN RED: `uv run pytest tests/test_ffn_equivalence.py -v` failed because `ppmoe.moefication.reference` did not exist.
+- Implemented unoptimized `DenseSwiGLU`, `ExpertSwiGLU`, and `PartitionedSwiGLU`. Each expert owns complete gate/up rows and down columns; only the partitioned parent owns the down bias.
+- FFN GREEN: partition and equivalence subset passed 11 tests in 1.46 seconds.
+- Full regression: `uv run pytest -v` passed 23 tests in 1.45 seconds.
+- Seed 11 FP32 all-expert measurement:
+  - maximum absolute error `1.1920929e-07`
+  - relative L2 error `2.00065458e-07`
+  - dense parameters `1,616`
+  - partitioned parameters `1,616`
+- This passes the `1e-5` single-FFN FP32 gate and preserves the parameter count in the measured configuration.
+- Next gate: input and mapped parameter gradients plus two-layer synthetic model output must match.
