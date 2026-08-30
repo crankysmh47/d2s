@@ -108,3 +108,13 @@ This file is an append-only record of material project actions, decisions, verif
 - GREEN: 4 hand-computed and boundary tests passed in 1.01 seconds.
 - Full non-CUDA regression: 29 tests passed in 1.48 seconds.
 - Next gate: direct fixed-K subset enumeration must choose the hand-derived best subset independently for each token and resolve exact ties lexicographically.
+
+### 11:40 PKT — Task 6 direct exact oracle
+
+- Corrected a test-fixture arithmetic error before implementation: the all-expert literal reconstruction `[0.5, 2.5]` has squared error `2.5` from `[1, 1]`, not `1.25`.
+- RED: `uv run pytest tests/test_oracle_bruteforce.py -v` failed because `ppmoe.oracle.exact` did not exist.
+- Implemented deterministic lexicographic fixed-K subset enumeration with per-token direct reconstruction scoring in FP32, or FP64 when the source is FP64.
+- GREEN: 6 direct-oracle tests passed in 1.45 seconds.
+- Full non-CUDA regression: 35 tests passed in 1.40 seconds.
+- Covered distinct token-wise selections, exact zero error, lexicographic ties, all-expert error, invalid K, and incompatible shapes.
+- Next gate: Gram-form scoring must return the identical subsets and errors, including an explicit cancellation case.

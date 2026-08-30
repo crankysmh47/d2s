@@ -564,7 +564,7 @@ git commit -m "feat: add numerical fidelity metrics"
 - Consumes: `target: Tensor[tokens, hidden]`, `expert_outputs: Tensor[tokens, experts, hidden]`, and integer `k`.
 - Produces: `OracleResult(subsets: Tensor[tokens, k], squared_errors: Tensor[tokens])` and `exact_direct_oracle(target, expert_outputs, k) -> OracleResult`.
 
-- [ ] **Step 1: Write failing direct-oracle tests**
+- [x] **Step 1: Write failing direct-oracle tests**
 
 ```python
 import pytest
@@ -596,17 +596,17 @@ def test_direct_oracle_rejects_invalid_k(k):
         exact_direct_oracle(torch.zeros(1, 2), torch.zeros(1, 3, 2), k=k)
 ```
 
-- [ ] **Step 2: Observe RED**
+- [x] **Step 2: Observe RED**
 
 Run: `uv run pytest tests/test_oracle_bruteforce.py -v`
 
 Expected: import failure for `ppmoe.oracle.exact`.
 
-- [ ] **Step 3: Implement deterministic enumeration**
+- [x] **Step 3: Implement deterministic enumeration**
 
 Use `itertools.combinations(range(num_experts), k)` in lexicographic order, materialize the small Phase 0 combination index tensor, reconstruct candidates with indexed expert sums, calculate squared error in FP32 or FP64, and use the first `argmin` on ties.
 
-- [ ] **Step 4: Observe GREEN, log, and commit**
+- [x] **Step 4: Observe GREEN, log, and commit**
 
 Run: `uv run pytest tests/test_oracle_bruteforce.py -v`
 
