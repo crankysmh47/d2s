@@ -19,7 +19,7 @@ This phase answers whether the decomposition is viable before any learned routin
 | External evaluation | `Salesforce/wikitext`, config `wikitext-103-raw-v1`, split `test`, revision `b08601e04326c79dfdd32d625aee71d232d685c3` | Dense/all-expert/oracle perplexity |
 | In-domain evaluation | Same pinned FineWeb-Edu stream | Exactly 100,000 held-out tokens initially; expandable to 500,000 without changing calibration |
 
-The model uses text only, BF16 weights, context length 512, and no remote code. The concrete `Qwen3_5ForCausalLM` class is mandatory.
+The model uses text only, BF16 weights, context length 512, and no remote code. The repository is a composite checkpoint whose declared concrete class is `Qwen3_5ForConditionalGeneration`; only its `model.language_model` text stack is evaluated and converted.
 
 ## Execution architecture
 
@@ -87,7 +87,7 @@ The student exposes:
 Stop before conversion if any condition fails:
 
 - resolved model revision differs from the pinned SHA;
-- loaded class is not `Qwen3_5ForCausalLM`;
+- loaded class is not `Qwen3_5ForConditionalGeneration`;
 - any floating-point parameter is not BF16;
 - any required text MLP is missing or has an unexpected shape;
 - CUDA is unavailable or peak memory leaves insufficient space for the next stage.
@@ -183,4 +183,3 @@ Required plots are:
 - Keep `main` unchanged. All work remains on `exp` until first real results are reviewed.
 - Append material decisions, commands, failures, token counts, hashes, and gate outcomes to `PROJECT_LOG.md`.
 - Commit only at meaningful milestones: design/plan, verified implementation, and first results.
-

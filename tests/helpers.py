@@ -2,6 +2,12 @@ from copy import deepcopy
 
 import torch
 from torch import nn
+from transformers import (
+    Qwen3_5Config,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5TextConfig,
+    Qwen3_5VisionConfig,
+)
 
 from ppmoe.moefication.reference import DenseSwiGLU, PartitionedSwiGLU
 
@@ -75,4 +81,51 @@ def partitioned_copy(
         partitions = tuple(permutation.reshape(num_experts, -1))
         layer.mlp = PartitionedSwiGLU.from_dense(dense, partitions)
     return converted
+
+
+def tiny_qwen35(*, dtype: torch.dtype = torch.float32):
+    text = Qwen3_5TextConfig(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        layer_types=["full_attention", "full_attention"],
+        max_position_embeddings=64,
+        pad_token_id=0,
+        eos_token_id=2,
+        tie_word_embeddings=True,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10_000,
+            "partial_rotary_factor": 1.0,
+        },
+    )
+    vision = Qwen3_5VisionConfig(
+        depth=1,
+        hidden_size=16,
+        intermediate_size=32,
+        num_heads=2,
+        out_hidden_size=16,
+        num_position_embeddings=16,
+        patch_size=2,
+        spatial_merge_size=1,
+        temporal_patch_size=1,
+    )
+    config = Qwen3_5Config(
+        text_config=text,
+        vision_config=vision,
+        image_token_id=60,
+        video_token_id=61,
+        vision_start_token_id=62,
+        vision_end_token_id=63,
+        tie_word_embeddings=True,
+    )
+    return Qwen3_5ForConditionalGeneration(config).to(dtype=dtype).eval()
 

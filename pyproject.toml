@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "Parameter-preserving dense-to-sparse MoE research tools"
 requires-python = ">=3.11,<3.12"
 dependencies = [
+  "datasets>=4,<5",
+  "matplotlib>=3.10,<4",
   "torch>=2.6,<3",
   "transformers>=5.12,<6",
 ]

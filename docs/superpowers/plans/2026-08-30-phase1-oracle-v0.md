@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Work only on branch `exp`; do not modify `main`.
-- Use model revision `dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68` and concrete `Qwen3_5ForCausalLM` with `trust_remote_code=False`.
+- Use model revision `dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68` and concrete `Qwen3_5ForConditionalGeneration` with `trust_remote_code=False`; operate on `model.language_model` for text-only evaluation.
 - Use FineWeb-Edu `sample-10BT/train` revision `87f09149ef4734204d70ed1d046ddc9ca3f2b8f9` for exactly 100,000 calibration tokens.
 - Use WikiText `wikitext-103-raw-v1/test` revision `b08601e04326c79dfdd32d625aee71d232d685c3`.
 - Use BF16 model weights, context length 512, eight experts of width 448, and K values `[8, 6, 4, 3, 2]`.
@@ -102,7 +102,7 @@ tests/...                              focused unit/integration tests
 - Produces: `PartitionedQwen35MLP.forward(x, selected_experts=None) -> Tensor`
 - Produces: `PartitionedQwen35MLP.expert_outputs(x) -> Tensor`
 
-- [ ] Build miniature real `Qwen3_5ForCausalLM` fixtures and tests for concrete class enforcement, BF16 parameter validation, 24-layer discovery semantics, and vision-module identity preservation.
+- [ ] Build miniature real `Qwen3_5ForConditionalGeneration` fixtures and tests for concrete class enforcement, BF16 parameter validation, text-layer discovery semantics, and vision-module identity preservation.
 - [ ] Add conversion tests proving physical complete-triplet permutation, eight contiguous 448-neuron groups at production dimensions, equal scalar parameter count, deterministic per-layer seeds, selected execution, and FP32 maximum error `<=1e-5`.
 - [ ] Run the tests and confirm missing-interface failures.
 - [ ] Implement `from_pretrained` with exact revision, concrete class, BF16 dtype, `trust_remote_code=False`, `eval()`, and explicit device placement; inspect actual parameters after loading and return CUDA memory evidence.

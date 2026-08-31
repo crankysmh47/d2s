@@ -230,3 +230,86 @@ This file is an append-only record of material project actions, decisions, verif
 - The concrete Qwen loader and actual BF16 parameter verification are hard requirements because the generic automatic loader may drop the requested dtype for this composite checkpoint.
 - User requested fewer commits. Phase 1 commit cadence is limited to meaningful milestones: combined design/plan, verified implementation, and first real results.
 - All work remains on `exp`; `main` remains unchanged until the first real results are reviewed.
+
+### Phase 1 Task 3 loader-gate correction
+
+- Before downloading weights, a real-class construction probe found the approved design named the wrong concrete loader class.
+- The pinned repository declares `Qwen3_5ForConditionalGeneration` and uses a composite `Qwen3_5Config`. Its checkpoint contains 488 indexed tensors under `model.language_model.*`, `model.visual.*`, and MTP prefixes; total indexed weight bytes are `1,746,882,752`.
+- `Qwen3_5ForCausalLM` instead declares `Qwen3_5TextConfig`. Passing the repository's composite config to that class reproducibly fails because the top-level config has no flat `vocab_size` field.
+- A miniature real `Qwen3_5ForConditionalGeneration` successfully executed text-only inputs without pixel values, exposing text FFNs at `model.language_model.layers[*].mlp` while retaining `model.visual` separately.
+- Corrected loader policy: use concrete `Qwen3_5ForConditionalGeneration`, verify actual BF16 parameters after loading, feed text-only inputs, convert only the language-model FFNs, and assert the vision module remains untouched.
+- No model weights were downloaded during this investigation; only configuration and the small safetensors index were accessed. Hugging Face again warned that requests are unauthenticated and Windows cache symlinks are unavailable.
+
+### 20:55–22:08 PKT — Phase 1 V0 implementation checkpoint
+
+- User authorized autonomous continuation until a genuinely consequential design fork and requested implementation delegation to one execution agent at a time. Architecture, protocol decisions, review, and integration remained with the primary agent; a single GPT-5.6 Terra agent executed bounded Tasks 5–7 without committing or changing the scientific protocol.
+- Implemented the locked Phase 1 V0 pipeline:
+  - immutable model/dataset configuration and canonical atomic provenance;
+  - deterministic exact-target FineWeb token streams, whole-document-disjoint held-out selection, stable WikiText row IDs, and full raw-test materialization;
+  - guarded concrete `Qwen3_5ForConditionalGeneration` loading with actual BF16/class/device checks;
+  - deterministic physical complete-neuron permutation and eight-way Qwen text-FFN conversion without parameter-count change or vision conversion;
+  - mask-correct FP64 NLL/PPL accumulation with failed-batch invalidation and resume;
+  - transactional local exact oracle with FP32 Gram scoring, CPU FP64 aggregation, one-time direct/Gram verification, selection/co-selection, interaction, and cancellation statistics;
+  - transactional residual-aware greedy rollout oracle using teacher next-layer targets and the evolving student state;
+  - gated `preflight`, `datasets`, `m0`, `local-smoke`, `local`, `rollout`, and `report` CLI stages with signature-bound checkpoints;
+  - five required value-preserving CSV/PNG report outputs and output/source hashes.
+- Review corrections made before acceptance:
+  - rollback all partial local/rollout batch metrics before recording a failure;
+  - call only `model.language_model` for oracle passes to avoid unnecessary vocabulary logits;
+  - keep BF16/FP32 oracle scoring in FP32 and promote per-token metrics before FP64 reduction;
+  - run direct-versus-Gram verification only once per layer/K and persist its coverage;
+  - persist the full conversion manifest rather than only its hash;
+  - isolate M0 checkpoint directories by model/conversion/token signature;
+  - load one model pair for the complete rollout stage rather than reloading for every corpus/K;
+  - require exact text-layer coverage `0..23` in reports;
+  - separate checkpoint weight bytes from total repository bytes in preflight evidence.
+- A causal-NLL unit fixture initially placed logits at label positions rather than preceding causal positions. The observed NLL matched that fixture error; the fixture was corrected without changing production scoring code.
+- The first dependency-inclusive test attempt timed out during `uv` resolution. A separate `uv sync --group dev` completed successfully; the locked environment now contains `datasets==4.8.5` and Matplotlib in addition to the existing CUDA Torch/Transformers stack.
+- Fresh live read-only preflight succeeded on branch `exp` without loading model weights:
+  - CUDA available: true; BF16 available: true;
+  - Torch `2.13.0+cu130`; Transformers `5.16.1`; Datasets `4.8.5`;
+  - free disk `210,016,460,800` bytes;
+  - pinned model, FineWeb-Edu, and WikiText revisions all matched;
+  - safetensors weight bytes `1,746,942,600`;
+  - total repository bytes `1,769,913,749`;
+  - preflight JSON SHA256 `E767720750AFC3612F5ACD6EDE6DDC757F3AB3F00D9EEE27C62BDAB2BE36D296`.
+- `artifacts/phase1-v0/` is ignored by Git. Only the preflight artifact exists; Phase 1 datasets and model weights have not yet been downloaded/materialized by the experiment pipeline.
+- Gate status remains:
+  - `PHASE 1 IMPLEMENTATION: PENDING FINAL COMMIT VERIFICATION`;
+  - `GLOBAL M0: PENDING REAL MODEL CONVERSION + PERPLEXITY`;
+  - `M1: PENDING 100K LOCAL + ROLLOUT ORACLE RESULTS`.
+- `main` remains unchanged. The next milestone is dataset materialization followed by real-model M0 and the 2,048-token local smoke gate on `exp`.
+
+## 2026-08-31
+
+### 10:20–10:40 PKT — Independent implementation review and final verification
+
+- A fresh read-only Terra review inspected the entire uncommitted Phase 1 Tasks 1–7 tree against the approved specification. No reviewer edits were accepted blindly; findings were checked against the actual code and protocol.
+- Critical resume finding resolved: batch indexes are only meaningful for one microbatch partition. M0, local, and rollout signatures and checkpoint paths now include `microbatch_size`. Reducing microbatch size after OOM starts a clean signature-isolated attempt; the failed attempt remains preserved as negative evidence and cannot silently omit or double-count contexts.
+- Critical loader-evidence finding resolved:
+  - production validation requires exactly 24 text layers, hidden size 1024, intermediate size 3584, and the required gate/up/down matrix shapes at every layer;
+  - every pair load enforces actual BF16 parameters and at least 4 GiB free CUDA memory after both models are resident;
+  - the M0 model manifest persists immutable class/dtype/dimension/shape/parameter evidence and that load's free/total/peak CUDA measurements;
+  - later stages compare immutable model identity while independently enforcing fresh memory headroom, rather than incorrectly requiring dynamic free/peak byte values to repeat exactly.
+- Conversion evidence strengthened:
+  - a deterministic layer-0 actual-weight CPU FP32 probe must have maximum absolute all-expert error `<=1e-5` before full mutation;
+  - the conversion manifest now records both physical permutations and expert-group original-neuron indices;
+  - production orchestration requires 24 converted layers and expert width 448.
+- NLL aggregation correction: causal cross-entropy remains FP32 per token, but per-token losses move to CPU FP64 before reduction and durable addition. Full-vocabulary logits are not expanded to FP64.
+- M0 now records the fixed batch index, input-ID hash, attention-mask hash, finite-logit status, maximum absolute logit difference, and cosine in addition to both PPL aggregates and their ratio.
+- Report plots now annotate K and token/scored counts; local and rollout plots include zero-error references and PPL retains the dense ratio-1 reference.
+- Fresh final verification after all review fixes:
+  - `uv run pytest -q`: 122 passed in 21.92 seconds, zero failures;
+  - `uv lock --check`: passed with 85 resolved packages;
+  - `git diff --check`: passed; only Windows LF-to-CRLF notices were emitted.
+- Fresh live preflight after review fixes passed without loading weights:
+  - free disk `221,282,013,184` bytes;
+  - safetensors weight bytes `1,746,942,600`;
+  - total repository bytes `1,769,913,749`;
+  - all three pinned remote revisions matched;
+  - preflight JSON SHA256 `C793B5443E89593BDD4AE2FCA63E90489B95FCFE5011C2AB955560107807D149`.
+- Gate status at this checkpoint:
+  - `PHASE 1 IMPLEMENTATION: PASS`;
+  - `LIVE PREFLIGHT: PASS`;
+  - `GLOBAL M0: PENDING REAL WEIGHT LOAD + CONVERSION + PPL`;
+  - `M1: PENDING LOCAL/ROLLOUT RESULTS`.

@@ -1,0 +1,32 @@
+[experiment]
+name = "qwen35_0p8b_ppmoe_oracle_v0"
+artifact_root = "artifacts/phase1-v0"
+dtype = "bfloat16"
+context_length = 512
+calibration_tokens = 100000
+heldout_tokens = 100000
+smoke_tokens = 2048
+k_values = [8, 6, 4, 3, 2]
+num_experts = 8
+hidden_size = 1024
+num_hidden_layers = 24
+intermediate_size = 3584
+seed_base = 20260830
+
+[model]
+repo_id = "Qwen/Qwen3.5-0.8B-Base"
+revision = "dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68"
+
+[fineweb]
+repo_id = "HuggingFaceFW/fineweb-edu"
+name = "sample-10BT"
+split = "train"
+revision = "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9"
+streaming = true
+
+[wikitext]
+repo_id = "Salesforce/wikitext"
+name = "wikitext-103-raw-v1"
+split = "test"
+revision = "b08601e04326c79dfdd32d625aee71d232d685c3"
+streaming = false
