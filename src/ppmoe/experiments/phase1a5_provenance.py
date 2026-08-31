@@ -57,6 +57,91 @@ def _required_hashes(source_root: Path, relative_paths: Mapping[str, Path]) -> d
     return result
 
 
+def _canonical_sha256(value: Mapping[str, object]) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _read_pinned_stage(path: Path) -> Mapping[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SourceVerificationError(f"invalid pinned Phase 1A stage: {path}") from error
+    if not isinstance(value, dict):
+        raise SourceVerificationError(f"invalid pinned Phase 1A stage: {path}")
+    return value
+
+
+def _required_value(value: Mapping[str, object], key: str, context: str) -> object:
+    try:
+        return value[key]
+    except KeyError as error:
+        raise SourceVerificationError(f"pinned {context} is missing {key}") from error
+
+
+def _verify_anchored_evidence(
+    source_root: Path,
+    config: Phase1A5Config,
+    stage_hashes: Mapping[str, str],
+    dataset_hashes: Mapping[str, str],
+    model_hashes: Mapping[str, str],
+) -> None:
+    """Check mutable evidence against values committed by pinned stages."""
+    stages = {
+        name: _read_pinned_stage(source_root / "stages" / f"{name}.json")
+        for name in stage_hashes
+    }
+    datasets = _read_pinned_stage(source_root / "stages" / "datasets.json")
+    streams = _required_value(datasets, "streams", "datasets stage")
+    output_hashes = _required_value(datasets, "output_hashes", "datasets stage")
+    if not isinstance(streams, dict) or not isinstance(output_hashes, dict):
+        raise SourceVerificationError("pinned datasets stage has invalid stream hashes")
+
+    dataset_stage_names = {
+        "calibration": "calibration",
+        "fineweb-heldout": "fineweb_heldout",
+        "wikitext": "wikitext",
+    }
+    for manifest_name, stage_name in dataset_stage_names.items():
+        stream = streams.get(stage_name)
+        expected_output = output_hashes.get(stage_name)
+        if not isinstance(stream, dict) or not isinstance(expected_output, str):
+            raise SourceVerificationError(
+                f"pinned datasets stage is missing {manifest_name} manifest SHA-256"
+            )
+        expected_stream = stream.get("manifest_sha256")
+        actual = dataset_hashes[manifest_name]
+        if actual != expected_stream or actual != expected_output:
+            raise SourceVerificationError(
+                f"{manifest_name} manifest SHA-256 does not match pinned Phase 1A evidence"
+            )
+
+    m0 = stages["m0"]
+    for name, field in (("conversion", "conversion_file_sha256"), ("model", "model_file_sha256")):
+        expected = _required_value(m0, field, "M0 stage")
+        if model_hashes[name] != expected:
+            raise SourceVerificationError(
+                f"{name} manifest SHA-256 does not match pinned Phase 1A evidence"
+            )
+
+    phase1 = config.phase1_config
+    expected_m0_input = _canonical_sha256(
+        {
+            "config": _required_value(m0, "config_signature", "M0 stage"),
+            "conversion": _required_value(m0, "conversion_hash", "M0 stage"),
+            "microbatch_size": _required_value(
+                m0, "execution_microbatch_size", "M0 stage"
+            ),
+            "model": _canonical_sha256(
+                {"repo_id": phase1.model.repo_id, "revision": phase1.model.revision}
+            ),
+            "streams": output_hashes,
+        }
+    )
+    if expected_m0_input != _required_value(m0, "input_signature", "M0 stage"):
+        raise SourceVerificationError("dataset evidence does not match pinned M0 input")
+
+
 def verify_phase1a_sources(
     source_root: Path,
     output_root: Path,
@@ -92,6 +177,9 @@ def verify_phase1a_sources(
             "model": Path("manifests/model.json"),
         },
     )
+    _verify_anchored_evidence(
+        resolved_source_root, config, stage_hashes, dataset_hashes, model_hashes
+    )
     revision = dict((code_revision_provider or _current_code_revision)(resolved_source_root))
     if not isinstance(revision.get("commit"), str) or not revision["commit"]:
         raise SourceVerificationError("code revision provider did not supply a commit")
@@ -121,9 +209,21 @@ def phase1a5_signature(
     """Return the canonical signature that isolates non-interchangeable runs."""
     if microbatch_size <= 0:
         raise ValueError("microbatch_size must be positive")
+    stable_provenance = {
+        key: source_manifest[key]
+        for key in (
+            "source_root",
+            "stage_sha256",
+            "dataset_manifest_sha256",
+            "model_manifest_sha256",
+            "code_revision",
+            "solver_version",
+        )
+        if key in source_manifest
+    }
     payload = {
         "config": asdict(config),
-        "source_manifest": source_manifest,
+        "source_provenance": stable_provenance,
         "solver_version": solver_version,
         "code_revision": code_revision,
         "microbatch_size": microbatch_size,
