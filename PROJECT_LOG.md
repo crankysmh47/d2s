@@ -531,3 +531,13 @@ This file is an append-only record of material project actions, decisions, verif
   - preserve the free solution as a non-deployable mathematical upper bound;
   - measure D0/E8/R8 distances so BF16 decomposition error is not mislabeled as sparsification error.
 - The approved architecture is recorded in `docs/superpowers/specs/2026-09-01-phase1a5-sparse-reconstruction-oracle-design.md`. Implementation remains gated on final review of the written spec.
+
+### 2026-09-01 — Phase 1A.5 approved for implementation
+
+- Final spec review approved implementation after four refinements, all incorporated before planning:
+  - renamed the numerical diagnostic to `Registered Free-Reconstruction Candidate Bound` and stated the direction of its error/quality bound explicitly;
+  - unit regression uses relative tolerance `1e-10` only for identical stored sufficient statistics and `1e-8` for recomputed model outputs, while retaining exact untied subset matching on the smoke set;
+  - ridge near-zero scale uses registered `epsilon_zero=1e-15` relative to `max(||y||^2,1)`;
+  - bounded `[0,2]` reports lower/upper saturation rates at `1e-6` and is practical independently of the negative-rate diagnostic.
+- Added free-reconstruction gain recovery as an analysis-only metric; it cannot affect the pre-registered 30% eligibility gate.
+- Implementation plan written at `docs/superpowers/plans/2026-09-01-phase1a5-sparse-reconstruction-oracle.md`. It separates protocol provenance, solver core, certified bounded QP, local calibration/selection, orchestration, Reconstruction-H rollout, and hashed reporting into major reviewed checkpoints.

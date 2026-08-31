@@ -1,7 +1,7 @@
 # Phase 1A.5 Sparse Reconstruction Oracle Design
 
 **Date:** 2026-09-01  
-**Status:** Approved direction; implementation pending final spec review  
+**Status:** APPROVED FOR IMPLEMENTATION
 **Branch:** `exp`
 
 ## 1. Purpose
@@ -46,7 +46,7 @@ The initial local experiment evaluates K in `{4, 6}` only.
 
 ### 4.1 Unit
 
-Enumerate every K-subset and fix each selected coefficient to one. This is the exact Phase 1A regression condition. The source manifest must pin Phase 1A local-stage SHA-256 `90382EA91C74B1850FB7AEF81C6F4705DD625A8559EF0FA725BD4511FB2D8341`, rollout-stage SHA-256 `0F415AF16EBFFB6231041605C0A72C4A3505C6DB1F5FF832D6126B8B339E334E`, and M0-stage SHA-256 `B9BE2ECFE2B73A906682B652D65CE1C9DB094E0D23ECC825AB00E677BD3A40D0`. On the 2,048-token smoke, winning unit subsets must match exactly. On the full local run, total squared error, total target norm, and aggregate NMSE must match within relative tolerance `1e-10`; otherwise execution stops as a regression failure.
+Enumerate every K-subset and fix each selected coefficient to one. This is the exact Phase 1A regression condition. The source manifest must pin Phase 1A local-stage SHA-256 `90382EA91C74B1850FB7AEF81C6F4705DD625A8559EF0FA725BD4511FB2D8341`, rollout-stage SHA-256 `0F415AF16EBFFB6231041605C0A72C4A3505C6DB1F5FF832D6126B8B339E334E`, and M0-stage SHA-256 `B9BE2ECFE2B73A906682B652D65CE1C9DB094E0D23ECC825AB00E677BD3A40D0`. On the 2,048-token smoke, winning unit subsets must match exactly wherever objective ties are absent. If unit metrics are derived only from identical stored Phase 1A sufficient statistics, total squared error, total target norm, and aggregate NMSE must match within relative tolerance `1e-10`. If model outputs are recomputed, the aggregate relative tolerance is `1e-8`; otherwise execution stops as a regression failure. The manifest records which comparison path was used.
 
 ### 4.2 Scale-normalized ridge
 
@@ -64,17 +64,17 @@ and solve:
 
 Sweep `rho in {10, 1, 0.1, 0.01, 0.001}`. The dimensionless rho is comparable across tokens and layers despite changing activation scale.
 
-Use FP64 Cholesky when `lambda_eff > 0`. If `trace(G_S) == 0` in FP64, define the deterministic ridge result as `alpha = 1`, because every coefficient vector has the same reconstruction and the prior is minimized at one. If Cholesky fails despite positive `lambda_eff`, use an FP64 symmetric eigensolve of the same regularized system and require relative linear-system residual `||A alpha - rhs|| / max(||rhs||, 1) <= 1e-9`. A failure of both paths is unresolved. Solver failures, non-finite values, residuals, and fallback counts are durable metrics, never silently discarded.
+Use FP64 Cholesky when `lambda_eff > 0`. Register `epsilon_zero = 1e-15`. If `trace(G_S) <= epsilon_zero * max(||y||^2, 1)` in FP64, define the deterministic ridge result as `alpha = 1`, because every coefficient vector is numerically indistinguishable at the registered scale and the prior is minimized at one. If Cholesky fails despite positive `lambda_eff`, use an FP64 symmetric eigensolve of the same regularized system and require relative linear-system residual `||A alpha - rhs|| / max(||rhs||, 1) <= 1e-9`. A failure of both paths is unresolved. Solver failures, non-finite values, residuals, and fallback counts are durable metrics, never silently discarded.
 
 ### 4.3 Bounded
 
 Solve the unregularized objective `min ||y - E_S alpha||^2` subject to `0 <= alpha_i <= 2`. This is a practical coefficient upper bound because it preserves contribution sign and limits amplification. Use a deterministic batched convex box-QP solver with lexicographic subset enumeration. Its KKT certificate uses three separate dimensionless tests: maximum coefficient-bound violation at most `1e-7`; projected-gradient/stationarity residual divided by `max(||b_S||_inf, trace(G_S), 1)` at most `1e-7`; and complementarity residual divided by the same gradient scale at most `1e-7`. The projected-gradient test requires near-zero gradient for interior coefficients, nonnegative gradient at the lower bound, and nonpositive gradient at the upper bound. Equal candidate objectives within `1e-10 * max(||y||^2, 1)` are broken by lexicographically smaller subset. Within one subset, tied minimizers use minimum coefficient L2 norm, followed by lexicographic coordinate minimization if the norm also ties within `1e-12`. Synthetic and sampled cases must agree with exhaustive active-face enumeration to the same objective tolerance.
 
-### 4.4 Numerical free candidate-pool upper bound
+### 4.4 Registered Free-Reconstruction Candidate Bound
 
-Compute a numerical unconstrained reconstruction upper bound from the registered candidate pool below. This condition is explicitly non-deployable unless later evidence establishes sane coefficients. Because finite-precision cutoff semantics can discard real low-energy modes, failure of this condition is not proof that no exact span solution exists.
+Compute a numerical unconstrained reconstruction bound from the registered candidate pool below. Its loss is an upper bound on the unknown true minimum reconstruction error, equivalently a lower bound on the reconstruction quality attainable by the exact unconstrained optimum. This condition is explicitly non-deployable unless later evidence establishes sane coefficients. Because finite-precision cutoff semantics can discard real low-energy modes, failure of this condition is not proof that no exact span solution exists.
 
-The primary pseudoinverse candidate uses an FP64 symmetric eigendecomposition of G with relative eigenvalue cutoff `tau_G = 1e-12`: retain eigenvalue `lambda_j` iff `lambda_j > tau_G * lambda_max`; a zero matrix has effective rank zero. The direct FP64 SVD cross-check uses the equivalent singular-value rule `sigma_j > sqrt(tau_G) * sigma_max`. Sampled pseudoinverse candidates must agree in effective rank and reconstructed objective within `1e-9 * max(||y||^2, 1)`, independently of which candidate later wins the pool. Because a finite cutoff can discard a real low-energy mode, the authoritative result for each subset is the coefficient vector with the lowest materialized FP64 reconstruction loss among the cutoff pseudoinverse candidate, unit coefficients, and every computed ridge candidate. This remains a valid unconstrained coefficient solution and guarantees the reported candidate-pool upper bound is no worse than those registered feasible solutions. Objective ties within `1e-9 * max(||y||^2, 1)` select the smaller coefficient L2 norm, then the lexicographically smaller coefficient vector. Persist which candidate source won. The cutoff is immutable after synthetic tests; the result is never described as the exact span optimum.
+The primary pseudoinverse candidate uses an FP64 symmetric eigendecomposition of G with relative eigenvalue cutoff `tau_G = 1e-12`: retain eigenvalue `lambda_j` iff `lambda_j > tau_G * lambda_max`; a zero matrix has effective rank zero. The direct FP64 SVD cross-check uses the equivalent singular-value rule `sigma_j > sqrt(tau_G) * sigma_max`. Sampled pseudoinverse candidates must agree in effective rank and reconstructed objective within `1e-9 * max(||y||^2, 1)`, independently of which candidate later wins the pool. Because a finite cutoff can discard a real low-energy mode, the authoritative result for each subset is the coefficient vector with the lowest materialized FP64 reconstruction loss among the cutoff pseudoinverse candidate, unit coefficients, and every computed ridge candidate. This remains a valid unconstrained coefficient solution and guarantees the Registered Free-Reconstruction Candidate Bound is no worse than those registered feasible solutions. Objective ties within `1e-9 * max(||y||^2, 1)` select the smaller coefficient L2 norm, then the lexicographically smaller coefficient vector. Persist which candidate source won. The cutoff is immutable after synthetic tests; the result is never described as the exact span optimum.
 
 ## 5. Exact subset search
 
@@ -82,7 +82,7 @@ Enumerate every candidate subset: 70 at K=4 and 28 at K=6. Greedy search is proh
 
 Compute full-token G, b, and target norm once. Rank candidates with the quadratic objective, clamp only tiny negative losses attributable to floating-point cancellation, and record larger negative losses as numerical failures. Materialize the winning reconstruction once per token/condition for authoritative metrics and sampled formula-versus-vector validation.
 
-All oracle scoring uses at least FP32. Numerical upper-bound solves, correctness samples, and authoritative solver cross-checks use FP64. A quadratic-form loss in `[-1e-8 * max(||y||^2, 1), 0)` is clamped to zero; a more negative value is a numerical failure.
+All oracle scoring uses at least FP32. Registered Free-Reconstruction Candidate Bound solves, correctness samples, and authoritative solver cross-checks use FP64. A quadratic-form loss in `[-1e-8 * max(||y||^2, 1), 0)` is clamped to zero; a more negative value is a numerical failure.
 
 ## 6. Local experiment and metrics
 
@@ -103,6 +103,7 @@ For every layer, K, and oracle condition, record:
 - mean, median, p90, p95, and p99 where per-token distributions are required;
 - coefficient mean, standard deviation, p01, p05, median, p95, p99, and maximum absolute value;
 - negative coefficient rate, rates above absolute 2 and 4, mean absolute deviation from one, and L2 deviation from one;
+- for the bounded family, exact pooled rates `P(alpha < 1e-6)` and `P(alpha > 2 - 1e-6)` to reveal lower/upper-bound saturation;
 - effective rank, condition diagnostics, solver/fallback/failure counts;
 - expert selection frequencies and co-selection matrices;
 - subset Jaccard similarity across coefficient families;
@@ -121,15 +122,23 @@ For each of K=4 and K=6:
 1. A candidate must reduce aggregate local NMSE by at least 30% relative to the corresponding unit oracle.
 2. A practical candidate must additionally have:
    - empirical p99 absolute coefficient at most 2, enforced by an exact above-2 rate of at most 1%;
-   - negative coefficient rate at most 5%;
+   - negative coefficient rate at most 5%; for bounded `[0,2]`, this is satisfied by construction and bound-saturation rates replace it as the primary sign/limit diagnostic;
    - finite metrics;
    - zero unresolved numerical failures. A rank-deficient pseudoinverse candidate is diagnostic metadata, not automatically a failure. An unresolved failure is any non-finite input/output, violated bounded KKT certificate, pseudoinverse/direct-reference disagreement, objective-order violation, or solver failure remaining after its pre-registered fallback.
 3. Among eligible practical candidates, select the lowest aggregate NMSE. Resolve exact ties by smaller mean absolute deviation from one, then by stronger regularization.
-4. The numerical candidate-pool oracle advances as an upper-bound diagnostic whenever it reaches the 30% NMSE-reduction threshold, regardless of coefficient sanity.
+4. The Registered Free-Reconstruction Candidate Bound advances as a diagnostic whenever it reaches the 30% NMSE-reduction threshold, regardless of coefficient sanity.
 
-If no practical candidate qualifies, record that outcome; do not relax thresholds. A qualifying numerical candidate-pool condition advances to rollout even when no practical condition qualifies, because it is the registered upper-bound diagnostic. If neither a practical condition nor the numerical upper bound qualifies for either K, stop Phase 1A.5 after local reporting and proceed to Phase 1B.
+If no practical candidate qualifies, record that outcome; do not relax thresholds. A qualifying Registered Free-Reconstruction Candidate Bound advances to rollout even when no practical condition qualifies. If neither a practical condition nor this bound qualifies for either K, stop Phase 1A.5 after local reporting and proceed to Phase 1B.
 
 The 2,048-token smoke must benchmark each family separately. Projected full-local runtime is `smoke elapsed seconds * 100000 / 2048`. The 100K bounded run is permitted only when projected runtime is at most two GPU-hours, measured peak CUDA allocation is at most 12 GiB, there are zero solver failures, and every sampled bounded result has a valid KKT certificate. Otherwise bounded is reported as engineering-infeasible under V0.5 and is not replaced by a weaker solver without a new reviewed spec.
+
+For analysis only, report free-reconstruction gain recovery for every practical condition `c`:
+
+```text
+R_c = (L_unit - L_c) / (L_unit - L_free_bound)
+```
+
+where losses are the pooled aggregate local squared errors for the same K. If the denominator is non-positive within the registered objective tolerance, report the metric as undefined. This metric never affects eligibility.
 
 ## 8. Rollout reconstruction target
 
@@ -153,7 +162,7 @@ After local calibration selection, freeze and persist the exact condition IDs be
 
 - the unit oracle baseline;
 - the single selected practical condition, if one exists;
-- the numerical candidate-pool upper bound, if it passed its local gate.
+- the Registered Free-Reconstruction Candidate Bound, if it passed its local gate.
 
 If the practical winner is the bounded oracle, persist its solver configuration. If it is ridge, persist rho and every numerical setting. Evaluation code must refuse an unregistered condition.
 
@@ -166,11 +175,11 @@ Required tests before real execution:
 1. Unit mode reproduces the Phase 1A exact subset oracle.
 2. D0, E8, and condition-indexed R8 remain separately labeled and measured.
 3. Gram-form candidate loss agrees with materialized-vector loss.
-4. The authoritative numerical candidate-pool objective is no worse than any registered ridge or unit coefficient vector for the same subset by more than `1e-9 * max(||y||^2, 1)`.
+4. The authoritative Registered Free-Reconstruction Candidate Bound objective is no worse than any registered ridge or unit coefficient vector for the same subset by more than `1e-9 * max(||y||^2, 1)`.
 5. Bounded optimum satisfies all bounds and agrees with brute-force active-set references on synthetic cases.
 6. Scale-normalized ridge is invariant to a common scaling of E and y, within tolerance.
 7. Pseudoinverse-candidate effective rank and cutoff are deterministic and serialized.
-8. Sampled FP64 pseudoinverse candidates agree with direct QR/SVD reference loss independently of the candidate-pool winner.
+8. Sampled FP64 pseudoinverse candidates agree with direct QR/SVD reference loss independently of the Registered Free-Reconstruction Candidate Bound winner.
 9. Reconstruction-H uses the teacher-next-state correction after student drift.
 10. Failed microbatches roll back all statistics and resume without double counting.
 11. Calibration selection is persisted before evaluation and evaluation cannot alter it.
@@ -201,8 +210,8 @@ The primary table contains K, family, rho or constraint, active fraction, local 
 
 ## 12. Decision outcomes
 
-- **Numerical candidate-pool upper bound fails:** no registered numerical reconstruction condition qualified. This does not prove that no exact span solution exists, but it provides no actionable evidence for coefficient-aware routing under the pre-registered solver. Proceed directly to Phase 1B.
-- **Numerical upper bound succeeds but practical conditions fail:** registered numerical reconstruction redundancy exists but is not credibly exploitable. Proceed to Phase 1B and preserve the upper-bound result without claiming an exact span optimum.
+- **Registered Free-Reconstruction Candidate Bound fails:** no registered numerical reconstruction condition qualified. This does not prove that no exact span solution exists, but it provides no actionable evidence for coefficient-aware routing under the pre-registered solver. Proceed directly to Phase 1B.
+- **Registered Free-Reconstruction Candidate Bound succeeds but practical conditions fail:** registered numerical reconstruction redundancy exists but is not credibly exploitable. Proceed to Phase 1B and preserve the bound without claiming an exact span optimum.
 - **A practical condition succeeds at K=4:** investigate coefficient-aware routing that predicts both subset and amplitudes before changing the partition.
 - **Only K=6 succeeds:** retain 75%-active FFN as the supported fallback frontier while Phase 1B attempts to move the knee toward 50%.
 
