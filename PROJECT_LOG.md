@@ -453,3 +453,67 @@ This file is an append-only record of material project actions, decisions, verif
 - Reviewer-noted pre-existing risks remain open for the next slice, not hidden by this checkpoint:
   - stage/checkpoint signatures do not yet include a source-code revision;
   - the local K=8 gate still assumes NMSE `<=1e-8` despite measured independent-expert BF16 arithmetic above that floor.
+
+### 2026-09-01 — Local-oracle smoke gate corrected and passed
+
+- The first CUDA smoke attempt exposed `NotImplementedError: "addmm_cuda" not implemented for 'Long'` in integer co-selection counting. The failed checkpoint preserved zero completed batches and zero direct checks.
+- Replaced the unsupported integer CUDA matrix multiplication with boolean pairwise co-selection followed by a token reduction. A CUDA regression reproduced the failure before the fix and passed afterward.
+- A complete two-batch smoke then measured K=8 dense-target NMSE between `3.7478717472499317e-06` and `5.77891082239999e-06` across all 24 layers. The old `1e-8` dense-target threshold rejected this otherwise complete result.
+- Methodological correction: the written smoke requirement is consistency between K=8 selection and the literal all-expert independent-expert sum. It is not exact equality between that BF16 sum and the monolithic dense GEMM. The gate now:
+  - checks literal K=8 expert selection and output equality token by token;
+  - records a durable `all_expert_check_count` in checkpoints and requires it during report validation;
+  - requires exact converted-layer x configured-K coverage, positive token counts, finite accumulated errors/norms/NMSE, a complete run, and positive direct/all-expert checks;
+  - preserves the measured K=8 dense-target NMSE instead of thresholding or rewriting it.
+- TDD and verification:
+  - RED failures identified the missing result counter and obsolete `1e-8` gate;
+  - local-oracle tests passed 10/10, reporting tests 9/9, and the full suite passed 125/125;
+  - `uv lock --check` resolved 85 packages and `git diff --check` passed.
+- Fresh clean production smoke:
+  - command: `uv run python scripts/run_phase1_v0.py --stage local-smoke --artifact-root artifacts/phase1-v0 --microbatch-size 4`;
+  - exit code `0`, elapsed approximately 9 seconds;
+  - stage: `artifacts/phase1-v0/stages/local-smoke.json`;
+  - checkpoint signature: `68d295cb74e2e15eded893cbbf816f9efe4370b72ecefa69ebb5ace8a21a0931`;
+  - 1 completed batch, 0 failed batches;
+  - 1,920 direct checks and 49,152 literal all-expert checks;
+  - exact 24-layer x 5-K coverage (120 metrics);
+  - K=8 dense-target NMSE remained `3.7478717472499317e-06` to `5.77891082239999e-06`.
+- The stage did not record a peak-CUDA field. An unauthenticated Hugging Face Hub rate-limit warning recurred but did not affect cached data or execution.
+- Decision: local-oracle smoke passes. Proceed to the locked 100,000-token calibration run without tuning a post-hoc numerical tolerance.
+
+### 2026-09-01 — Full 100K-token local oracle PASS
+
+- Executed `uv run python scripts/run_phase1_v0.py --stage local --artifact-root artifacts/phase1-v0 --microbatch-size 4`.
+- Exit code `0`; elapsed `32.5` seconds; no CUDA/OOM failure.
+- Stage: `artifacts/phase1-v0/stages/local.json`.
+- Checkpoint signature: `68d295cb74e2e15eded893cbbf816f9efe4370b72ecefa69ebb5ace8a21a0931` under the full-local checkpoint namespace.
+- Completion evidence: 49/49 batches, zero failures, exact 24-layer x 5-K coverage, and 100,000 tokens for every layer/K metric.
+- Validation evidence: 1,920 direct checks and 2,400,000 literal all-expert checks.
+- Aggregate normalized error over all layers:
+  - K=8: `4.464879674258729e-06`;
+  - K=6: `0.09733733576993434`;
+  - K=4: `0.2485731050105692`;
+  - K=3: `0.35453659422814027`;
+  - K=2: `0.49269984905605735`.
+- Interpretation: the all-expert point remains at the measured BF16 independent-sum floor, while removing 25%, 50%, 62.5%, and 75% of experts produces progressively larger local reconstruction error. These are measurements, not yet end-to-end sparse-model quality claims.
+- Peak CUDA was not recorded by this stage. The unauthenticated Hugging Face warning recurred without affecting execution.
+
+### 2026-09-01 — Full rollout oracle PASS with negative sparsity result
+
+- Executed `uv run python scripts/run_phase1_v0.py --stage rollout --artifact-root artifacts/phase1-v0 --microbatch-size 4`.
+- Exit code `0`; elapsed `542.4` seconds. Peak CUDA allocation was `8,699,603,456` bytes; no OOM occurred.
+- Stage: `artifacts/phase1-v0/stages/rollout.json`.
+- All 10 dataset/K settings completed with zero failures and complete 24-layer intervention coverage.
+- WikiText-103 raw test: 147 batches and 299,357 scored tokens per K.
+  - K=8: PPL `20.7820`, aggregate hidden NMSE `0.000132`;
+  - K=6: PPL `29.0723`, aggregate hidden NMSE `0.119446`;
+  - K=4: PPL `54.1177`, aggregate hidden NMSE `0.278846`;
+  - K=3: PPL `103.0113`, aggregate hidden NMSE `0.393997`;
+  - K=2: PPL `515.6701`, aggregate hidden NMSE `0.547125`.
+- FineWeb-Edu held-out: 49 batches and 99,804 scored tokens per K.
+  - K=8: PPL `16.0964`, aggregate hidden NMSE `0.000119`;
+  - K=6: PPL `22.2418`, aggregate hidden NMSE `0.111854`;
+  - K=4: PPL `39.6923`, aggregate hidden NMSE `0.266938`;
+  - K=3: PPL `69.5593`, aggregate hidden NMSE `0.380337`;
+  - K=2: PPL `282.0449`, aggregate hidden NMSE `0.533937`.
+- Interpretation: the rollout mechanism and coverage gate pass, but the scientific result is negative for naive fixed-K local-oracle sparsification. Even K=6 materially degrades both external and in-domain PPL; degradation accelerates at lower K. This result must be preserved and should constrain any learned-router work rather than be tuned away.
+- The unauthenticated Hugging Face warning recurred without affecting cached inputs or the completed run.

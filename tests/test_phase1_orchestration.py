@@ -188,7 +188,17 @@ def test_execution_microbatch_isolates_m0_local_and_rollout_checkpoints(tmp_path
         return SimpleNamespace(
             complete=True,
             direct_check_count=1,
-            layer_k={(0, config.num_experts): SimpleNamespace(normalized_mse=0.0)},
+            all_expert_check_count=1,
+            layer_k={
+                (layer, k): SimpleNamespace(
+                    normalized_mse=5.8e-6,
+                    squared_error_sum=5.8e-6,
+                    target_squared_norm_sum=1.0,
+                    token_count=1,
+                )
+                for layer in range(2)
+                for k in config.k_values
+            },
         )
 
     def rollout_runner(_teacher, _student, _batches, *, checkpoint_dir, run_signature, **_kwargs):

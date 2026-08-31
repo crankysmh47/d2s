@@ -48,6 +48,7 @@ class LocalOracleResult:
     completed_batches: int
     failed_batches: int
     direct_check_count: int
+    all_expert_check_count: int
     complete: bool
 
 
@@ -82,6 +83,7 @@ class LocalOracleAccumulator:
         self.completed_batches: set[int] = set()
         self.failures: dict[int, str] = {}
         self.direct_check_count = 0
+        self.all_expert_check_count = 0
         self._direct_checked_pairs: set[tuple[int, int]] = set()
         self._stats = {
             (layer, k): [0.0, 0.0, 0]
@@ -132,6 +134,7 @@ class LocalOracleAccumulator:
         self.completed_batches = {int(index) for index in state["completed_batches"]}
         self.failures = {int(index): str(message) for index, message in state["failures"].items()}
         self.direct_check_count = int(state.get("direct_check_count", 0))
+        self.all_expert_check_count = int(state.get("all_expert_check_count", 0))
         self._direct_checked_pairs = {
             (int(layer), int(k)) for layer, k in state.get("direct_checked_pairs", ())
         }
@@ -174,6 +177,7 @@ class LocalOracleAccumulator:
                     for layer, k in self._stats
                 },
                 "completed_batches": sorted(self.completed_batches),
+                "all_expert_check_count": self.all_expert_check_count,
                 "direct_check_count": self.direct_check_count,
                 "direct_checked_pairs": [list(pair) for pair in sorted(self._direct_checked_pairs)],
                 "failures": {str(index): self.failures[index] for index in sorted(self.failures)},
@@ -203,6 +207,7 @@ class LocalOracleAccumulator:
             deepcopy(self._interaction_sum),
             deepcopy(self._cancellation_count),
             self.direct_check_count,
+            self.all_expert_check_count,
             deepcopy(self._direct_checked_pairs),
         )
 
@@ -216,6 +221,7 @@ class LocalOracleAccumulator:
             self._interaction_sum,
             self._cancellation_count,
             self.direct_check_count,
+            self.all_expert_check_count,
             self._direct_checked_pairs,
         ) = snapshot
 
@@ -278,6 +284,13 @@ class LocalOracleAccumulator:
                 1,
                 chosen[..., None].expand(-1, -1, scoring_experts.shape[-1]),
             ).sum(dim=1)
+            if k == self.num_experts:
+                expected = torch.arange(self.num_experts, device=chosen.device).expand_as(chosen)
+                if not torch.equal(chosen, expected):
+                    raise RuntimeError("all-expert oracle did not select every expert in order")
+                if not torch.equal(selected, scoring_experts.sum(dim=1)):
+                    raise RuntimeError("all-expert oracle output disagrees with the literal expert sum")
+                self.all_expert_check_count += target.shape[0]
             squared_error = float(
                 (selected - scoring_target)
                 .square()
@@ -297,11 +310,17 @@ class LocalOracleAccumulator:
                 self._selection_counts[(layer, k)][expert] += int(count)
             selected_mask = torch.zeros(
                 (target.shape[0], self.num_experts),
-                dtype=torch.int64,
+                dtype=torch.bool,
                 device=chosen.device,
             )
-            selected_mask.scatter_(1, chosen, 1)
-            co_selection = (selected_mask.T @ selected_mask).cpu().tolist()
+            selected_mask.scatter_(1, chosen, True)
+            co_selection = (
+                selected_mask[:, :, None]
+                .logical_and(selected_mask[:, None, :])
+                .sum(dim=0)
+                .cpu()
+                .tolist()
+            )
             for expert_a in range(self.num_experts):
                 for expert_b in range(self.num_experts):
                     self._co_selection[(layer, k)][expert_a][expert_b] += int(
@@ -349,6 +368,7 @@ class LocalOracleAccumulator:
             completed_batches=len(self.completed_batches),
             failed_batches=len(self.failures),
             direct_check_count=self.direct_check_count,
+            all_expert_check_count=self.all_expert_check_count,
             complete=not self.failures and bool(self.completed_batches),
         )
 

@@ -29,10 +29,34 @@ def test_local_accumulator_aggregates_selection_interaction_and_cancellation() -
 
     assert result.layer_k[(0, 2)].token_count == 2
     assert result.layer_k[(0, 2)].normalized_mse == pytest.approx(0.0, abs=1e-7)
+    assert result.all_expert_check_count == 2
     assert sum(result.selection_counts[(0, 1)]) == 2
     assert result.co_selection[(0, 2)] == ((2, 2), (2, 2))
     assert result.interaction_sum[0][0][1] < 0
     assert result.cancellation_count[0][0][1] == 1
+
+
+@pytest.mark.cuda
+def test_local_accumulator_counts_co_selection_on_cuda() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+
+    experts = torch.tensor(
+        [
+            [[1.0, 0.0], [0.0, 1.0]],
+            [[0.0, 1.0], [1.0, 0.0]],
+        ],
+        device="cuda",
+    )
+    accumulator = LocalOracleAccumulator(
+        num_layers=1,
+        num_experts=2,
+        k_values=(2,),
+    )
+
+    accumulator.update_layer(0, experts.sum(dim=1), experts)
+
+    assert accumulator.finalize().co_selection[(0, 2)] == ((2, 2), (2, 2))
 
 
 def test_local_accumulator_resume_and_signature_guard(tmp_path) -> None:
@@ -59,6 +83,7 @@ def test_local_accumulator_resume_and_signature_guard(tmp_path) -> None:
     assert resumed.completed_batches == {0}
     assert resumed.finalize().layer_k[(0, 2)].token_count == 1
     assert resumed.finalize().direct_check_count == 2
+    assert resumed.finalize().all_expert_check_count == 1
     with pytest.raises(ValueError, match="signature"):
         LocalOracleAccumulator(
             num_layers=1,
@@ -172,6 +197,7 @@ def test_local_runner_rolls_back_earlier_layers_before_persisting_failure(
 
     assert result.failed_batches == 1
     assert result.layer_k[(0, 8)].token_count == 0
+    assert result.all_expert_check_count == 0
     resumed = LocalOracleAccumulator(
         num_layers=2,
         num_experts=8,
@@ -180,6 +206,7 @@ def test_local_runner_rolls_back_earlier_layers_before_persisting_failure(
         run_signature="transaction-test",
     )
     assert resumed.finalize().layer_k[(0, 8)].token_count == 0
+    assert resumed.finalize().all_expert_check_count == 0
 
 
 def test_local_runner_uses_text_stack_not_composite_forward(monkeypatch, tmp_path) -> None:

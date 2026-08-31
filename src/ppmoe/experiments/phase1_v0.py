@@ -569,9 +569,24 @@ def _local_stage(
         ),
         run_signature=signature,
     )
-    k8 = [metric for (layer, k), metric in result.layer_k.items() if k == config.num_experts]
-    if not result.complete or result.direct_check_count <= 0 or not k8 or any(
-        not isfinite(metric.normalized_mse) or metric.normalized_mse > 1e-8 for metric in k8
+    expected_pairs = {
+        (layer, k)
+        for layer in range(conversion.converted_layers)
+        for k in config.k_values
+    }
+    metrics_are_valid = all(
+        metric.token_count > 0
+        and isfinite(metric.squared_error_sum)
+        and isfinite(metric.target_squared_norm_sum)
+        and isfinite(metric.normalized_mse)
+        for metric in result.layer_k.values()
+    )
+    if (
+        not result.complete
+        or result.direct_check_count <= 0
+        or result.all_expert_check_count <= 0
+        or set(result.layer_k) != expected_pairs
+        or not metrics_are_valid
     ):
         raise StageError("local oracle smoke/completion gate failed")
     stage = "local-smoke" if smoke else "local"

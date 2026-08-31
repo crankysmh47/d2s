@@ -151,6 +151,12 @@ def render_phase1_report(artifact_root: Path, config: Phase1Config) -> ReportMan
         raise ReportValidationError("local result is incomplete")
     if _integer(local_result.get("direct_check_count"), "local direct checks", positive=True) <= 0:
         raise ReportValidationError("local direct checks are missing")
+    if _integer(
+        local_result.get("all_expert_check_count"),
+        "local all-expert checks",
+        positive=True,
+    ) <= 0:
+        raise ReportValidationError("local all-expert checks are missing")
     layer_k_raw = local_result.get("layer_k")
     if not isinstance(layer_k_raw, Mapping):
         raise ReportValidationError("local layer/K metrics are missing")

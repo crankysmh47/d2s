@@ -75,6 +75,7 @@ def _write_finalized_stages(root: Path, config: Phase1Config) -> None:
             "complete": True,
             "failed_batches": 0,
             "direct_check_count": 10,
+            "all_expert_check_count": 10,
             "layer_k": layer_k,
             "selection_counts": selection_counts,
             "co_selection": co_selection,
@@ -188,6 +189,12 @@ def test_metric_plots_annotate_k_and_counts_with_locked_references() -> None:
         ("m0", lambda value: value["results"]["wikitext"]["teacher"].__setitem__("ppl", None), "finite"),
         ("m0", lambda value: value["results"]["wikitext"]["student"].__setitem__("ppl", None), "finite"),
         ("local", lambda value: value["result"].__setitem__("complete", False), "incomplete"),
+        ("local", lambda value: value["result"].pop("all_expert_check_count"), "all-expert"),
+        (
+            "local",
+            lambda value: value["result"].__setitem__("all_expert_check_count", 0),
+            "all-expert",
+        ),
         ("local", _drop_local_layer, "missing"),
         ("rollout", lambda value: value["results"].pop("wikitext:k4"), "missing"),
         (
