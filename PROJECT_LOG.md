@@ -517,3 +517,17 @@ This file is an append-only record of material project actions, decisions, verif
   - K=2: PPL `282.0449`, aggregate hidden NMSE `0.533937`.
 - Interpretation: the rollout mechanism and coverage gate pass, but the scientific result is negative for naive fixed-K local-oracle sparsification. Even K=6 materially degrades both external and in-domain PPL; degradation accelerates at lower K. This result must be preserved and should constrain any learned-router work rather than be tuned away.
 - The unauthenticated Hugging Face warning recurred without affecting cached inputs or the completed run.
+
+### 2026-09-01 — Phase 1A.5 direction approved for specification
+
+- The Phase 1A random-partition rollout result triggered the plan's decomposition-improvement fork rather than router training.
+- A proposed sparse reconstruction oracle was reviewed and approved with methodological corrections:
+  - separate monolithic dense D0, literal eight-expert E8, and reconstructed R8 references;
+  - scale ridge regularization by subset Gram trace;
+  - use stable, cutoff-recorded free reconstruction with sampled direct FP64 validation;
+  - include unit, ridge, bounded `[0,2]`, and free oracle families at K in `{4,6}`;
+  - select conditions using calibration only and freeze them before WikiText/FineWeb-heldout evaluation;
+  - use teacher-next-state correction Reconstruction-H during rollout;
+  - preserve the free solution as a non-deployable mathematical upper bound;
+  - measure D0/E8/R8 distances so BF16 decomposition error is not mislabeled as sparsification error.
+- The approved architecture is recorded in `docs/superpowers/specs/2026-09-01-phase1a5-sparse-reconstruction-oracle-design.md`. Implementation remains gated on final review of the written spec.
