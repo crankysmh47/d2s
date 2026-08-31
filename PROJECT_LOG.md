@@ -313,3 +313,143 @@ This file is an append-only record of material project actions, decisions, verif
   - `LIVE PREFLIGHT: PASS`;
   - `GLOBAL M0: PENDING REAL WEIGHT LOAD + CONVERSION + PPL`;
   - `M1: PENDING LOCAL/ROLLOUT RESULTS`.
+
+### 10:42–10:48 PKT — Real Phase 1 dataset materialization
+
+- Executed the committed dataset stage once:
+  - `uv run python scripts/run_phase1_v0.py --stage datasets --artifact-root artifacts/phase1-v0 --microbatch-size 1`
+  - exit code `0`; elapsed `288.705` seconds; stage status `complete`.
+- Deterministic corpus evidence:
+  - FineWeb-Edu calibration: exactly `100,000` Qwen tokens, `196 x 512` tensor shape, 130 source document records;
+  - FineWeb-Edu held-out: exactly `100,000` Qwen tokens, `196 x 512`, 90 source document records;
+  - calibration next row `130` equals held-out start row `130`;
+  - calibration/held-out document-ID intersection is empty;
+  - WikiText-103 raw test: complete stream, `299,943` Qwen tokens, `586 x 512`, 2,891 nonempty records from 4,358 source rows.
+- Independently verified stage signature and all manifest/tensor hashes. Manifest SHA256 values:
+  - calibration `FAE56A3EF5E50D03CA2C939B99D04E91DDAEBA0828B6E46CFA1DFFE61E920A92`;
+  - held-out `476BC91A0C976835B1FCE96989A863C9F2419664EB7AB21619008F2F94BBA658`;
+  - WikiText `23FFA28D98D4FE0F5318F23EE104BABA42330EC46B677B23FCB99D2A08336D91`.
+- Artifact-root size increased by `8,655,816` bytes. Hugging Face cache increased by `887,680,934` bytes during tokenizer and streamed dataset access.
+- Environment warnings preserved:
+  - Hugging Face requests remain unauthenticated;
+  - Windows symlink-cache degradation remains active;
+  - FineWeb access encountered two read timeouts and one DNS lookup failure; library retries recovered without a manual rerun.
+- No raw document text entered Git or the project log. `artifacts/` remains ignored.
+- Next gate: real two-model BF16 load, locked-dimension/headroom validation, actual-weight FP32 conversion probe, full conversion, and dense/all-expert M0 perplexity on both corpora.
+
+### 10:52–11:02 PKT — First real M0 attempt stopped at fixed-batch equivalence gate
+
+- Executed exactly once with microbatch size 2:
+  - `uv run python scripts/run_phase1_v0.py --stage m0 --artifact-root artifacts/phase1-v0 --microbatch-size 2`
+  - exit code `1`; elapsed `622.416` seconds; no retry or parameter change.
+- Checkpoint/model gates that passed before the stop:
+  - concrete `Qwen3_5ForConditionalGeneration`, actual BF16 parameters on `cuda:0`;
+  - 24 text layers, hidden size 1024, intermediate size 3584, and every gate/up/down shape validated;
+  - two-model CUDA evidence: free `12,197,036,032`, total `17,102,864,384`, peak `3,481,065,472` bytes; the 4 GiB headroom gate passed;
+  - 24 converted FFNs, 8 experts of width 448, and unchanged parameter count `852,985,920`;
+  - layer-0 actual-weight CPU FP32 probe maximum absolute difference `7.450580596923828e-08`, below `1e-5`;
+  - runtime vision-module identity guard passed.
+- Complete WikiText evidence before the stop:
+  - dense teacher PPL `20.781730576659253`, NLL `908271.3691734727`;
+  - all-expert student PPL `20.782032063092196`, NLL `908275.7119984903`;
+  - PPL ratio `1.0000145072823377`, inside the locked `[0.999, 1.001]` interval;
+  - each model scored `299,357` causal tokens in `293/293` batches with zero failures.
+- Hard stop: fixed-batch logit cosine `0.999959382` was below the locked `0.99999` threshold, raising `M0GateError`.
+- Because discrepancy evidence was assembled only after the cosine gate, the failed attempt did not persist the fixed-batch input/mask hashes, finite flag, or maximum absolute logit difference. FineWeb held-out evaluation did not start and `stages/m0.json` was not written.
+- Preserved evidence:
+  - model manifest SHA256 `1B970B3FCD8B11E0553A7CE8B1743E0F0DE1EF15391906DDAA719CAB4D8707A5`;
+  - conversion manifest SHA256 `20153B0229F69C8C380D608C7E757EAF29454C6A068A685572A4A51563284EA4`;
+  - teacher checkpoint SHA256 `F088DA67ACAAAF21F30757AF1D703E9ECA40F9C067EB112E48FD1408DB03CC16`;
+  - student checkpoint SHA256 `072508790AAFBAAC9AA55049E51D90589E4861491F596D0EFDEEBEBA587B84CE`.
+- Diagnostic ruling: do not relax the cosine threshold. First isolate whether the discrepancy comes from the current eight-GEMM expert-sum all-expert path, physical-permutation accumulation order, or another conversion defect.
+
+### 11:09–11:14 PKT — M0 BF16 accumulation-order diagnosis
+
+- The first diagnostic instrumentation attempt was preserved as a failure artifact rather than silently retried:
+  - `artifacts/phase1-v0/diagnostics/m0-accumulation.json`;
+  - SHA256 `9072943B6FA67DDC79451BDD36D5B5D4F4D111A9B5111589119D8E7A9FCBC64C`;
+  - it stopped before persisting comparisons because it queried PyTorch's internal tensor version counter inside `inference_mode` (`Inference tensors do not track version counter`).
+- A corrected one-shot diagnostic used the same persisted WikiText batch 0 at microbatch 2 and transactionally persisted:
+  - `artifacts/phase1-v0/diagnostics/m0-accumulation-v2.json`;
+  - SHA256 `8065DD21BD6D399B6E2ACF1F11D5B3CBABFEAD11D7621498EE0DF7E87D23078B`;
+  - input shape `[2, 512]`, 1,024 valid tokens; input-ID SHA256 `75FDFF750A22A8D923E251688FAA1225D185FEF1A4D6868F59E4088A55EFDF17`; mask SHA256 `E70C49B36DB298C56E85CFEA6CAB6E96432682F410729A73470A52813E3526E9`.
+- Full-model fixed-batch comparison:
+  - fresh unconverted teacher/student control: cosine `1.0`, zero max/RMS/NMSE difference;
+  - current eight-expert down-GEMM sum: cosine `0.9999593822093301`, max absolute difference `0.5`, RMS `0.0355147380`, NMSE `8.1248690e-05`;
+  - physically permuted monolithic down GEMM: cosine `0.9999615374834674`, max absolute difference `0.5`, RMS `0.0345793568`, NMSE `7.7025222e-05`.
+- Layer-local comparisons used identical captured teacher MLP inputs for all 24 layers:
+  - current expert sum worst cosine `0.9999963744972646` at layer 14; maximum absolute difference `0.03125` at layer 23;
+  - monolithic permuted path worst cosine `0.9999999891801782` at layer 20; maximum absolute difference `0.015625` at layer 23.
+- The temporary diagnostic changed no weights: 473 tensors and `852,985,920` elements retained identical metadata and sampled-value hashes before/after; methods were restored.
+- Root-cause status: the checkpoint and conversion mapping are correct. BF16 neuron-order changes introduce very small per-layer differences that compound through the 24-layer autoregressive stack; eight separate expert GEMMs add some error but are not the sole cause. Next diagnostic: test an all-expert path that restores original neuron order at execution time while retaining physically permuted stored parameters.
+
+### 11:17–11:32 PKT — Exact all-expert path confirmed and implemented
+
+- V3 tested execution-time restoration of original neuron order while keeping all stored gate/up rows and down columns physically permuted:
+  - artifact SHA256 `EB8D0E312132406CEF4894FE2DE50DE060BF2756FBE23E6CAEC66CCC94983926`;
+  - full-model fixed-batch logits were bit-exact: cosine `1.0`, maximum/RMS/NMSE difference `0`;
+  - all 24 layer-local MLP outputs had maximum/RMS/NMSE difference `0` on identical teacher inputs;
+  - FP32 summation of already-rounded expert outputs did not improve the original failure.
+- V4 tested independent FP32 expert down projections plus FP32 accumulation:
+  - artifact SHA256 `69E95DA53CA0C2D1EA6B433CD1549CBE0FB119C2C71B5BC2B9DB6788A3C4E0E3`;
+  - full-model cosine `0.9999621624291856`, below `0.99999`;
+  - worst layer-local K=8 NMSE `5.345445260689922e-08`, still above the locked `1e-8` local gate.
+- V5 additionally restored original neuron order within each expert's FP32 GEMM:
+  - artifact SHA256 `63281695D9DA999AAEB291EA296E5C51FE84E39D6D5C27746D508B550C75610F`;
+  - full-model cosine `0.9999607041815973`, below `0.99999`;
+  - 0/24 layers met local NMSE `<=1e-8`; worst NMSE `5.3146541930675825e-08`.
+- Conclusion: independent expert GEMMs are not bitwise decomposable from one dense BF16 GEMM because each partial result is rounded before summation. This is a numerical execution effect, not parameter corruption. The exact all-expert correctness path must globally restore original neuron order and use one down-projection GEMM; sparse selected-expert paths must retain their real independent-expert arithmetic so the oracle curve does not hide that cost.
+- Implemented with strict TDD:
+  - RED regression failed at `torch.equal` against the previous expert-sum path;
+  - GREEN restores activation and down-column order through a non-persistent inverse-permutation buffer only when no selection or oracle transform is active;
+  - selected-expert execution and oracle expert-output capture remain unchanged;
+  - targeted regression passed; conversion module 6/6 passed; full suite 123/123 passed; `git diff --check` passed.
+- Operational trade-off: the M0 correctness path materializes reordered activation and down-weight views/copies per FFN, increasing all-expert evaluation allocation/latency. It adds no parameters and is not used by selected sparse execution.
+- Resume ruling: do not reuse the failed microbatch-2 M0 checkpoint because its student PPL was produced by the superseded expert-sum default path and the current checkpoint signature does not contain a code-version fingerprint. Preserve it as negative evidence and run the corrected M0 at microbatch 1, which has a clean signature-isolated checkpoint path.
+
+### 11:39–11:43 PKT — Corrected real M0 PASS
+
+- Fresh pre-run verification: `uv run pytest -q` passed 123 tests in 12.46 seconds; `git diff --check` exited zero.
+- Executed exactly once in a clean signature-isolated attempt:
+  - `uv run python scripts/run_phase1_v0.py --stage m0 --artifact-root artifacts/phase1-v0 --microbatch-size 1`;
+  - exit code `0`; elapsed `176.5` seconds;
+  - stage SHA256 `B9BE2ECFE2B73A906682B652D65CE1C9DB094E0D23ECC825AB00E677BD3A40D0`;
+  - stage input signature `6fe6f78c9102389dc30f9f351b14af665358453b3948fcba23103a7a2c78abe2`.
+- WikiText-103 raw test:
+  - dense and converted all-expert PPL both `20.783743340940465`;
+  - dense and student NLL both `908300.3612681422`;
+  - PPL ratio `1.0`;
+  - each scored `299,357` causal tokens in `586/586` completed microbatches with zero failures;
+  - fixed-batch logits finite, cosine `1.0`, maximum absolute difference `0.0`.
+- FineWeb-Edu held-out:
+  - dense and converted all-expert PPL both `16.096086699454688`;
+  - dense and student NLL both `277313.0170986966`;
+  - PPL ratio `1.0`;
+  - each scored `99,804` causal tokens in `196/196` completed microbatches with zero failures;
+  - fixed-batch logits finite, cosine `1.0`, maximum absolute difference `0.0`.
+- Evaluation peak CUDA allocation was `5,039,206,400` bytes for each corpus/model pass. Load-time evidence remained: free `12,197,036,032`, total `17,102,864,384`, peak `3,481,065,472` bytes.
+- Parameter/conversion evidence remained exact: 24 text layers, 8 experts x 448 neurons, `852,985,920` parameters before/after, BF16 on `cuda:0`, layer-0 FP32 probe `7.450580596923828e-08`, and runtime vision-module identity guard passed.
+- Clean checkpoint evidence:
+  - WikiText signature `2bba489dc298633cf610e92c322ddd6cd901cd493357ee2820e1e1b2b5d00e1c`, identical teacher/student state SHA256 `70096E0B9396AD2EF1F04B840F01CA93C6B254E8990F27B6A59BE24F7860F0D7`;
+  - FineWeb signature `9566b873ab64363458b3776f53bf7dfbb895b2cd88abaae733361580847dce9f`, identical teacher/student state SHA256 `D6EFDC609C96AEAE81B28E8CA2307D28660354183A25D9ADECB5DBB20092B58E`.
+- The failed microbatch-2 checkpoint hashes and timestamps remained unchanged. Hugging Face cache delta was zero; only the known unauthenticated-request warning recurred.
+- Gate decision: `GLOBAL M0: PASS`. This is the first real Phase 1 result: the fully converted parameter-preserving Qwen text stack matches the dense teacher exactly under the locked external and in-domain PPL pipelines.
+- Next gate remains the 2,048-token local-oracle smoke. The K=8 local expert-sum numerical floor is deliberately not hidden by the exact M0 correctness path and must be handled as measured BF16 execution behavior, not parameter-conversion failure.
+
+### 2026-09-01 — First-results checkpoint review closure
+
+- A fresh read-only Terra review found no Critical implementation issues and confirmed:
+  - physical gate/up/down permutation remains intact;
+  - inverse permutation is a non-persistent long buffer with correct device migration and unchanged serialization;
+  - selected-expert and oracle `output_transform` paths remain unchanged;
+  - the restored-order default path is autograd-safe and adds no parameters.
+- The review's sole Important finding was missing committed coverage at the real BF16/CUDA FFN dimensions. Added a focused production-shape test using hidden size 1024 and intermediate size 3584.
+- Fresh local verification after the test addition:
+  - production-shape CUDA/BF16 regression: 1 passed in 14.01 seconds;
+  - Qwen conversion module: 7 passed in 3.09 seconds;
+  - full suite: 124 passed in 14.61 seconds;
+  - `uv lock --check`: 85 packages resolved, exit zero;
+  - `git diff --check`: exit zero.
+- Reviewer-noted pre-existing risks remain open for the next slice, not hidden by this checkpoint:
+  - stage/checkpoint signatures do not yet include a source-code revision;
+  - the local K=8 gate still assumes NMSE `<=1e-8` despite measured independent-expert BF16 arithmetic above that floor.

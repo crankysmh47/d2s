@@ -133,6 +133,11 @@ class PartitionedQwen35MLP(nn.Module):
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False, **factory)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False, **factory)
         self.register_buffer("permutation", permutation.detach().clone(), persistent=False)
+        self.register_buffer(
+            "inverse_permutation",
+            torch.argsort(permutation).detach().clone(),
+            persistent=False,
+        )
         with torch.no_grad():
             self.gate_proj.weight.copy_(dense.gate_proj.weight.index_select(0, permutation))
             self.up_proj.weight.copy_(dense.up_proj.weight.index_select(0, permutation))
@@ -177,20 +182,24 @@ class PartitionedQwen35MLP(nn.Module):
         x: Tensor,
         selected_experts: Sequence[int] | Tensor | None = None,
     ) -> Tensor:
+        if selected_experts is None and self._output_transform is None:
+            activated_new = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+            activated_original = activated_new.index_select(-1, self.inverse_permutation)
+            down_original = self.down_proj.weight.index_select(1, self.inverse_permutation)
+            return F.linear(activated_original, down_original)
         outputs = self.expert_outputs(x)
         if selected_experts is None:
-            if self._output_transform is not None:
-                transformed = self._output_transform(x, outputs)
-                if not isinstance(transformed, Tensor):
-                    raise TypeError("output transform must return a tensor")
-                if transformed.shape != x.shape:
-                    raise ValueError("output transform returned a tensor with the wrong shape")
-                if transformed.device != x.device:
-                    raise ValueError("output transform returned a tensor on the wrong device")
-                if transformed.dtype != x.dtype:
-                    raise ValueError("output transform returned a tensor with the wrong dtype")
-                return transformed
-            return outputs.sum(dim=-2)
+            assert self._output_transform is not None
+            transformed = self._output_transform(x, outputs)
+            if not isinstance(transformed, Tensor):
+                raise TypeError("output transform must return a tensor")
+            if transformed.shape != x.shape:
+                raise ValueError("output transform returned a tensor with the wrong shape")
+            if transformed.device != x.device:
+                raise ValueError("output transform returned a tensor on the wrong device")
+            if transformed.dtype != x.dtype:
+                raise ValueError("output transform returned a tensor with the wrong dtype")
+            return transformed
         if isinstance(selected_experts, Tensor):
             selections = selected_experts.to(device=outputs.device, dtype=torch.long)
             if tuple(selections.shape[:-1]) != tuple(outputs.shape[:-2]):

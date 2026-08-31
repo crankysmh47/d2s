@@ -2,6 +2,7 @@ from copy import deepcopy
 
 import pytest
 import torch
+from transformers import Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5MLP
 
 from ppmoe.moefication.qwen35 import (
@@ -85,6 +86,61 @@ def test_all_expert_and_selected_execution_match_literal_reconstruction() -> Non
     torch.testing.assert_close(selected, literal)
 
 
+def test_default_all_expert_restores_original_reduction_order_exactly() -> None:
+    torch.manual_seed(47)
+    model = tiny_qwen35()
+    dense = deepcopy(model.model.language_model.layers[0].mlp)
+    inputs = torch.randn(2, 3, 16)
+
+    convert_qwen35_text_ffns(model, num_experts=8, seed_base=29)
+    converted = model.model.language_model.layers[0].mlp
+
+    assert torch.equal(converted(inputs), dense(inputs))
+    assert torch.equal(converted.inverse_permutation, torch.argsort(converted.permutation))
+    assert "model.language_model.layers.0.mlp.inverse_permutation" not in model.state_dict()
+
+
+@pytest.mark.cuda
+def test_production_shape_bf16_default_all_expert_is_exact_on_cuda() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    if not torch.cuda.is_bf16_supported():
+        pytest.skip("CUDA BF16 is unavailable")
+
+    torch.manual_seed(53)
+    config = Qwen3_5TextConfig(hidden_size=1_024, intermediate_size=3_584)
+    dense = Qwen3_5MLP(config, 3_584).to(device="cuda", dtype=torch.bfloat16).eval()
+    original_parameters = sum(parameter.numel() for parameter in dense.parameters())
+    permutation = torch.roll(torch.arange(3_584), shifts=137)
+    converted = PartitionedQwen35MLP(
+        dense,
+        permutation=permutation,
+        num_experts=8,
+    ).eval()
+    inputs = torch.randn(
+        1,
+        4,
+        1_024,
+        generator=torch.Generator(device="cuda").manual_seed(59),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+
+    with torch.inference_mode():
+        dense_output = dense(inputs)
+        converted_output = converted(inputs)
+
+    assert not torch.equal(converted.permutation, torch.arange(3_584, device="cuda"))
+    assert torch.equal(converted.gate_proj.weight, dense.gate_proj.weight[converted.permutation])
+    assert torch.equal(converted.up_proj.weight, dense.up_proj.weight[converted.permutation])
+    assert torch.equal(converted.down_proj.weight, dense.down_proj.weight[:, converted.permutation])
+    assert torch.equal(converted_output, dense_output)
+    assert {parameter.dtype for parameter in converted.parameters()} == {torch.bfloat16}
+    assert sum(parameter.numel() for parameter in converted.parameters()) == original_parameters
+    assert torch.equal(converted.inverse_permutation, torch.argsort(converted.permutation))
+    assert "inverse_permutation" not in converted.state_dict()
+
+
 def test_layer_permutations_are_deterministic_and_nonpersistent() -> None:
     first = tiny_qwen35()
     second = deepcopy(first)
@@ -104,13 +160,14 @@ def test_output_transform_is_temporary_validated_and_parameter_free() -> None:
     original_parameters = sum(parameter.numel() for parameter in converted.parameters())
     original_state_keys = tuple(converted.state_dict())
     experts = converted.expert_outputs(inputs)
+    default_output = converted(inputs)
 
     with converted.output_transform(lambda _x, outputs: outputs[..., 0, :]):
         torch.testing.assert_close(converted(inputs), experts[..., 0, :])
         with pytest.raises(RuntimeError, match="already active"):
             with converted.output_transform(lambda _x, outputs: outputs.sum(dim=-2)):
                 pass
-    torch.testing.assert_close(converted(inputs), experts.sum(dim=-2))
+    torch.testing.assert_close(converted(inputs), default_output)
 
     with pytest.raises(ValueError, match="shape"):
         with converted.output_transform(lambda _x, outputs: outputs[..., 0, :1]):
@@ -120,6 +177,6 @@ def test_output_transform_is_temporary_validated_and_parameter_free() -> None:
             lambda _x, _outputs: (_ for _ in ()).throw(RuntimeError("transform failure"))
         ):
             converted(inputs)
-    torch.testing.assert_close(converted(inputs), experts.sum(dim=-2))
+    torch.testing.assert_close(converted(inputs), default_output)
     assert sum(parameter.numel() for parameter in converted.parameters()) == original_parameters
     assert tuple(converted.state_dict()) == original_state_keys
