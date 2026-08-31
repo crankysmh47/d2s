@@ -67,7 +67,7 @@ class ReconstructionResult:
     subsets: Tensor
     coefficients: Tensor
     squared_error: Tensor
-    effective_rank: Tensor
+    effective_rank: Tensor | None
     solver_source: tuple[str, ...]
     diagnostics: Mapping[str, object]
 
@@ -216,22 +216,38 @@ def _lexicographically_smaller(left: Tensor, right: Tensor) -> Tensor:
 
 
 def _pick_registered_candidate(
-    coefficients: list[Tensor], losses: list[Tensor], sources: tuple[str, ...], target_norm: Tensor
+    coefficients: list[Tensor],
+    losses: list[Tensor],
+    sources: tuple[str, ...],
+    target_norm: Tensor,
+    objective_tolerance: float = 1e-9,
 ) -> tuple[Tensor, Tensor, Tensor]:
+    """Choose only among candidates tied with the global materialized minimum."""
+
+    all_losses = torch.stack(losses, dim=-1)
+    minimum_loss = all_losses.min(dim=-1).values
+    tie_tolerance = objective_tolerance * target_norm[:, None].clamp_min(1.0)
     chosen_coefficients = coefficients[0].clone()
     chosen_losses = losses[0].clone()
-    chosen_source = torch.zeros(chosen_losses.shape, dtype=torch.long, device=chosen_losses.device)
-    objective_tolerance = 1e-9 * target_norm[:, None].clamp_min(1.0)
-    for source_index in range(1, len(sources)):
-        contender_coefficients = coefficients[source_index]
+    chosen_source = torch.zeros(
+        chosen_losses.shape, dtype=torch.long, device=chosen_losses.device
+    )
+    chosen = (chosen_losses - minimum_loss).abs() <= tie_tolerance
+    for source_index, contender_coefficients in enumerate(coefficients[1:], start=1):
         contender_losses = losses[source_index]
-        better = contender_losses < chosen_losses - objective_tolerance
-        tied_loss = (contender_losses - chosen_losses).abs() <= objective_tolerance
+        tied_loss = (contender_losses - minimum_loss).abs() <= tie_tolerance
         contender_norm = contender_coefficients.norm(dim=-1)
         chosen_norm = chosen_coefficients.norm(dim=-1)
         better_norm = contender_norm < chosen_norm - 1e-12
         tied_norm = (contender_norm - chosen_norm).abs() <= 1e-12
-        replace = better | (tied_loss & (better_norm | (tied_norm & _lexicographically_smaller(contender_coefficients, chosen_coefficients))))
+        replace = tied_loss & (
+            ~chosen
+            | better_norm
+            | (
+                tied_norm
+                & _lexicographically_smaller(contender_coefficients, chosen_coefficients)
+            )
+        )
         chosen_coefficients = torch.where(
             replace[..., None], contender_coefficients, chosen_coefficients
         )
@@ -239,6 +255,7 @@ def _pick_registered_candidate(
         chosen_source = torch.where(
             replace, torch.full_like(chosen_source, source_index), chosen_source
         )
+        chosen |= tied_loss
     return chosen_coefficients, chosen_losses, chosen_source
 
 
@@ -280,80 +297,131 @@ def score_reconstruction(
     )
     unit_loss = _quadratic_loss(target_norm, gs, bs, unit_coefficients)
 
-    # Rank diagnostics always reflect the primary registered pseudoinverse,
-    # even when a practical condition is being scored.
-    gs64 = gs.double()
-    bs64 = bs.double()
-    target64 = target.double()
-    target_norm64 = target64.square().sum(dim=-1)
-    pseudoinverse_coefficients, pseudoinverse_rank = _pseudoinverse_candidates(
-        gs64, bs64, settings
-    )
-
     if condition.family == "unit":
         subset_indices = _choose_subsets(unit_loss)
         coefficients = _gather_by_subset(unit_coefficients, subset_indices)
-        squared_error = _gather_by_subset(unit_loss, subset_indices)
-        source_indices = torch.zeros_like(subset_indices)
-        sources = ("unit",)
-        diagnostics: dict[str, object] = {
+        selected_subsets = _gather_by_subset(
+            combinations.expand(target.shape[0], -1, -1), subset_indices
+        )
+        selected_experts = score_experts[
+            torch.arange(target.shape[0], device=experts.device)[:, None],
+            selected_subsets,
+        ]
+        squared_error = (
+            (
+                torch.einsum("tk,tkh->th", coefficients, selected_experts)
+                - score_target
+            )
+            .square()
+            .sum(dim=-1)
+        )
+        return ReconstructionResult(
+            subsets=selected_subsets,
+            coefficients=coefficients,
+            squared_error=squared_error,
+            effective_rank=None,
+            solver_source=("unit",) * target.shape[0],
+            diagnostics={
             "cholesky_fallback_count": 0,
             "degenerate_ridge_count": 0,
             "max_relative_system_residual": 0.0,
-        }
-    elif condition.family == "ridge":
+            },
+        )
+
+    # Numerical coefficient systems are constructed from promoted vectors,
+    # never from an FP32 Gram matrix cast after accumulation.
+    target64 = target.double()
+    experts64 = experts.double()
+    target_norm64 = target64.square().sum(dim=-1)
+    full_gram64 = torch.einsum("teh,tfh->tef", experts64, experts64)
+    full_linear64 = torch.einsum("th,teh->te", target64, experts64)
+    gs64 = full_gram64[:, combinations[:, :, None], combinations[:, None, :]]
+    bs64 = full_linear64[:, combinations]
+
+    if condition.family == "ridge":
         ridge_coefficients, ridge_diagnostics = _ridge_candidates(
             gs64, bs64, target_norm64, condition.rho, settings
         )
         ridge_loss = _quadratic_loss(target_norm64, gs64, bs64, ridge_coefficients)
         subset_indices = _choose_subsets(ridge_loss)
         coefficients = _gather_by_subset(ridge_coefficients, subset_indices)
-        squared_error = _gather_by_subset(ridge_loss, subset_indices)
-        source_indices = torch.zeros_like(subset_indices)
-        sources = (f"ridge:{condition.rho:g}",)
-        diagnostics = dict(ridge_diagnostics)
-    else:
-        selected_experts64 = experts.double()[:, combinations, :]
-        pseudoinverse_loss = _materialized_loss(
-            target64, selected_experts64, pseudoinverse_coefficients
+        selected_subsets = _gather_by_subset(
+            combinations.expand(target.shape[0], -1, -1), subset_indices
         )
-        candidate_coefficients = [pseudoinverse_coefficients, unit_coefficients.double()]
-        candidate_losses = [pseudoinverse_loss, _materialized_loss(target64, selected_experts64, unit_coefficients.double())]
-        sources = ("pseudoinverse", "unit") + tuple(
-            f"ridge:{rho:g}" for rho in settings.rho_values
+        selected_experts64 = experts64[
+            torch.arange(target.shape[0], device=experts.device)[:, None],
+            selected_subsets,
+        ]
+        squared_error = (
+            (
+                torch.einsum("tk,tkh->th", coefficients, selected_experts64)
+                - target64
+            )
+            .square()
+            .sum(dim=-1)
         )
-        total_fallbacks = 0
-        total_degenerate = 0
-        largest_residual = 0.0
-        for rho in settings.rho_values:
-            ridge_coefficients, ridge_diagnostics = _ridge_candidates(
-                gs64, bs64, target_norm64, rho, settings
-            )
-            candidate_coefficients.append(ridge_coefficients)
-            candidate_losses.append(
-                _materialized_loss(target64, selected_experts64, ridge_coefficients)
-            )
-            total_fallbacks += int(ridge_diagnostics["cholesky_fallback_count"])
-            total_degenerate += int(ridge_diagnostics["degenerate_ridge_count"])
-            largest_residual = max(
-                largest_residual,
-                float(ridge_diagnostics["max_relative_system_residual"]),
-            )
-        free_coefficients, free_loss, source_indices_all = _pick_registered_candidate(
-            candidate_coefficients, candidate_losses, sources, target_norm64
+        return ReconstructionResult(
+            subsets=selected_subsets,
+            coefficients=coefficients,
+            squared_error=squared_error,
+            effective_rank=None,
+            solver_source=(f"ridge:{condition.rho:g}",) * target.shape[0],
+            diagnostics=dict(ridge_diagnostics),
         )
-        subset_indices = _choose_subsets(free_loss)
-        coefficients = _gather_by_subset(free_coefficients, subset_indices)
-        squared_error = _gather_by_subset(free_loss, subset_indices)
-        source_indices = _gather_by_subset(source_indices_all, subset_indices)
-        diagnostics = {
-            "cholesky_fallback_count": total_fallbacks,
-            "degenerate_ridge_count": total_degenerate,
-            "max_relative_system_residual": largest_residual,
-            "candidate_sources": sources,
-        }
 
-    selected_subsets = _gather_by_subset(combinations.expand(target.shape[0], -1, -1), subset_indices)
+    pseudoinverse_coefficients, pseudoinverse_rank = _pseudoinverse_candidates(
+        gs64, bs64, settings
+    )
+    selected_experts64 = experts64[:, combinations, :]
+    unit_coefficients64 = torch.ones_like(bs64)
+    pseudoinverse_loss = _materialized_loss(
+        target64, selected_experts64, pseudoinverse_coefficients
+    )
+    candidate_coefficients = [pseudoinverse_coefficients, unit_coefficients64]
+    candidate_losses = [
+        pseudoinverse_loss,
+        _materialized_loss(target64, selected_experts64, unit_coefficients64),
+    ]
+    sources = ("pseudoinverse", "unit") + tuple(
+        f"ridge:{rho:g}" for rho in settings.rho_values
+    )
+    total_fallbacks = 0
+    total_degenerate = 0
+    largest_residual = 0.0
+    for rho in settings.rho_values:
+        ridge_coefficients, ridge_diagnostics = _ridge_candidates(
+            gs64, bs64, target_norm64, rho, settings
+        )
+        candidate_coefficients.append(ridge_coefficients)
+        candidate_losses.append(
+            _materialized_loss(target64, selected_experts64, ridge_coefficients)
+        )
+        total_fallbacks += int(ridge_diagnostics["cholesky_fallback_count"])
+        total_degenerate += int(ridge_diagnostics["degenerate_ridge_count"])
+        largest_residual = max(
+            largest_residual,
+            float(ridge_diagnostics["max_relative_system_residual"]),
+        )
+    free_coefficients, free_loss, source_indices_all = _pick_registered_candidate(
+        candidate_coefficients,
+        candidate_losses,
+        sources,
+        target_norm64,
+        settings.objective_tolerance,
+    )
+    subset_indices = _choose_subsets(free_loss)
+    coefficients = _gather_by_subset(free_coefficients, subset_indices)
+    squared_error = _gather_by_subset(free_loss, subset_indices)
+    source_indices = _gather_by_subset(source_indices_all, subset_indices)
+    diagnostics: dict[str, object] = {
+        "cholesky_fallback_count": total_fallbacks,
+        "degenerate_ridge_count": total_degenerate,
+        "max_relative_system_residual": largest_residual,
+        "candidate_sources": sources,
+    }
+    selected_subsets = _gather_by_subset(
+        combinations.expand(target.shape[0], -1, -1), subset_indices
+    )
     selected_pseudoinverse_coefficients = _gather_by_subset(
         pseudoinverse_coefficients, subset_indices
     )
@@ -374,17 +442,6 @@ def score_reconstruction(
             "pseudoinverse_effective_rank": selected_pseudoinverse_rank,
         }
     )
-    if condition.family != "free_bound":
-        output_dtype = _scoring_dtype(target, experts)
-        selected_experts = experts.to(output_dtype)[
-            torch.arange(target.shape[0], device=experts.device)[:, None], selected_subsets
-        ]
-        squared_error = (
-            (torch.einsum("tk,tkh->th", coefficients.to(output_dtype), selected_experts)
-             - target.to(output_dtype))
-            .square()
-            .sum(dim=-1)
-        )
     return ReconstructionResult(
         subsets=selected_subsets,
         coefficients=coefficients,
