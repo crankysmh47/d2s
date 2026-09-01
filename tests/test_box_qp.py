@@ -5,7 +5,12 @@ from itertools import product
 import pytest
 import torch
 
-from ppmoe.oracle.box_qp import BoxQPSettings, solve_box_qp
+from ppmoe.oracle.box_qp import (
+    BoxQPSettings,
+    _canonical_face_choice,
+    _kkt_residuals,
+    solve_box_qp,
+)
 
 
 SETTINGS = BoxQPSettings()
@@ -126,3 +131,76 @@ def test_box_qp_rejects_approximate_solution_after_iteration_cap() -> None:
     )
 
     assert solution.certified.tolist() == [False]
+
+
+def test_box_qp_settings_accepts_zero_and_rejects_iteration_caps_above_64() -> None:
+    """Catches accepting an unregistered active-set cap while retaining RED-cap tests."""
+
+    assert BoxQPSettings(max_iterations=0).max_iterations == 0
+    assert BoxQPSettings(max_iterations=64).max_iterations == 64
+    with pytest.raises(ValueError, match="at most 64"):
+        BoxQPSettings(max_iterations=65)
+
+
+def test_box_qp_primal_residual_is_normalized_by_box_width() -> None:
+    """Catches reporting raw coefficient violation instead of a dimensionless residual."""
+
+    _, primal, stationarity, complementarity = _kkt_residuals(
+        torch.zeros(1, 1, 1, dtype=torch.float64),
+        torch.zeros(1, 1, dtype=torch.float64),
+        torch.tensor([[-0.1]], dtype=torch.float64),
+        lower=0.0,
+        upper=100.0,
+        tolerance=1e-7,
+    )
+
+    assert primal.tolist() == [0.001]
+    assert stationarity.tolist() == [0.0]
+    assert complementarity.tolist() == [0.0]
+
+
+def test_canonical_face_choice_uses_objective_then_norm_then_lexicographic_order() -> None:
+    """Catches rank-deficient tied faces being selected by enumeration order."""
+
+    objective_then_norm = _canonical_face_choice(
+        torch.tensor([[1.0, 0.0], [0.0, 0.0], [0.0, 1.0]], dtype=torch.float64),
+        torch.tensor([0.0, 0.5e-10, 2.0e-10], dtype=torch.float64),
+        objective_tolerance=1e-10,
+        norm_tolerance=1e-12,
+    )
+    norm_then_lexicographic = _canonical_face_choice(
+        torch.tensor([[1.0, 0.0], [0.0, 1.0 + 5e-13]], dtype=torch.float64),
+        torch.tensor([0.0, 0.5e-10], dtype=torch.float64),
+        objective_tolerance=1e-10,
+        norm_tolerance=1e-12,
+    )
+
+    assert objective_then_norm == 1
+    assert norm_then_lexicographic == 1
+
+
+@pytest.mark.parametrize("k", range(2, 7))
+def test_box_qp_uses_canonical_minimizer_for_rank_deficient_tied_faces(k: int) -> None:
+    """Catches a tied rank-one face solution replacing the minimum-L2 coefficient vector."""
+
+    gs = torch.ones(k, k, dtype=torch.float64)
+    bs = torch.full((k,), float(k), dtype=torch.float64)
+    expected_coefficients, expected_objective = _reference_box_qp(gs, bs)
+    tied_face = torch.ones(k, dtype=torch.float64)
+    tied_face[0], tied_face[1] = 0.0, 2.0
+
+    solution = solve_box_qp(
+        gs.unsqueeze(0), bs.unsqueeze(0), lower=0.0, upper=2.0, settings=SETTINGS
+    )
+
+    assert torch.allclose(gs @ tied_face - bs, torch.zeros(k, dtype=torch.float64))
+    torch.testing.assert_close(
+        tied_face @ gs @ tied_face - 2.0 * bs @ tied_face,
+        expected_objective,
+        rtol=0,
+        atol=1e-12,
+    )
+    torch.testing.assert_close(solution.coefficients[0], expected_coefficients, rtol=0, atol=1e-12)
+    torch.testing.assert_close(
+        solution.coefficients[0], torch.ones(k, dtype=torch.float64), rtol=0, atol=1e-12
+    )

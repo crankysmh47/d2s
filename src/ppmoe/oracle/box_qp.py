@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import product
 from math import isfinite
 
 import torch
@@ -16,14 +17,22 @@ class BoxQPSettings:
     kkt_tolerance: float = 1e-7
     max_iterations: int = 64
     pseudoinverse_rtol: float = 1e-12
+    objective_tolerance: float = 1e-10
+    norm_tolerance: float = 1e-12
 
     def __post_init__(self) -> None:
         if not isfinite(self.kkt_tolerance) or self.kkt_tolerance <= 0.0:
             raise ValueError("kkt_tolerance must be finite and positive")
         if self.max_iterations < 0:
             raise ValueError("max_iterations must be non-negative")
+        if self.max_iterations > 64:
+            raise ValueError("max_iterations must be at most 64")
         if not isfinite(self.pseudoinverse_rtol) or self.pseudoinverse_rtol <= 0.0:
             raise ValueError("pseudoinverse_rtol must be finite and positive")
+        if not isfinite(self.objective_tolerance) or self.objective_tolerance <= 0.0:
+            raise ValueError("objective_tolerance must be finite and positive")
+        if not isfinite(self.norm_tolerance) or self.norm_tolerance <= 0.0:
+            raise ValueError("norm_tolerance must be finite and positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +69,33 @@ def _first(mask: Tensor) -> Tensor:
     return mask.to(torch.int64).argmax(dim=-1)
 
 
+def _canonical_face_choice(
+    coefficients: Tensor,
+    objectives: Tensor,
+    *,
+    objective_tolerance: float,
+    norm_tolerance: float,
+) -> int:
+    """Choose a tied active face by objective, L2 norm, then coordinates."""
+
+    minimum_objective = objectives.min()
+    objective_tied = objectives <= minimum_objective + objective_tolerance
+    norms = coefficients.norm(dim=-1)
+    minimum_norm = norms[objective_tied].min()
+    norm_tied = objective_tied & (norms <= minimum_norm + norm_tolerance)
+    selected = int(torch.nonzero(norm_tied, as_tuple=False)[0].item())
+    for contender in torch.nonzero(norm_tied, as_tuple=False).flatten().tolist():
+        left = coefficients[contender]
+        right = coefficients[selected]
+        for coordinate in range(coefficients.shape[-1]):
+            if bool(left[coordinate] < right[coordinate]):
+                selected = contender
+                break
+            if bool(left[coordinate] > right[coordinate]):
+                break
+    return selected
+
+
 def _kkt_residuals(
     gs: Tensor,
     bs: Tensor,
@@ -71,10 +107,13 @@ def _kkt_residuals(
     """Return gradient and the three registered, independently scaled residuals."""
 
     gradient = (gs @ coefficients[..., None]).squeeze(-1) - bs
+    box_width = upper - lower
+    if box_width <= 0.0:
+        raise ValueError("box width must be positive")
     primal = torch.maximum(
         (lower - coefficients).clamp_min(0.0),
         (coefficients - upper).clamp_min(0.0),
-    ).amax(dim=-1)
+    ).amax(dim=-1) / box_width
     gradient_scale = torch.maximum(
         bs.abs().amax(dim=-1),
         torch.diagonal(gs, dim1=-2, dim2=-1).sum(dim=-1),
@@ -100,6 +139,68 @@ def _kkt_residuals(
     # certificate from treating a point in the box interior as a bound point.
     del interior
     return gradient, primal, stationarity, complementarity
+
+
+def _canonical_rank_deficient_solution(
+    gs: Tensor,
+    bs: Tensor,
+    lower: float,
+    upper: float,
+    settings: BoxQPSettings,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | None:
+    """Resolve certified rank-deficient active faces to the registered order."""
+
+    k = bs.shape[0]
+    candidates: list[Tensor] = []
+    objectives: list[Tensor] = []
+    residuals: list[tuple[Tensor, Tensor, Tensor]] = []
+    for face in product((-1, 0, 1), repeat=k):
+        state = torch.tensor(face, dtype=torch.int8, device=gs.device)
+        fixed = state != 0
+        free = ~fixed
+        coefficients = torch.zeros(k, dtype=gs.dtype, device=gs.device)
+        coefficients[state < 0] = lower
+        coefficients[state > 0] = upper
+        if bool(free.any()):
+            rhs = bs[free] - gs[free][:, fixed] @ coefficients[fixed]
+            coefficients[free] = torch.linalg.pinv(
+                gs[free][:, free], hermitian=True, rtol=settings.pseudoinverse_rtol
+            ) @ rhs
+        _, primal, stationarity, complementarity = _kkt_residuals(
+            gs.unsqueeze(0),
+            bs.unsqueeze(0),
+            coefficients.unsqueeze(0),
+            lower,
+            upper,
+            settings.kkt_tolerance,
+        )
+        if not bool(
+            (primal <= settings.kkt_tolerance)
+            & (stationarity <= settings.kkt_tolerance)
+            & (complementarity <= settings.kkt_tolerance)
+        ):
+            continue
+        candidates.append(coefficients)
+        objectives.append(coefficients @ gs @ coefficients - 2.0 * bs @ coefficients)
+        residuals.append((primal, stationarity, complementarity))
+    if not candidates:
+        return None
+    all_coefficients = torch.stack(candidates)
+    all_objectives = torch.stack(objectives)
+    selected = _canonical_face_choice(
+        all_coefficients,
+        all_objectives,
+        objective_tolerance=settings.objective_tolerance,
+        norm_tolerance=settings.norm_tolerance,
+    )
+    primal, stationarity, complementarity = residuals[selected]
+    return (
+        all_coefficients[selected],
+        primal.squeeze(0),
+        stationarity.squeeze(0),
+        complementarity.squeeze(0),
+        all_objectives[selected],
+    )
 
 
 def solve_box_qp(
@@ -206,6 +307,26 @@ def solve_box_qp(
         & (complementarity <= settings.kkt_tolerance)
         & ~unresolved
     )
+    eigenvalues = torch.linalg.eigvalsh(flat_gs)
+    largest_eigenvalue = eigenvalues.abs().amax(dim=-1)
+    rank_deficient = (largest_eigenvalue == 0.0) | (
+        eigenvalues[..., 0].abs()
+        <= settings.pseudoinverse_rtol * largest_eigenvalue.clamp_min(1.0)
+    )
+    for system_index in torch.nonzero(certified & rank_deficient, as_tuple=False).flatten().tolist():
+        canonical = _canonical_rank_deficient_solution(
+            flat_gs[system_index], flat_bs[system_index], lower, upper, settings
+        )
+        if canonical is None:
+            certified[system_index] = False
+            continue
+        (
+            coefficients[system_index],
+            primal[system_index],
+            stationarity[system_index],
+            complementarity[system_index],
+            _,
+        ) = canonical
     iterations[unresolved] = settings.max_iterations
     objective = torch.einsum("bi,bij,bj->b", coefficients, flat_gs, coefficients) - 2.0 * (
         flat_bs * coefficients
