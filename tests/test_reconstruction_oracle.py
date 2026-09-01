@@ -3,6 +3,7 @@ import torch
 
 from ppmoe.oracle.exact import exact_gram_oracle
 from ppmoe.oracle.reconstruction import (
+    FamilyBenchmark,
     ReconstructionCondition,
     SolverSettings,
     _pick_registered_candidate,
@@ -201,6 +202,67 @@ def test_free_bound_is_no_worse_than_registered_unit_and_ridge_candidates() -> N
             target, experts, 4, ReconstructionCondition("ridge", rho=rho), SETTINGS
         )
         assert torch.all(free.squared_error <= ridge.squared_error + tolerance)
+
+
+def test_bounded_reconstruction_is_certified_and_never_worse_than_unit() -> None:
+    """Catches bounded scoring that chooses by a quadratic surrogate or loses its KKT proof."""
+
+    target, experts = deterministic_case(tokens=5, hidden=7)
+    bounded = score_reconstruction(
+        target, experts, 4, ReconstructionCondition("bounded"), SETTINGS
+    )
+    unit = score_reconstruction(target, experts, 4, UNIT, SETTINGS)
+
+    tolerance = 1e-10 * target.square().sum(dim=-1).clamp_min(1.0)
+    assert torch.all(bounded.squared_error <= unit.squared_error + tolerance)
+    assert bounded.solver_source == ("bounded",) * target.shape[0]
+    assert bounded.diagnostics["bounded_failure_count"] == 0
+    assert bounded.diagnostics["bounded_uncertified_count"] == 0
+    assert bounded.diagnostics["bounded_max_primal_residual"] <= 1e-7
+    assert bounded.diagnostics["bounded_max_stationarity_residual"] <= 1e-7
+    assert bounded.diagnostics["bounded_max_complementarity_residual"] <= 1e-7
+
+
+def test_family_benchmark_requires_all_bounded_feasibility_gates() -> None:
+    """Catches admitting a bounded run despite a runtime, memory, failure, or KKT failure."""
+
+    feasible = FamilyBenchmark.from_measurement(
+        elapsed_seconds=1.0,
+        peak_cuda_bytes=12 * 1024**3,
+        processed_tokens=2048,
+        failures=0,
+        all_certified=True,
+    )
+    assert feasible.projected_full_seconds == 100000.0 / 2048.0
+    assert feasible.feasible
+    assert not FamilyBenchmark.from_measurement(
+        elapsed_seconds=147.4561,
+        peak_cuda_bytes=12 * 1024**3,
+        processed_tokens=2048,
+        failures=0,
+        all_certified=True,
+    ).feasible
+    assert not FamilyBenchmark.from_measurement(
+        elapsed_seconds=1.0,
+        peak_cuda_bytes=12 * 1024**3 + 1,
+        processed_tokens=2048,
+        failures=0,
+        all_certified=True,
+    ).feasible
+    assert not FamilyBenchmark.from_measurement(
+        elapsed_seconds=1.0,
+        peak_cuda_bytes=0,
+        processed_tokens=2048,
+        failures=1,
+        all_certified=True,
+    ).feasible
+    assert not FamilyBenchmark.from_measurement(
+        elapsed_seconds=1.0,
+        peak_cuda_bytes=0,
+        processed_tokens=2048,
+        failures=0,
+        all_certified=False,
+    ).feasible
 
 
 def test_free_candidate_tie_breaking_never_replaces_a_strict_minimum() -> None:

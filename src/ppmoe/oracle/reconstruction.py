@@ -15,6 +15,8 @@ from typing import Literal, Mapping
 import torch
 from torch import Tensor
 
+from ppmoe.oracle.box_qp import BoxQPSettings, solve_box_qp
+
 
 _FAMILY = Literal["unit", "ridge", "bounded", "free_bound"]
 _DEFAULT_RHOS = (10.0, 1.0, 0.1, 0.01, 0.001)
@@ -46,6 +48,7 @@ class SolverSettings:
     rho_values: tuple[float, ...] = _DEFAULT_RHOS
     residual_tolerance: float = 1e-9
     objective_tolerance: float = 1e-9
+    box_qp: BoxQPSettings = BoxQPSettings()
 
     def __post_init__(self) -> None:
         if not isfinite(self.tau_g) or self.tau_g <= 0.0:
@@ -58,6 +61,46 @@ class SolverSettings:
             raise ValueError("rho_values must contain only finite positive values")
         if self.residual_tolerance <= 0.0 or self.objective_tolerance <= 0.0:
             raise ValueError("solver tolerances must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class FamilyBenchmark:
+    """One family's smoke measurement and its frozen bounded feasibility gate."""
+
+    elapsed_seconds: float
+    peak_cuda_bytes: int
+    processed_tokens: int
+    projected_full_seconds: float
+    feasible: bool
+
+    @classmethod
+    def from_measurement(
+        cls,
+        *,
+        elapsed_seconds: float,
+        peak_cuda_bytes: int,
+        processed_tokens: int,
+        failures: int,
+        all_certified: bool,
+    ) -> FamilyBenchmark:
+        if not isfinite(elapsed_seconds) or elapsed_seconds < 0.0:
+            raise ValueError("elapsed_seconds must be finite and non-negative")
+        if peak_cuda_bytes < 0 or processed_tokens <= 0 or failures < 0:
+            raise ValueError("benchmark counts must be non-negative and tokens positive")
+        projected = elapsed_seconds * 100000.0 / processed_tokens
+        feasible = (
+            projected <= 7200.0
+            and peak_cuda_bytes <= 12 * 1024**3
+            and failures == 0
+            and all_certified
+        )
+        return cls(
+            elapsed_seconds=elapsed_seconds,
+            peak_cuda_bytes=peak_cuda_bytes,
+            processed_tokens=processed_tokens,
+            projected_full_seconds=projected,
+            feasible=feasible,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +306,16 @@ def _choose_subsets(losses: Tensor) -> Tensor:
     return losses.argmin(dim=1)
 
 
+def _choose_subsets_with_tolerance(
+    losses: Tensor, target_norm: Tensor, objective_tolerance: float
+) -> Tensor:
+    """Choose the first subset whose materialized loss ties the true minimum."""
+
+    minimum = losses.min(dim=1).values
+    tied = losses <= minimum[:, None] + objective_tolerance * target_norm[:, None].clamp_min(1.0)
+    return tied.to(torch.int64).argmax(dim=1)
+
+
 def _gather_by_subset(values: Tensor, subset_indices: Tensor) -> Tensor:
     return values[torch.arange(values.shape[0], device=values.device), subset_indices]
 
@@ -277,8 +330,6 @@ def score_reconstruction(
     """Exhaustively choose each token's best subset under one coefficient family."""
 
     _validate_inputs(target, experts, k)
-    if condition.family == "bounded":
-        raise NotImplementedError("bounded reconstruction is implemented by the box-QP task")
 
     combinations = enumerate_subsets(experts.shape[1], k, experts.device)
     score_dtype = _scoring_dtype(target, experts)
@@ -335,6 +386,57 @@ def score_reconstruction(
     full_linear64 = torch.einsum("th,teh->te", target64, experts64)
     gs64 = full_gram64[:, combinations[:, :, None], combinations[:, None, :]]
     bs64 = full_linear64[:, combinations]
+
+    if condition.family == "bounded":
+        bounded = solve_box_qp(
+            gs64, bs64, lower=0.0, upper=2.0, settings=settings.box_qp
+        )
+        selected_experts64 = experts64[:, combinations, :]
+        bounded_loss = _materialized_loss(
+            target64, selected_experts64, bounded.coefficients
+        )
+        valid_loss = torch.where(
+            bounded.certified, bounded_loss, torch.full_like(bounded_loss, float("inf"))
+        )
+        if bool(torch.isinf(valid_loss).all(dim=1).any()):
+            raise FloatingPointError("bounded box-QP left a token without a certified subset")
+        subset_indices = _choose_subsets_with_tolerance(
+            valid_loss, target_norm64, objective_tolerance=1e-10
+        )
+        coefficients = _gather_by_subset(bounded.coefficients, subset_indices)
+        selected_subsets = _gather_by_subset(
+            combinations.expand(target.shape[0], -1, -1), subset_indices
+        )
+        squared_error = _gather_by_subset(bounded_loss, subset_indices)
+        selected_primal = _gather_by_subset(bounded.primal_residual, subset_indices)
+        selected_stationarity = _gather_by_subset(
+            bounded.stationarity_residual, subset_indices
+        )
+        selected_complementarity = _gather_by_subset(
+            bounded.complementarity_residual, subset_indices
+        )
+        selected_iterations = _gather_by_subset(bounded.iterations, subset_indices)
+        bound_violations = (coefficients < -1e-7) | (coefficients > 2.0 + 1e-7)
+        failures = int((~bounded.certified).sum().item())
+        return ReconstructionResult(
+            subsets=selected_subsets,
+            coefficients=coefficients,
+            squared_error=squared_error,
+            effective_rank=None,
+            solver_source=("bounded",) * target.shape[0],
+            diagnostics={
+                "bounded_lower_saturation_count": int((coefficients < 1e-6).sum().item()),
+                "bounded_upper_saturation_count": int((coefficients > 2.0 - 1e-6).sum().item()),
+                "bounded_coefficient_bound_violation_count": int(bound_violations.sum().item()),
+                "bounded_max_primal_residual": float(selected_primal.max().item()),
+                "bounded_max_stationarity_residual": float(selected_stationarity.max().item()),
+                "bounded_max_complementarity_residual": float(selected_complementarity.max().item()),
+                "bounded_max_iterations": int(selected_iterations.max().item()),
+                "bounded_failure_count": failures,
+                "bounded_uncertified_count": failures,
+                "bounded_solver_candidate_count": int(bounded.certified.numel()),
+            },
+        )
 
     if condition.family == "ridge":
         ridge_coefficients, ridge_diagnostics = _ridge_candidates(
