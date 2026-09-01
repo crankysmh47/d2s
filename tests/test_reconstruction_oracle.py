@@ -223,6 +223,17 @@ def test_bounded_reconstruction_is_certified_and_never_worse_than_unit() -> None
     assert bounded.diagnostics["bounded_max_complementarity_residual"] <= 1e-7
 
 
+def test_bounded_reconstruction_rejects_nonprotocol_k() -> None:
+    """Catches exposing bounded reconstruction at an unregistered experiment K."""
+
+    target, experts = deterministic_case(tokens=1, hidden=7)
+
+    with pytest.raises(ValueError, match="K=4 or K=6"):
+        score_reconstruction(
+            target, experts, 2, ReconstructionCondition("bounded"), SETTINGS
+        )
+
+
 def test_family_benchmark_requires_all_bounded_feasibility_gates() -> None:
     """Catches admitting a bounded run despite a runtime, memory, failure, or KKT failure."""
 

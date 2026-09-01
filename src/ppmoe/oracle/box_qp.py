@@ -46,21 +46,34 @@ class BoxQPSolution:
     complementarity_residual: Tensor
     iterations: Tensor
     certified: Tensor
+    face_enumeration_count: Tensor
 
 
-def _validate_inputs(gs: Tensor, bs: Tensor, lower: float, upper: float) -> None:
+def _validate_inputs(
+    gs: Tensor, bs: Tensor, objective_scale: Tensor, lower: float, upper: float
+) -> None:
     if gs.ndim < 2 or gs.shape[-1] != gs.shape[-2]:
         raise ValueError("gs must have shape [..., k, k]")
     if bs.shape != gs.shape[:-1]:
         raise ValueError("bs must have shape [..., k] matching gs")
-    if not gs.is_floating_point() or not bs.is_floating_point():
-        raise ValueError("gs and bs must be floating-point tensors")
-    if gs.device != bs.device:
-        raise ValueError("gs and bs must share a device")
+    k = bs.shape[-1]
+    if not 2 <= k <= 6:
+        raise ValueError(f"box-QP requires 2 <= k <= 6; received {k}")
+    if objective_scale.shape != bs.shape[:-1]:
+        raise ValueError("objective_scale must have one value per system")
+    if not gs.is_floating_point() or not bs.is_floating_point() or not objective_scale.is_floating_point():
+        raise ValueError("gs, bs, and objective_scale must be floating-point tensors")
+    if gs.device != bs.device or gs.device != objective_scale.device:
+        raise ValueError("gs, bs, and objective_scale must share a device")
     if not isfinite(lower) or not isfinite(upper) or lower >= upper:
         raise ValueError("box bounds must be finite and satisfy lower < upper")
-    if not bool(torch.isfinite(gs).all()) or not bool(torch.isfinite(bs).all()):
-        raise ValueError("gs and bs must be finite")
+    if (
+        not bool(torch.isfinite(gs).all())
+        or not bool(torch.isfinite(bs).all())
+        or not bool(torch.isfinite(objective_scale).all())
+        or bool((objective_scale < 0.0).any())
+    ):
+        raise ValueError("gs, bs, and non-negative objective_scale must be finite")
 
 
 def _first(mask: Tensor) -> Tensor:
@@ -73,13 +86,16 @@ def _canonical_face_choice(
     coefficients: Tensor,
     objectives: Tensor,
     *,
+    objective_scale: float,
     objective_tolerance: float,
     norm_tolerance: float,
 ) -> int:
     """Choose a tied active face by objective, L2 norm, then coordinates."""
 
     minimum_objective = objectives.min()
-    objective_tied = objectives <= minimum_objective + objective_tolerance
+    objective_tied = objectives <= minimum_objective + objective_tolerance * max(
+        objective_scale, 1.0
+    )
     norms = coefficients.norm(dim=-1)
     minimum_norm = norms[objective_tied].min()
     norm_tied = objective_tied & (norms <= minimum_norm + norm_tolerance)
@@ -146,6 +162,7 @@ def _canonical_rank_deficient_solution(
     bs: Tensor,
     lower: float,
     upper: float,
+    objective_scale: Tensor,
     settings: BoxQPSettings,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | None:
     """Resolve certified rank-deficient active faces to the registered order."""
@@ -190,6 +207,7 @@ def _canonical_rank_deficient_solution(
     selected = _canonical_face_choice(
         all_coefficients,
         all_objectives,
+        objective_scale=float(objective_scale.item()),
         objective_tolerance=settings.objective_tolerance,
         norm_tolerance=settings.norm_tolerance,
     )
@@ -208,6 +226,7 @@ def solve_box_qp(
     bs: Tensor,
     lower: float,
     upper: float,
+    objective_scale: Tensor,
     settings: BoxQPSettings,
 ) -> BoxQPSolution:
     """Solve ``min a'Ga - 2b'a`` over a finite box with deterministic updates.
@@ -218,15 +237,17 @@ def solve_box_qp(
     An iteration cap leaves the result explicitly uncertified.
     """
 
-    _validate_inputs(gs, bs, lower, upper)
+    _validate_inputs(gs, bs, objective_scale, lower, upper)
     leading_shape = bs.shape[:-1]
     k = bs.shape[-1]
     flat_gs = gs.reshape(-1, k, k)
     flat_bs = bs.reshape(-1, k)
+    flat_objective_scale = objective_scale.reshape(-1)
     systems = flat_bs.shape[0]
     dtype = torch.promote_types(flat_gs.dtype, flat_bs.dtype)
     flat_gs = flat_gs.to(dtype)
     flat_bs = flat_bs.to(dtype)
+    flat_objective_scale = flat_objective_scale.to(dtype)
 
     # -1/lower, 0/free, +1/upper.  The specified initial candidate is one.
     state = torch.zeros((systems, k), dtype=torch.int8, device=bs.device)
@@ -234,6 +255,9 @@ def solve_box_qp(
         lower, upper
     )
     iterations = torch.zeros(systems, dtype=torch.int64, device=bs.device)
+    face_enumeration_count = torch.zeros(
+        systems, dtype=torch.int64, device=bs.device
+    )
     unresolved = torch.ones(systems, dtype=torch.bool, device=bs.device)
 
     identity = torch.eye(k, dtype=dtype, device=bs.device).expand(systems, -1, -1)
@@ -314,8 +338,14 @@ def solve_box_qp(
         <= settings.pseudoinverse_rtol * largest_eigenvalue.clamp_min(1.0)
     )
     for system_index in torch.nonzero(certified & rank_deficient, as_tuple=False).flatten().tolist():
+        face_enumeration_count[system_index] = 3**k
         canonical = _canonical_rank_deficient_solution(
-            flat_gs[system_index], flat_bs[system_index], lower, upper, settings
+            flat_gs[system_index],
+            flat_bs[system_index],
+            lower,
+            upper,
+            flat_objective_scale[system_index],
+            settings,
         )
         if canonical is None:
             certified[system_index] = False
@@ -339,4 +369,5 @@ def solve_box_qp(
         complementarity_residual=complementarity.reshape(*leading_shape),
         iterations=iterations.reshape(*leading_shape),
         certified=certified.reshape(*leading_shape),
+        face_enumeration_count=face_enumeration_count.reshape(*leading_shape),
     )

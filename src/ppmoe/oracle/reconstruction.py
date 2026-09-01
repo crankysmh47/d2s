@@ -330,6 +330,8 @@ def score_reconstruction(
     """Exhaustively choose each token's best subset under one coefficient family."""
 
     _validate_inputs(target, experts, k)
+    if condition.family == "bounded" and k not in {4, 6}:
+        raise ValueError("bounded reconstruction is registered only for K=4 or K=6")
 
     combinations = enumerate_subsets(experts.shape[1], k, experts.device)
     score_dtype = _scoring_dtype(target, experts)
@@ -389,7 +391,12 @@ def score_reconstruction(
 
     if condition.family == "bounded":
         bounded = solve_box_qp(
-            gs64, bs64, lower=0.0, upper=2.0, settings=settings.box_qp
+            gs64,
+            bs64,
+            lower=0.0,
+            upper=2.0,
+            objective_scale=target_norm64[:, None].expand(-1, gs64.shape[1]),
+            settings=settings.box_qp,
         )
         selected_experts64 = experts64[:, combinations, :]
         bounded_loss = _materialized_loss(
@@ -435,6 +442,12 @@ def score_reconstruction(
                 "bounded_failure_count": failures,
                 "bounded_uncertified_count": failures,
                 "bounded_solver_candidate_count": int(bounded.certified.numel()),
+                "bounded_face_enumeration_count": int(
+                    bounded.face_enumeration_count.sum().item()
+                ),
+                "bounded_max_face_enumeration_count": int(
+                    bounded.face_enumeration_count.max().item()
+                ),
             },
         )
 

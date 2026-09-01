@@ -89,7 +89,12 @@ def test_box_qp_matches_exhaustive_active_faces_for_psd_systems(
     expected_coefficients, expected_objective = _reference_box_qp(gs, bs)
 
     solution = solve_box_qp(
-        gs.unsqueeze(0), bs.unsqueeze(0), lower=0.0, upper=2.0, settings=SETTINGS
+        gs.unsqueeze(0),
+        bs.unsqueeze(0),
+        lower=0.0,
+        upper=2.0,
+        objective_scale=torch.ones(1, dtype=torch.float64),
+        settings=SETTINGS,
     )
 
     assert solution.certified.tolist() == [True]
@@ -109,6 +114,7 @@ def test_box_qp_preserves_leading_batch_dimensions() -> None:
         bs.expand(2, 4, -1).clone(),
         lower=0.0,
         upper=2.0,
+        objective_scale=torch.ones(2, 4, dtype=torch.float64),
         settings=SETTINGS,
     )
 
@@ -127,6 +133,7 @@ def test_box_qp_rejects_approximate_solution_after_iteration_cap() -> None:
         bs.unsqueeze(0),
         lower=0.0,
         upper=2.0,
+        objective_scale=torch.ones(1, dtype=torch.float64),
         settings=BoxQPSettings(max_iterations=0),
     )
 
@@ -165,12 +172,14 @@ def test_canonical_face_choice_uses_objective_then_norm_then_lexicographic_order
     objective_then_norm = _canonical_face_choice(
         torch.tensor([[1.0, 0.0], [0.0, 0.0], [0.0, 1.0]], dtype=torch.float64),
         torch.tensor([0.0, 0.5e-10, 2.0e-10], dtype=torch.float64),
+        objective_scale=1.0,
         objective_tolerance=1e-10,
         norm_tolerance=1e-12,
     )
     norm_then_lexicographic = _canonical_face_choice(
         torch.tensor([[1.0, 0.0], [0.0, 1.0 + 5e-13]], dtype=torch.float64),
         torch.tensor([0.0, 0.5e-10], dtype=torch.float64),
+        objective_scale=1.0,
         objective_tolerance=1e-10,
         norm_tolerance=1e-12,
     )
@@ -190,7 +199,12 @@ def test_box_qp_uses_canonical_minimizer_for_rank_deficient_tied_faces(k: int) -
     tied_face[0], tied_face[1] = 0.0, 2.0
 
     solution = solve_box_qp(
-        gs.unsqueeze(0), bs.unsqueeze(0), lower=0.0, upper=2.0, settings=SETTINGS
+        gs.unsqueeze(0),
+        bs.unsqueeze(0),
+        lower=0.0,
+        upper=2.0,
+        objective_scale=torch.ones(1, dtype=torch.float64),
+        settings=SETTINGS,
     )
 
     assert torch.allclose(gs @ tied_face - bs, torch.zeros(k, dtype=torch.float64))
@@ -204,3 +218,65 @@ def test_box_qp_uses_canonical_minimizer_for_rank_deficient_tied_faces(k: int) -
     torch.testing.assert_close(
         solution.coefficients[0], torch.ones(k, dtype=torch.float64), rtol=0, atol=1e-12
     )
+
+
+def test_canonical_face_choice_scales_objective_ties_by_target_norm() -> None:
+    """Catches treating a high-target-norm objective difference as a strict tie break."""
+
+    coefficients = torch.tensor([[1.0, 0.0], [0.0, 0.0]], dtype=torch.float64)
+    objectives = torch.tensor([0.0, 1e-8], dtype=torch.float64)
+
+    assert _canonical_face_choice(
+        coefficients,
+        objectives,
+        objective_scale=1.0,
+        objective_tolerance=1e-10,
+        norm_tolerance=1e-12,
+    ) == 0
+    assert _canonical_face_choice(
+        coefficients,
+        objectives,
+        objective_scale=1e4,
+        objective_tolerance=1e-10,
+        norm_tolerance=1e-12,
+    ) == 1
+
+
+@pytest.mark.parametrize("k", (1, 7, 8))
+def test_box_qp_rejects_unsupported_k(k: int) -> None:
+    """Catches opening the registered small-QP solver beyond K=2..6."""
+
+    with pytest.raises(ValueError, match="2 <= k <= 6"):
+        solve_box_qp(
+            torch.eye(k, dtype=torch.float64).unsqueeze(0),
+            torch.zeros(1, k, dtype=torch.float64),
+            lower=0.0,
+            upper=2.0,
+            objective_scale=torch.ones(1, dtype=torch.float64),
+            settings=SETTINGS,
+        )
+
+
+def test_box_qp_only_enumerates_rank_deficient_systems_and_records_the_cost() -> None:
+    """Catches an exhaustive fallback on full-rank batches or an unbounded face count."""
+
+    full_rank = solve_box_qp(
+        torch.eye(2, dtype=torch.float64).expand(3, -1, -1).clone(),
+        torch.ones(3, 2, dtype=torch.float64),
+        lower=0.0,
+        upper=2.0,
+        objective_scale=torch.ones(3, dtype=torch.float64),
+        settings=SETTINGS,
+    )
+    rank_deficient = solve_box_qp(
+        torch.ones(1, 6, 6, dtype=torch.float64),
+        torch.full((1, 6), 6.0, dtype=torch.float64),
+        lower=0.0,
+        upper=2.0,
+        objective_scale=torch.ones(1, dtype=torch.float64),
+        settings=SETTINGS,
+    )
+
+    assert full_rank.face_enumeration_count.tolist() == [0, 0, 0]
+    assert rank_deficient.face_enumeration_count.tolist() == [3**6]
+    assert rank_deficient.face_enumeration_count.max().item() <= 3**6
