@@ -220,22 +220,20 @@ def _pick_registered_candidate(
     losses: list[Tensor],
     sources: tuple[str, ...],
     target_norm: Tensor,
-    objective_tolerance: float = 1e-9,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Choose only among candidates tied with the global materialized minimum."""
+    """Choose among candidates exactly tied at the materialized FP64 minimum."""
 
     all_losses = torch.stack(losses, dim=-1)
     minimum_loss = all_losses.min(dim=-1).values
-    tie_tolerance = objective_tolerance * target_norm[:, None].clamp_min(1.0)
     chosen_coefficients = coefficients[0].clone()
     chosen_losses = losses[0].clone()
     chosen_source = torch.zeros(
         chosen_losses.shape, dtype=torch.long, device=chosen_losses.device
     )
-    chosen = (chosen_losses - minimum_loss).abs() <= tie_tolerance
+    chosen = chosen_losses == minimum_loss
     for source_index, contender_coefficients in enumerate(coefficients[1:], start=1):
         contender_losses = losses[source_index]
-        tied_loss = (contender_losses - minimum_loss).abs() <= tie_tolerance
+        tied_loss = contender_losses == minimum_loss
         contender_norm = contender_coefficients.norm(dim=-1)
         chosen_norm = chosen_coefficients.norm(dim=-1)
         better_norm = contender_norm < chosen_norm - 1e-12
@@ -407,7 +405,6 @@ def score_reconstruction(
         candidate_losses,
         sources,
         target_norm64,
-        settings.objective_tolerance,
     )
     subset_indices = _choose_subsets(free_loss)
     coefficients = _gather_by_subset(free_coefficients, subset_indices)

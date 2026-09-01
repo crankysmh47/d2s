@@ -203,7 +203,7 @@ def test_free_bound_is_no_worse_than_registered_unit_and_ridge_candidates() -> N
         assert torch.all(free.squared_error <= ridge.squared_error + tolerance)
 
 
-def test_free_candidate_tie_breaking_cannot_chain_past_global_objective_tolerance() -> None:
+def test_free_candidate_tie_breaking_never_replaces_a_strict_minimum() -> None:
     coefficients = [
         torch.tensor([[[3.0]]]),
         torch.tensor([[[2.0]]]),
@@ -219,9 +219,9 @@ def test_free_candidate_tie_breaking_cannot_chain_past_global_objective_toleranc
         coefficients, losses, ("minimum", "tie", "outside_tie"), torch.ones(1)
     )
 
-    assert chosen_source.tolist() == [[1]]
-    assert chosen_losses.tolist() == [[0.9e-9]]
-    assert chosen_coefficients.tolist() == [[[2.0]]]
+    assert chosen_source.tolist() == [[0]]
+    assert chosen_losses.tolist() == [[0.0]]
+    assert chosen_coefficients.tolist() == [[[3.0]]]
 
 
 @pytest.mark.parametrize(
