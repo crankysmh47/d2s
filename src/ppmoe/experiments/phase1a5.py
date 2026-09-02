@@ -39,6 +39,10 @@ from ppmoe.oracle.reconstruction_local import (
     ReconstructionLocalResult,
     run_reconstruction_local,
 )
+from ppmoe.oracle.reconstruction_rollout import (
+    ReconstructionRolloutResult,
+    run_reconstruction_rollout,
+)
 from ppmoe.provenance import atomic_write_json, sha256_file
 
 
@@ -224,6 +228,43 @@ def _load_calibration_tokens(
     return input_ids, attention_mask
 
 
+def _load_evaluation_tokens(
+    source_root: Path, source_manifest: Mapping[str, object]
+) -> Mapping[str, tuple[Tensor, Tensor]]:
+    """Load only the two source-verified external evaluation corpora."""
+
+    datasets = source_manifest.get("dataset_manifest_sha256")
+    if not isinstance(datasets, Mapping):
+        raise StageError("source manifest lacks evaluation dataset hashes")
+    loaded: dict[str, tuple[Tensor, Tensor]] = {}
+    for corpus, directory, source_key in (
+        ("wikitext", "wikitext", "wikitext"),
+        ("fineweb_heldout", "fineweb-heldout", "fineweb-heldout"),
+    ):
+        manifest_path = source_root / "tokens" / directory / "manifest.json"
+        if sha256_file(manifest_path) != datasets.get(source_key):
+            raise StageError(f"{corpus} manifest does not match verified source hash")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            input_ids = torch.load(
+                manifest_path.parent / "input_ids.pt", map_location="cpu", weights_only=True
+            )
+            attention_mask = torch.load(
+                manifest_path.parent / "attention_mask.pt", map_location="cpu", weights_only=True
+            )
+        except (OSError, json.JSONDecodeError, RuntimeError) as error:
+            raise StageError(f"unable to load verified {corpus} tensors") from error
+        if (
+            not isinstance(manifest, Mapping)
+            or input_ids.ndim != 2
+            or attention_mask.shape != input_ids.shape
+            or int(attention_mask.sum()) <= 0
+        ):
+            raise StageError(f"{corpus} tensors do not match their manifest")
+        loaded[corpus] = input_ids, attention_mask
+    return loaded
+
+
 def _first_valid_tokens(
     input_ids: Tensor, attention_mask: Tensor, count: int
 ) -> tuple[Tensor, Tensor]:
@@ -382,6 +423,8 @@ class Phase1A5Dependencies:
     local_runner: Callable[..., ReconstructionLocalResult] | None = None
     unit_regression_runner: Callable[..., Mapping[str, object]] | None = None
     selection_runner: Callable[..., object] | None = None
+    evaluation_loader: Callable[..., Mapping[str, tuple[Tensor, Tensor]]] | None = None
+    rollout_runner: Callable[..., ReconstructionRolloutResult] | None = None
     cuda_peak_probe: Callable[[], int] | None = None
     cuda_peak_reset: Callable[[], None] | None = None
     clock: Callable[[], float] | None = None
@@ -409,6 +452,10 @@ def _dependencies(values: Phase1A5Dependencies | None) -> Phase1A5Dependencies:
         values.unit_regression_runner = _default_unit_regression
     if values.selection_runner is None:
         values.selection_runner = select_calibration_conditions
+    if values.evaluation_loader is None:
+        values.evaluation_loader = _load_evaluation_tokens
+    if values.rollout_runner is None:
+        values.rollout_runner = run_reconstruction_rollout
     if values.cuda_peak_probe is None:
         values.cuda_peak_probe = lambda: (
             int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0
@@ -844,6 +891,132 @@ def _immutable_selection(artifact_root: Path, config: Phase1A5Config) -> None:
         raise StagePrerequisiteError("rollout requires an immutable selection manifest")
 
 
+def _condition_from_frozen_id(
+    identifier: object, config: Phase1A5Config
+) -> ReconstructionCondition:
+    """Decode a manifest ID only when it is an exact registered condition ID."""
+
+    if not isinstance(identifier, str):
+        raise StagePrerequisiteError("selection manifest contains a non-string condition ID")
+    if identifier == "unit":
+        return ReconstructionCondition("unit")
+    if identifier == "bounded":
+        return ReconstructionCondition("bounded")
+    if identifier == "free_bound":
+        return ReconstructionCondition("free_bound")
+    for rho in config.rho_values:
+        candidate = ReconstructionCondition("ridge", rho)
+        if identifier == f"ridge:{rho:g}":
+            return candidate
+    raise StagePrerequisiteError("selection manifest contains an unregistered condition")
+
+
+def _frozen_condition_id(condition: ReconstructionCondition) -> str:
+    return condition.family if condition.rho is None else f"ridge:{condition.rho:g}"
+
+
+def _frozen_rollout_conditions(
+    artifact_root: Path, config: Phase1A5Config
+) -> tuple[str, Mapping[int, tuple[ReconstructionCondition, ...]]]:
+    """Return exactly unit plus the immutable practical/free selections by K."""
+
+    _immutable_selection(artifact_root, config)
+    path = artifact_root / "selection-manifest.json"
+    try:
+        payload = json.loads(path.read_bytes())
+    except (OSError, json.JSONDecodeError) as error:
+        raise StagePrerequisiteError("rollout selection manifest is invalid") from error
+    if not isinstance(payload, Mapping):
+        raise StagePrerequisiteError("rollout selection manifest is invalid")
+    practical, free_bound = payload.get("practical_conditions", {}), payload.get("free_bound_conditions", {})
+    if not isinstance(practical, Mapping) or not isinstance(free_bound, Mapping):
+        raise StagePrerequisiteError("rollout selection manifest has invalid condition maps")
+    conditions: dict[int, tuple[ReconstructionCondition, ...]] = {}
+    allowed_k = {str(k) for k in config.k_values}
+    if any(str(key) not in allowed_k for key in practical) or any(str(key) not in allowed_k for key in free_bound):
+        raise StagePrerequisiteError("selection manifest names an unregistered K")
+    for k in config.k_values:
+        selected: list[ReconstructionCondition] = []
+        practical_id, free_id = practical.get(str(k)), free_bound.get(str(k))
+        if practical_id is not None:
+            selected.append(_condition_from_frozen_id(practical_id, config))
+        if free_id is not None:
+            condition = _condition_from_frozen_id(free_id, config)
+            if condition.family != "free_bound":
+                raise StagePrerequisiteError("free-bound selection must name free_bound")
+            selected.append(condition)
+        if selected:
+            values = (ReconstructionCondition("unit"), *selected)
+            identifiers = [_frozen_condition_id(value) for value in values]
+            if len(set(identifiers)) != len(identifiers):
+                raise StagePrerequisiteError("selection manifest repeats a rollout condition")
+            conditions[k] = values
+    if not conditions:
+        raise StagePrerequisiteError("rollout has no eligible frozen condition")
+    return sha256_file(path), conditions
+
+
+def _rollout_stage(
+    config: Phase1A5Config,
+    artifact_root: Path,
+    microbatch_size: int,
+    dependencies: Phase1A5Dependencies,
+) -> dict[str, object]:
+    source_stage, source_manifest, source_hashes = _source_from_stage(artifact_root, config)
+    selection = _read_stage(artifact_root, "select", _config_signature(config))
+    if not _matches_current_source(selection, source_stage, source_hashes):
+        raise StagePrerequisiteError("rollout selection provenance does not match the current verified source")
+    manifest_sha256, conditions = _frozen_rollout_conditions(artifact_root, config)
+    assert dependencies.evaluation_loader is not None and dependencies.converted_pair_loader is not None and dependencies.rollout_runner is not None
+    streams = dependencies.evaluation_loader(Path(str(source_manifest["source_root"])), source_manifest)
+    if set(streams) != {"wikitext", "fineweb_heldout"}:
+        raise StageError("rollout requires exactly WikiText and FineWeb-heldout streams")
+    teacher, student = dependencies.converted_pair_loader(config)
+    results: dict[str, object] = {}
+    for corpus in ("wikitext", "fineweb_heldout"):
+        input_ids, attention_mask = streams[corpus]
+        if input_ids.ndim != 2 or attention_mask.shape != input_ids.shape:
+            raise StageError(f"rollout {corpus} tensors are malformed")
+        token_hash = _canonical_hash({"input_ids": input_ids.tolist(), "attention_mask": attention_mask.tolist()})
+        for k, selected in conditions.items():
+            for condition in selected:
+                identifier = _frozen_condition_id(condition)
+                signature = _execution_signature(
+                    config, source_manifest, microbatch_size, stage="rollout", token_hash=token_hash,
+                    extra={"corpus": corpus, "k": k, "condition": identifier, "selection_manifest_sha256": manifest_sha256},
+                )
+                result = dependencies.rollout_runner(
+                    teacher, student,
+                    iter_evaluation_batches(input_ids, attention_mask, microbatch_size=microbatch_size),
+                    condition, k,
+                    artifact_root / "checkpoints" / "rollout" / corpus / f"k{k}" / identifier.replace(":", "_") / signature,
+                    signature, source_hashes=source_hashes,
+                )
+                if (
+                    not result.complete
+                    or result.failed_batches
+                    or result.scored_tokens <= 0
+                    or dict(result.source_hashes) != source_hashes
+                ):
+                    raise StageError(f"rollout is incomplete for {corpus} K={k} {identifier}")
+                results[f"{corpus}:k{k}:{identifier}"] = _json_safe(result)
+    signature = _canonical_hash({
+        "source": source_stage["input_signature"], "selection_manifest_sha256": manifest_sha256,
+        "microbatch_size": microbatch_size,
+        "conditions": {
+            str(k): [_frozen_condition_id(value) for value in values]
+            for k, values in conditions.items()
+        },
+    })
+    return _write_stage(artifact_root, "rollout", _config_signature(config), signature, {
+        "execution_microbatch_size": microbatch_size,
+        "source_hashes": source_hashes,
+        "source_stage_input_signature": source_stage["input_signature"],
+        "selection_manifest_sha256": manifest_sha256,
+        "results": results,
+    })
+
+
 def _read_report_stage(
     artifact_root: Path,
     stage: str,
@@ -926,8 +1099,7 @@ def run_phase1a5(
     if stage == "select":
         return _select_stage(config, artifact_root, microbatch_size, values)
     if stage == "rollout":
-        _immutable_selection(artifact_root, config)
-        raise StageError("rollout is not implemented until Task 6")
+        return _rollout_stage(config, artifact_root, microbatch_size, values)
     source_stage, _, source_hashes = _source_from_stage(artifact_root, config)
     _read_report_stage(artifact_root, "smoke", config, source_stage, source_hashes)
     _read_report_stage(artifact_root, "local", config, source_stage, source_hashes)

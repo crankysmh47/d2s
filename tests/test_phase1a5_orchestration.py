@@ -1,4 +1,5 @@
 import json
+from dataclasses import dataclass
 from dataclasses import replace
 from pathlib import Path
 
@@ -325,3 +326,75 @@ def test_report_requires_terminal_predecessors_and_allows_selection_stop(
     run_phase1a5(config, "select", False, tmp_path, 100, dependencies=stopped)
     with pytest.raises(StageError, match="not implemented"):
         run_phase1a5(config, "report", False, tmp_path, 100, dependencies=stopped)
+
+
+@dataclass(frozen=True)
+class _RolloutResult:
+    complete: bool = True
+    failed_batches: int = 0
+    completed_batches: int = 1
+    scored_tokens: int = 2
+    nll_sum: float = 1.0
+    ppl: float = 1.5
+    peak_cuda_bytes: int = 123
+    layer_metrics: dict[int, object] | None = None
+    source_hashes: dict[str, str] | None = None
+
+
+def test_rollout_uses_only_byte_frozen_registered_conditions_and_corpora(
+    tmp_path: Path,
+) -> None:
+    from ppmoe.experiments.phase1a5 import Phase1A5Dependencies, run_phase1a5
+
+    config = Phase1A5Config.load(CONFIG_PATH)
+    base, _ = _dependencies()
+    calls: list[tuple[str, int, str]] = []
+
+    def selection_runner(_result, _config, output_path):
+        output_path.write_bytes(
+            b'{"free_bound_conditions":{"4":"free_bound"},"practical_conditions":{"4":"ridge:1","6":"bounded"}}\n'
+        )
+        return {
+            "practical_conditions": {4: "ridge:1", 6: "bounded"},
+            "free_bound_conditions": {4: "free_bound"},
+        }
+
+    def evaluation_loader(_root, _manifest):
+        ids = torch.tensor([[1, 2, 3]])
+        mask = torch.ones_like(ids)
+        return {"wikitext": (ids, mask), "fineweb_heldout": (ids, mask)}
+
+    def rollout_runner(_teacher, _student, batches, condition, k, _checkpoint, _signature, *, source_hashes):
+        materialized = tuple(batches)
+        assert len(materialized) == 1
+        calls.append(("unknown", k, condition.family if condition.rho is None else f"ridge:{condition.rho:g}"))
+        return _RolloutResult(layer_metrics={0: {}}, source_hashes=dict(source_hashes))
+
+    dependencies = Phase1A5Dependencies(
+        source_verifier=base.source_verifier,
+        calibration_loader=base.calibration_loader,
+        converted_pair_loader=base.converted_pair_loader,
+        local_runner=base.local_runner,
+        unit_regression_runner=base.unit_regression_runner,
+        selection_runner=selection_runner,
+        cuda_peak_probe=base.cuda_peak_probe,
+        cuda_peak_reset=base.cuda_peak_reset,
+        clock=base.clock,
+        evaluation_loader=evaluation_loader,
+        rollout_runner=rollout_runner,
+    )
+    run_phase1a5(config, "source", False, tmp_path, 100, dependencies=dependencies)
+    run_phase1a5(config, "smoke", False, tmp_path, 100, dependencies=dependencies)
+    run_phase1a5(config, "local", False, tmp_path, 100, dependencies=dependencies)
+    run_phase1a5(config, "select", False, tmp_path, 100, dependencies=dependencies)
+    rollout = run_phase1a5(config, "rollout", False, tmp_path, 100, dependencies=dependencies)
+
+    assert len(calls) == 10
+    assert {item[1:] for item in calls} == {
+        (4, "unit"), (4, "ridge:1"), (4, "free_bound"), (6, "unit"), (6, "bounded")
+    }
+    assert set(rollout["results"]) == {
+        f"{corpus}:k{k}:{condition}"
+        for corpus in ("wikitext", "fineweb_heldout")
+        for k, condition in ((4, "unit"), (4, "ridge:1"), (4, "free_bound"), (6, "unit"), (6, "bounded"))
+    }
