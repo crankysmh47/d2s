@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 import torch
 
+import ppmoe.oracle.reconstruction_local as reconstruction_local
 from ppmoe.oracle.reconstruction import ReconstructionCondition
 from ppmoe.oracle.reconstruction_local import (
     ReconstructionLocalAccumulator,
@@ -149,6 +150,60 @@ def test_every_sparse_condition_has_a_separately_solved_all_expert_r8_reference(
         r8 = f"R8[{condition_id(condition)}]"
         assert (0, "D0", r8) in references
         assert (0, "E8", r8) in references
+
+
+def test_r8_references_deduplicate_k4_k6_and_persist_full_solver_diagnostics(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    ridge = ReconstructionCondition("ridge", rho=0.1)
+    bounded = ReconstructionCondition("bounded")
+    free = ReconstructionCondition("free_bound")
+    accumulator = ReconstructionLocalAccumulator(
+        num_layers=1,
+        num_experts=8,
+        conditions={4: (ridge, bounded, free), 6: (ridge, bounded, free)},
+        checkpoint_dir=tmp_path,
+        run_signature="deduplicated-r8",
+    )
+    generator = torch.Generator().manual_seed(33)
+    experts = torch.randn(2, 8, 8, generator=generator)
+    d0 = experts.sum(dim=1) + 0.01
+    calls = 0
+    original = reconstruction_local.score_full_reference
+
+    def count_references(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(reconstruction_local, "score_full_reference", count_references)
+    accumulator.update_layer(0, d0, experts)
+    accumulator.mark_batch_completed(0)
+    first = accumulator.finalize()
+    resumed = ReconstructionLocalAccumulator(
+        num_layers=1,
+        num_experts=8,
+        conditions={4: (ridge, bounded, free), 6: (ridge, bounded, free)},
+        checkpoint_dir=tmp_path,
+        run_signature="deduplicated-r8",
+    ).finalize()
+
+    assert calls == 3
+    expected_norm = float(d0.double().square().sum().item())
+    for condition in (ridge, bounded, free):
+        r8 = f"R8[{condition_id(condition)}]"
+        assert first.reference_distances[(0, "D0", r8)].token_count == 2
+        assert first.reference_distances[
+            (0, "D0", r8)
+        ].left_squared_norm_sum == pytest.approx(expected_norm)
+        diagnostics = first.reference_diagnostics[(0, r8)]
+        assert diagnostics["solver_source_counts"]
+        if condition.family == "bounded":
+            assert diagnostics["bounded_certified_count"] == 2
+            assert "bounded_max_stationarity_residual" in diagnostics
+        if condition.family == "free_bound":
+            assert diagnostics["pseudoinverse_effective_rank_counts"] == {"8": 2}
+        assert diagnostics == resumed.reference_diagnostics[(0, r8)]
 
 
 def test_tensor_solver_diagnostics_persist_rank_distribution_across_resume(

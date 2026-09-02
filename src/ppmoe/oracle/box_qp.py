@@ -240,7 +240,7 @@ def _canonical_rank_deficient_solution(
     )
 
 
-def solve_box_qp(
+def _solve_box_qp(
     gs: Tensor,
     bs: Tensor,
     lower: float,
@@ -374,11 +374,6 @@ def solve_box_qp(
         <= settings.pseudoinverse_rtol * largest_eigenvalue.clamp_min(1.0)
     )
     canonicalize_rank_deficient = certified & rank_deficient
-    if allow_full_reference and k == 8:
-        # The all-expert reference is diagnostic-only.  Its active-set solution
-        # is already KKT-certified; avoid the 3**8 tie-face search reserved for
-        # deployable K=4/6 candidates.
-        canonicalize_rank_deficient = torch.zeros_like(canonicalize_rank_deficient)
     for system_index in (
         torch.nonzero(canonicalize_rank_deficient, as_tuple=False).flatten().tolist()
     ):
@@ -414,4 +409,46 @@ def solve_box_qp(
         iterations=iterations.reshape(*leading_shape),
         certified=certified.reshape(*leading_shape),
         face_enumeration_count=face_enumeration_count.reshape(*leading_shape),
+    )
+
+
+def solve_box_qp(
+    gs: Tensor,
+    bs: Tensor,
+    lower: float,
+    upper: float,
+    objective_scale: Tensor,
+    settings: BoxQPSettings,
+) -> BoxQPSolution:
+    """Solve a deployable registered K=2..6 box-QP system."""
+
+    return _solve_box_qp(
+        gs,
+        bs,
+        lower,
+        upper,
+        objective_scale,
+        settings,
+        allow_full_reference=False,
+    )
+
+
+def solve_full_reference_box_qp(
+    gs: Tensor,
+    bs: Tensor,
+    lower: float,
+    upper: float,
+    objective_scale: Tensor,
+    settings: BoxQPSettings,
+) -> BoxQPSolution:
+    """Solve the canonical all-eight-expert bounded reference only."""
+
+    return _solve_box_qp(
+        gs,
+        bs,
+        lower,
+        upper,
+        objective_scale,
+        settings,
+        allow_full_reference=True,
     )

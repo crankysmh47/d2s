@@ -15,7 +15,11 @@ from typing import Literal, Mapping
 import torch
 from torch import Tensor
 
-from ppmoe.oracle.box_qp import BoxQPSettings, solve_box_qp
+from ppmoe.oracle.box_qp import (
+    BoxQPSettings,
+    solve_box_qp,
+    solve_full_reference_box_qp,
+)
 
 
 _FAMILY = Literal["unit", "ridge", "bounded", "free_bound"]
@@ -337,7 +341,7 @@ def _gather_by_subset(values: Tensor, subset_indices: Tensor) -> Tensor:
     return values[torch.arange(values.shape[0], device=values.device), subset_indices]
 
 
-def score_reconstruction(
+def _score_reconstruction(
     target: Tensor,
     experts: Tensor,
     k: int,
@@ -408,14 +412,14 @@ def score_reconstruction(
     bs64 = full_linear64[:, combinations]
 
     if condition.family == "bounded":
-        bounded = solve_box_qp(
+        solve = solve_full_reference_box_qp if allow_full_reference else solve_box_qp
+        bounded = solve(
             gs64,
             bs64,
             lower=0.0,
             upper=2.0,
             objective_scale=target_norm64[:, None].expand(-1, gs64.shape[1]),
             settings=settings.box_qp,
-            allow_full_reference=allow_full_reference,
         )
         selected_experts64 = experts64[:, combinations, :]
         bounded_loss = _materialized_loss(
@@ -472,6 +476,7 @@ def score_reconstruction(
                 "bounded_max_iterations": int(selected_iterations.max().item()),
                 "bounded_failure_count": failures,
                 "bounded_uncertified_count": failures,
+                "bounded_certified_count": int(bounded.certified.sum().item()),
                 "bounded_solver_candidate_count": int(bounded.certified.numel()),
                 "bounded_face_enumeration_count": int(
                     bounded.face_enumeration_count.sum().item()
@@ -594,6 +599,36 @@ def score_reconstruction(
         effective_rank=selected_pseudoinverse_rank,
         solver_source=tuple(sources[index] for index in source_indices.tolist()),
         diagnostics=diagnostics,
+    )
+
+
+def score_reconstruction(
+    target: Tensor,
+    experts: Tensor,
+    k: int,
+    condition: ReconstructionCondition,
+    settings: SolverSettings,
+) -> ReconstructionResult:
+    """Exhaustively score a registered deployable reconstruction condition."""
+
+    return _score_reconstruction(target, experts, k, condition, settings)
+
+
+def score_full_reference(
+    target: Tensor,
+    experts: Tensor,
+    condition: ReconstructionCondition,
+    settings: SolverSettings,
+) -> ReconstructionResult:
+    """Solve the named all-eight-expert R8 condition with canonical semantics."""
+
+    return _score_reconstruction(
+        target,
+        experts,
+        8,
+        condition,
+        settings,
+        allow_full_reference=True,
     )
 
 

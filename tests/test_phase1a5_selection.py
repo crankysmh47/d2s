@@ -53,6 +53,7 @@ def result_for(
         co_selection={},
         solver_diagnostics={},
         reference_distances={},
+        reference_diagnostics={},
         coefficient_quantiles={},
         completed_batches=1,
         failed_batches=0,

@@ -65,7 +65,9 @@ def test_unit_reconstruction_matches_fp32_gram_oracle() -> None:
     new = score_reconstruction(target, experts, 4, UNIT, SETTINGS)
 
     assert torch.equal(new.subsets, old.subsets)
-    torch.testing.assert_close(new.squared_error, materialized_loss(target, experts, new))
+    torch.testing.assert_close(
+        new.squared_error, materialized_loss(target, experts, new)
+    )
 
 
 def test_unit_reconstruction_preserves_cancellation_and_lexicographic_ties() -> None:
@@ -106,7 +108,9 @@ def test_ridge_uses_unit_coefficients_for_registered_zero_trace_degeneracy() -> 
         target, experts, 4, ReconstructionCondition("ridge", rho=0.1), SETTINGS
     )
 
-    torch.testing.assert_close(result.coefficients, torch.ones_like(result.coefficients))
+    torch.testing.assert_close(
+        result.coefficients, torch.ones_like(result.coefficients)
+    )
     assert result.diagnostics["degenerate_ridge_count"] == 70
 
 
@@ -125,9 +129,11 @@ def test_free_bound_records_zero_and_rank_deficient_pseudoinverse_candidates() -
     verification = verify_pseudoinverse_svd(target, experts, result, SETTINGS)
     assert verification["rank_equal"]
     assert verification["max_relative_objective_error"] <= 1e-9
-    assert all(source in {"pseudoinverse", "unit", *{
-        f"ridge:{rho:g}" for rho in SETTINGS.rho_values
-    }} for source in result.solver_source)
+    assert all(
+        source
+        in {"pseudoinverse", "unit", *{f"ridge:{rho:g}" for rho in SETTINGS.rho_values}}
+        for source in result.solver_source
+    )
 
 
 def test_free_bound_primary_pseudoinverse_matches_direct_svd_cutoff() -> None:

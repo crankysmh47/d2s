@@ -9,6 +9,7 @@ from ppmoe.oracle.box_qp import (
     BoxQPSettings,
     _canonical_face_choice,
     _kkt_residuals,
+    solve_full_reference_box_qp,
     solve_box_qp,
 )
 
@@ -16,7 +17,9 @@ from ppmoe.oracle.box_qp import (
 SETTINGS = BoxQPSettings()
 
 
-def _reference_box_qp(gs: torch.Tensor, bs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _reference_box_qp(
+    gs: torch.Tensor, bs: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Independent exhaustive active-face reference for one small PSD system."""
 
     k = gs.shape[0]
@@ -31,9 +34,9 @@ def _reference_box_qp(gs: torch.Tensor, bs: torch.Tensor) -> tuple[torch.Tensor,
         free = ~fixed
         if bool(free.any()):
             rhs = bs[free] - gs[free][:, fixed] @ coefficients[fixed]
-            coefficients[free] = torch.linalg.pinv(
-                gs[free][:, free], hermitian=True, rtol=1e-12
-            ) @ rhs
+            coefficients[free] = (
+                torch.linalg.pinv(gs[free][:, free], hermitian=True, rtol=1e-12) @ rhs
+            )
         gradient = gs @ coefficients - bs
         if (
             bool((coefficients < -1e-9).any())
@@ -53,10 +56,9 @@ def _reference_box_qp(gs: torch.Tensor, bs: torch.Tensor) -> tuple[torch.Tensor,
         elif abs(objective - best_objective) <= 1e-10:
             if coefficients.norm() < best_coefficients.norm() - 1e-12:
                 best = coefficients, objective
-            elif (
-                abs(coefficients.norm() - best_coefficients.norm()) <= 1e-12
-                and tuple(coefficients.tolist()) < tuple(best_coefficients.tolist())
-            ):
+            elif abs(coefficients.norm() - best_coefficients.norm()) <= 1e-12 and tuple(
+                coefficients.tolist()
+            ) < tuple(best_coefficients.tolist()):
                 best = coefficients, objective
     assert best is not None
     return best
@@ -98,8 +100,12 @@ def test_box_qp_matches_exhaustive_active_faces_for_psd_systems(
     )
 
     assert solution.certified.tolist() == [True]
-    torch.testing.assert_close(solution.objective, expected_objective.unsqueeze(0), rtol=0, atol=1e-10)
-    torch.testing.assert_close(solution.coefficients[0], expected_coefficients, rtol=0, atol=1e-10)
+    torch.testing.assert_close(
+        solution.objective, expected_objective.unsqueeze(0), rtol=0, atol=1e-10
+    )
+    torch.testing.assert_close(
+        solution.coefficients[0], expected_coefficients, rtol=0, atol=1e-10
+    )
     assert solution.primal_residual.max().item() <= 1e-7
     assert solution.stationarity_residual.max().item() <= 1e-7
     assert solution.complementarity_residual.max().item() <= 1e-7
@@ -166,7 +172,9 @@ def test_box_qp_primal_residual_is_normalized_by_box_width() -> None:
     assert complementarity.tolist() == [0.0]
 
 
-def test_canonical_face_choice_uses_objective_then_norm_then_lexicographic_order() -> None:
+def test_canonical_face_choice_uses_objective_then_norm_then_lexicographic_order() -> (
+    None
+):
     """Catches rank-deficient tied faces being selected by enumeration order."""
 
     objective_then_norm = _canonical_face_choice(
@@ -214,7 +222,9 @@ def test_box_qp_uses_canonical_minimizer_for_rank_deficient_tied_faces(k: int) -
         rtol=0,
         atol=1e-12,
     )
-    torch.testing.assert_close(solution.coefficients[0], expected_coefficients, rtol=0, atol=1e-12)
+    torch.testing.assert_close(
+        solution.coefficients[0], expected_coefficients, rtol=0, atol=1e-12
+    )
     torch.testing.assert_close(
         solution.coefficients[0], torch.ones(k, dtype=torch.float64), rtol=0, atol=1e-12
     )
@@ -226,20 +236,26 @@ def test_canonical_face_choice_scales_objective_ties_by_target_norm() -> None:
     coefficients = torch.tensor([[1.0, 0.0], [0.0, 0.0]], dtype=torch.float64)
     objectives = torch.tensor([0.0, 1e-8], dtype=torch.float64)
 
-    assert _canonical_face_choice(
-        coefficients,
-        objectives,
-        objective_scale=1.0,
-        objective_tolerance=1e-10,
-        norm_tolerance=1e-12,
-    ) == 0
-    assert _canonical_face_choice(
-        coefficients,
-        objectives,
-        objective_scale=1e4,
-        objective_tolerance=1e-10,
-        norm_tolerance=1e-12,
-    ) == 1
+    assert (
+        _canonical_face_choice(
+            coefficients,
+            objectives,
+            objective_scale=1.0,
+            objective_tolerance=1e-10,
+            norm_tolerance=1e-12,
+        )
+        == 0
+    )
+    assert (
+        _canonical_face_choice(
+            coefficients,
+            objectives,
+            objective_scale=1e4,
+            objective_tolerance=1e-10,
+            norm_tolerance=1e-12,
+        )
+        == 1
+    )
 
 
 @pytest.mark.parametrize("k", (1, 7, 8))
@@ -280,3 +296,23 @@ def test_box_qp_only_enumerates_rank_deficient_systems_and_records_the_cost() ->
     assert full_rank.face_enumeration_count.tolist() == [0, 0, 0]
     assert rank_deficient.face_enumeration_count.tolist() == [3**6]
     assert rank_deficient.face_enumeration_count.max().item() <= 3**6
+
+
+def test_full_reference_k8_uses_canonical_rank_deficient_tie_semantics() -> None:
+    """The explicit R8 API retains min-L2/lexicographic fallback and its 3**8 cost."""
+
+    solution = solve_full_reference_box_qp(
+        torch.ones(1, 8, 8, dtype=torch.float64),
+        torch.full((1, 8), 8.0, dtype=torch.float64),
+        lower=0.0,
+        upper=2.0,
+        objective_scale=torch.ones(1, dtype=torch.float64),
+        settings=SETTINGS,
+    )
+
+    torch.testing.assert_close(
+        solution.coefficients[0], torch.ones(8, dtype=torch.float64)
+    )
+    assert solution.certified.tolist() == [True]
+    assert solution.face_enumeration_count.tolist() == [3**8]
+    assert solution.face_enumeration_count.max().item() <= 3**8

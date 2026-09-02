@@ -18,6 +18,7 @@ from ppmoe.moefication.qwen35 import PartitionedQwen35MLP
 from ppmoe.oracle.reconstruction import (
     ReconstructionCondition,
     SolverSettings,
+    score_full_reference,
     score_reconstruction,
 )
 from ppmoe.provenance import atomic_write_json
@@ -102,6 +103,7 @@ class ReconstructionLocalResult:
     co_selection: Mapping[tuple[int, int, str], tuple[tuple[int, ...], ...]]
     solver_diagnostics: Mapping[tuple[int, str], Mapping[str, object]]
     reference_distances: Mapping[tuple[int, str, str], ReferenceDistance]
+    reference_diagnostics: Mapping[tuple[int, str], Mapping[str, object]]
     coefficient_quantiles: Mapping[tuple[int, str], Mapping[str, float]]
     completed_batches: int
     failed_batches: int
@@ -200,6 +202,7 @@ class ReconstructionLocalAccumulator:
             key: {} for key in self._condition_keys
         }
         self._references: dict[tuple[int, str, str], list[float | int]] = {}
+        self._reference_solver: dict[tuple[int, str], dict[str, object]] = {}
         self._pending_coefficients: dict[tuple[int, str], list[float]] = {
             key: [] for key in self._condition_keys
         }
@@ -260,6 +263,13 @@ class ReconstructionLocalAccumulator:
             (int(layer), left, right): value
             for (layer, left, right), value in self._references.items()
         }
+        self._reference_solver = {
+            (int(layer), name): dict(value)
+            for (layer, name), value in (
+                (key.split("|", 1), value)
+                for key, value in state.get("reference_solver", {}).items()
+            )
+        }
 
     def _persist(self) -> None:
         path = self._state_path
@@ -298,6 +308,10 @@ class ReconstructionLocalAccumulator:
                     "|".join(map(str, key)): value
                     for key, value in self._references.items()
                 },
+                "reference_solver": {
+                    "|".join(map(str, key)): value
+                    for key, value in self._reference_solver.items()
+                },
             },
         )
 
@@ -310,6 +324,7 @@ class ReconstructionLocalAccumulator:
                 self._co_selection,
                 self._solver,
                 self._references,
+                self._reference_solver,
                 self._pending_coefficients,
                 self.completed_batches,
                 self.failures,
@@ -324,6 +339,7 @@ class ReconstructionLocalAccumulator:
             self._co_selection,
             self._solver,
             self._references,
+            self._reference_solver,
             self._pending_coefficients,
             self.completed_batches,
             self.failures,
@@ -365,10 +381,10 @@ class ReconstructionLocalAccumulator:
         values[3] += float((left64 * right64).sum().item())
         values[4] += int(left.shape[0])
 
+    @staticmethod
     def _accumulate_tensor_diagnostic(
-        self, key: tuple[int, str], name: str, value: Tensor
+        diagnostics: dict[str, object], name: str, value: Tensor
     ) -> None:
-        diagnostics = self._solver[key]
         if name == "pseudoinverse_effective_rank":
             counts = diagnostics.setdefault("pseudoinverse_effective_rank_counts", {})
             assert isinstance(counts, dict)
@@ -409,21 +425,20 @@ class ReconstructionLocalAccumulator:
                 else max(float(summary["max"]), maximum)
             )
 
-    def _accumulate_solver_diagnostics(
-        self, key: tuple[int, str], result: object
+    def _accumulate_result_diagnostics(
+        self, diagnostics: dict[str, object], result: object
     ) -> None:
         if result.effective_rank is not None:
             self._accumulate_tensor_diagnostic(
-                key, "effective_rank", result.effective_rank
+                diagnostics, "effective_rank", result.effective_rank
             )
-        diagnostics = self._solver[key]
         source_counts = diagnostics.setdefault("solver_source_counts", {})
         assert isinstance(source_counts, dict)
         for source in result.solver_source:
             source_counts[source] = int(source_counts.get(source, 0)) + 1
         for name, value in result.diagnostics.items():
             if isinstance(value, Tensor):
-                self._accumulate_tensor_diagnostic(key, name, value)
+                self._accumulate_tensor_diagnostic(diagnostics, name, value)
             elif isinstance(value, (tuple, list)):
                 sequences = diagnostics.setdefault("sequence_diagnostics", {})
                 assert isinstance(sequences, dict)
@@ -447,6 +462,11 @@ class ReconstructionLocalAccumulator:
                 else:
                     diagnostics[name] = float(diagnostics.get(name, 0)) + float(value)
 
+    def _accumulate_solver_diagnostics(
+        self, key: tuple[int, str], result: object
+    ) -> None:
+        self._accumulate_result_diagnostics(self._solver[key], result)
+
     def update_layer(self, layer: int, d0: Tensor, expert_outputs: Tensor) -> None:
         if not 0 <= layer < self.num_layers or d0.ndim != 2 or expert_outputs.ndim != 3:
             raise ValueError("invalid reconstruction local layer tensors")
@@ -463,6 +483,28 @@ class ReconstructionLocalAccumulator:
         target_norm = float(d0.detach().double().square().sum().item())
         e8 = expert_outputs.sum(dim=1)
         self._add_reference(layer, "D0", d0, "E8", e8)
+        unique_conditions = {
+            condition_id(condition): condition
+            for candidates in self.conditions.values()
+            for condition in candidates
+        }
+        for identifier, condition in unique_conditions.items():
+            r8_result = score_full_reference(
+                d0.double(), expert_outputs.double(), condition, self.solver_settings
+            )
+            selected_experts = expert_outputs.double()[
+                torch.arange(d0.shape[0], device=d0.device)[:, None],
+                r8_result.subsets,
+            ].to(r8_result.coefficients.dtype)
+            reconstruction = torch.einsum(
+                "tk,tkh->th", r8_result.coefficients, selected_experts
+            )
+            r8_name = f"R8[{identifier}]"
+            self._add_reference(layer, "D0", d0, r8_name, reconstruction)
+            self._add_reference(layer, "E8", e8, r8_name, reconstruction)
+            self._accumulate_result_diagnostics(
+                self._reference_solver.setdefault((layer, r8_name), {}), r8_result
+            )
         for k, candidates in self.conditions.items():
             for condition in candidates:
                 key = (k, condition_id(condition))
@@ -506,24 +548,6 @@ class ReconstructionLocalAccumulator:
                             co_selection[first][second]
                         )
                 self._accumulate_solver_diagnostics(key, result)
-                r8_result = score_reconstruction(
-                    d0.double(),
-                    expert_outputs.double(),
-                    self.num_experts,
-                    condition,
-                    self.solver_settings,
-                    allow_full_reference=True,
-                )
-                selected_experts = expert_outputs.double()[
-                    torch.arange(d0.shape[0], device=d0.device)[:, None],
-                    r8_result.subsets,
-                ].to(r8_result.coefficients.dtype)
-                reconstruction = torch.einsum(
-                    "tk,tkh->th", r8_result.coefficients, selected_experts
-                )
-                r8_name = f"R8[{condition_id(condition)}]"
-                self._add_reference(layer, "D0", d0, r8_name, reconstruction)
-                self._add_reference(layer, "E8", e8, r8_name, reconstruction)
 
     def _chunk_path(self, key: tuple[int, str], batch_index: int) -> Path:
         assert self.checkpoint_dir is not None
@@ -652,6 +676,9 @@ class ReconstructionLocalAccumulator:
                     int(value[4]),
                 )
                 for key, value in self._references.items()
+            },
+            reference_diagnostics={
+                key: dict(value) for key, value in self._reference_solver.items()
             },
             coefficient_quantiles={
                 key: self._quantiles(key) for key in self._condition_keys
