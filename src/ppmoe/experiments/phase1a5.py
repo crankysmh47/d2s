@@ -85,10 +85,14 @@ def _write_stage(
     config_signature: str,
     input_signature: str,
     payload: Mapping[str, object],
+    *,
+    status: str = "complete",
 ) -> dict[str, object]:
+    if status not in {"complete", "scientifically_stopped"}:
+        raise ValueError(f"unsupported stage status: {status}")
     state = {
         "stage": stage,
-        "status": "complete",
+        "status": status,
         "config_signature": config_signature,
         "input_signature": input_signature,
         **_json_safe(payload),
@@ -451,6 +455,36 @@ def _source_from_stage(
     return state, manifest, _source_hashes(manifest)
 
 
+def _matches_current_source(
+    state: Mapping[str, object],
+    source_stage: Mapping[str, object],
+    source_hashes: Mapping[str, str],
+) -> bool:
+    return (
+        state.get("source_stage_input_signature") == source_stage.get("input_signature")
+        and state.get("source_hashes") == source_hashes
+    )
+
+
+def _read_current_smoke(
+    artifact_root: Path,
+    config: Phase1A5Config,
+    source_stage: Mapping[str, object],
+    source_hashes: Mapping[str, str],
+    microbatch_size: int,
+) -> dict[str, Any]:
+    smoke = _read_stage(artifact_root, "smoke", _config_signature(config))
+    if not _matches_current_source(smoke, source_stage, source_hashes):
+        raise StagePrerequisiteError(
+            "local requires smoke from the current verified source provenance"
+        )
+    if smoke.get("execution_microbatch_size") != microbatch_size:
+        raise StagePrerequisiteError(
+            "local requires smoke with the requested execution microbatch size"
+        )
+    return smoke
+
+
 def _diagnostic_count(diagnostics: Mapping[object, object], name: str) -> int:
     total = 0
     for value in diagnostics.values():
@@ -466,8 +500,25 @@ def _smoke_stage(
     artifact_root: Path,
     microbatch_size: int,
     dependencies: Phase1A5Dependencies,
+    *,
+    resume: bool,
 ) -> dict[str, object]:
-    _, source_manifest, source_hashes = _source_from_stage(artifact_root, config)
+    source_stage, source_manifest, source_hashes = _source_from_stage(
+        artifact_root, config
+    )
+    existing_path = _stage_path(artifact_root, "smoke")
+    if existing_path.exists():
+        existing = _read_stage(artifact_root, "smoke", _config_signature(config))
+        compatible = (
+            _matches_current_source(existing, source_stage, source_hashes)
+            and existing.get("execution_microbatch_size") == microbatch_size
+        )
+        if compatible:
+            if resume:
+                return existing
+            raise StageError(
+                "compatible smoke evidence is immutable; rerun with --resume"
+            )
     assert (
         dependencies.calibration_loader is not None
         and dependencies.converted_pair_loader is not None
@@ -572,6 +623,7 @@ def _smoke_stage(
             "unit_regression": regression,
             "families": families,
             "source_hashes": source_hashes,
+            "source_stage_input_signature": source_stage["input_signature"],
         },
     )
 
@@ -582,11 +634,21 @@ def _local_stage(
     microbatch_size: int,
     dependencies: Phase1A5Dependencies,
 ) -> dict[str, object]:
-    _, source_manifest, source_hashes = _source_from_stage(artifact_root, config)
+    source_stage, source_manifest, source_hashes = _source_from_stage(
+        artifact_root, config
+    )
     try:
-        smoke = _read_stage(artifact_root, "smoke", _config_signature(config))
+        smoke = _read_current_smoke(
+            artifact_root,
+            config,
+            source_stage,
+            source_hashes,
+            microbatch_size,
+        )
     except StagePrerequisiteError as error:
-        raise StagePrerequisiteError("local requires feasible smoke") from error
+        if "required stage smoke is absent" in str(error):
+            raise StagePrerequisiteError("local requires feasible smoke") from error
+        raise
     families = smoke.get("families")
     if not isinstance(families, Mapping) or not isinstance(
         families.get("bounded"), Mapping
@@ -654,6 +716,7 @@ def _local_stage(
             "valid_calibration_tokens": 100_000,
             "bounded_included": include_bounded,
             "source_hashes": source_hashes,
+            "source_stage_input_signature": source_stage["input_signature"],
             "selection_metrics": selection_metrics,
             "result": _json_safe(result),
         },
@@ -667,6 +730,11 @@ def _select_stage(
     dependencies: Phase1A5Dependencies,
 ) -> dict[str, object]:
     local = _read_stage(artifact_root, "local", _config_signature(config))
+    source_stage, _, source_hashes = _source_from_stage(artifact_root, config)
+    if not _matches_current_source(local, source_stage, source_hashes):
+        raise StagePrerequisiteError(
+            "select requires local results from the current verified source provenance"
+        )
     metrics_payload = local.get("selection_metrics")
     source_hashes = local.get("source_hashes")
     persisted_result = local.get("result")
@@ -736,6 +804,13 @@ def _select_stage(
             "microbatch_size": microbatch_size,
         }
     )
+    if isinstance(manifest, Mapping):
+        practical = manifest.get("practical_conditions", {})
+        free_bound = manifest.get("free_bound_conditions", {})
+    else:
+        practical = getattr(manifest, "practical_conditions", {})
+        free_bound = getattr(manifest, "free_bound_conditions", {})
+    stopped = not practical and not free_bound
     return _write_stage(
         artifact_root,
         "select",
@@ -746,7 +821,14 @@ def _select_stage(
             "selection_manifest_sha256": sha256_file(output_path),
             "manifest": _json_safe(manifest),
             "source_hashes": source_hashes,
+            "source_stage_input_signature": source_stage["input_signature"],
+            **(
+                {"scientific_stop_reason": "selection_no_eligible_conditions"}
+                if stopped
+                else {}
+            ),
         },
+        status="scientifically_stopped" if stopped else "complete",
     )
 
 
@@ -762,6 +844,60 @@ def _immutable_selection(artifact_root: Path, config: Phase1A5Config) -> None:
         raise StagePrerequisiteError("rollout requires an immutable selection manifest")
 
 
+def _read_report_stage(
+    artifact_root: Path,
+    stage: str,
+    config: Phase1A5Config,
+    source_stage: Mapping[str, object],
+    source_hashes: Mapping[str, str],
+    *,
+    allow_scientific_stop: bool = False,
+) -> dict[str, Any]:
+    state = _read_stage(
+        artifact_root,
+        stage,
+        _config_signature(config),
+        allow_scientific_stop=allow_scientific_stop,
+    )
+    if not _matches_current_source(state, source_stage, source_hashes):
+        raise StagePrerequisiteError(
+            f"required stage {stage} provenance does not match the current verified source"
+        )
+    return state
+
+
+def _selection_is_scientifically_stopped(
+    artifact_root: Path, selection: Mapping[str, object]
+) -> bool:
+    if selection.get("status") != "scientifically_stopped":
+        return False
+    if selection.get("scientific_stop_reason") != "selection_no_eligible_conditions":
+        raise StagePrerequisiteError(
+            "selection scientific stop has no registered reason"
+        )
+    path = artifact_root / "selection-manifest.json"
+    expected = selection.get("selection_manifest_sha256")
+    if (
+        not path.is_file()
+        or not isinstance(expected, str)
+        or sha256_file(path) != expected
+    ):
+        raise StagePrerequisiteError(
+            "selection scientific stop lacks an immutable manifest"
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise StagePrerequisiteError(
+            "selection scientific stop has invalid manifest"
+        ) from error
+    if payload.get("practical_conditions") or payload.get("free_bound_conditions"):
+        raise StagePrerequisiteError(
+            "selection scientific stop has eligible conditions"
+        )
+    return True
+
+
 def run_phase1a5(
     config: Phase1A5Config,
     stage: str,
@@ -773,9 +909,6 @@ def run_phase1a5(
 ) -> Mapping[str, object]:
     """Execute one Phase 1A.5 gate without deleting or sharing checkpoints."""
 
-    del (
-        resume
-    )  # Resume belongs to the signature-isolated local accumulator checkpoints.
     if stage not in {"source", "smoke", "local", "select", "rollout", "report"}:
         raise ValueError(f"unsupported Phase 1A.5 stage: {stage}")
     if microbatch_size <= 0:
@@ -785,7 +918,9 @@ def run_phase1a5(
     if stage == "source":
         return _source_stage(config, artifact_root, microbatch_size, values)
     if stage == "smoke":
-        return _smoke_stage(config, artifact_root, microbatch_size, values)
+        return _smoke_stage(
+            config, artifact_root, microbatch_size, values, resume=resume
+        )
     if stage == "local":
         return _local_stage(config, artifact_root, microbatch_size, values)
     if stage == "select":
@@ -793,8 +928,18 @@ def run_phase1a5(
     if stage == "rollout":
         _immutable_selection(artifact_root, config)
         raise StageError("rollout is not implemented until Task 6")
-    _read_stage(artifact_root, "source", _config_signature(config))
-    _read_stage(
-        artifact_root, "smoke", _config_signature(config), allow_scientific_stop=True
+    source_stage, _, source_hashes = _source_from_stage(artifact_root, config)
+    _read_report_stage(artifact_root, "smoke", config, source_stage, source_hashes)
+    _read_report_stage(artifact_root, "local", config, source_stage, source_hashes)
+    selection = _read_report_stage(
+        artifact_root,
+        "select",
+        config,
+        source_stage,
+        source_hashes,
+        allow_scientific_stop=True,
     )
+    if _selection_is_scientifically_stopped(artifact_root, selection):
+        raise StageError("report is not implemented until Task 7")
+    _read_report_stage(artifact_root, "rollout", config, source_stage, source_hashes)
     raise StageError("report is not implemented until Task 7")

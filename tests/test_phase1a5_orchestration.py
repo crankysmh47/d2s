@@ -82,9 +82,16 @@ def _dependencies():
     def selection_runner(result, _config, output_path):
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(
-            json.dumps({"frozen": result.complete}), encoding="utf-8"
+            json.dumps(
+                {
+                    "practical_conditions": {},
+                    "free_bound_conditions": {"4": "free_bound"},
+                    "frozen": result.complete,
+                }
+            ),
+            encoding="utf-8",
         )
-        return {"frozen": True}
+        return {"practical_conditions": {}, "free_bound_conditions": {4: "free_bound"}}
 
     return Phase1A5Dependencies(
         source_verifier=lambda *_args, **_kwargs: _source_manifest(),
@@ -207,7 +214,7 @@ def test_local_omits_bounded_only_after_the_bounded_smoke_gate_fails(
 def test_execution_signature_isolates_checkpoint_paths_for_code_and_microbatch(
     tmp_path: Path,
 ) -> None:
-    from ppmoe.experiments.phase1a5 import run_phase1a5
+    from ppmoe.experiments.phase1a5 import StagePrerequisiteError, run_phase1a5
 
     config = Phase1A5Config.load(CONFIG_PATH)
     dependencies, calls = _dependencies()
@@ -218,10 +225,16 @@ def test_execution_signature_isolates_checkpoint_paths_for_code_and_microbatch(
     first = run_phase1a5(
         config, "local", False, tmp_path, 100, dependencies=dependencies
     )
+    with pytest.raises(StagePrerequisiteError, match="microbatch"):
+        run_phase1a5(config, "local", False, tmp_path, 50, dependencies=dependencies)
+    second_smoke = run_phase1a5(
+        config, "smoke", False, tmp_path, 50, dependencies=dependencies
+    )
     second = run_phase1a5(
         config, "local", False, tmp_path, 50, dependencies=dependencies
     )
     assert first["input_signature"] != second["input_signature"]
+    assert first_smoke["input_signature"] != second_smoke["input_signature"]
     assert calls[-2]["checkpoint_dir"] != calls[-1]["checkpoint_dir"]
     first_local_checkpoint = calls[-2]["checkpoint_dir"]
 
@@ -233,6 +246,8 @@ def test_execution_signature_isolates_checkpoint_paths_for_code_and_microbatch(
         },
     )
     run_phase1a5(config, "source", False, tmp_path, 100, dependencies=changed)
+    with pytest.raises(StagePrerequisiteError, match="source"):
+        run_phase1a5(config, "local", False, tmp_path, 100, dependencies=changed)
     changed_smoke = run_phase1a5(
         config, "smoke", False, tmp_path, 100, dependencies=changed
     )
@@ -244,7 +259,34 @@ def test_execution_signature_isolates_checkpoint_paths_for_code_and_microbatch(
     assert calls[-1]["checkpoint_dir"] != first_local_checkpoint
 
 
-def test_select_requires_complete_local_and_report_allows_scientific_stop(
+def test_compatible_smoke_evidence_is_immutable_on_resume_and_nonresume(
+    tmp_path: Path,
+) -> None:
+    from ppmoe.experiments.phase1a5 import StageError, run_phase1a5
+
+    config = Phase1A5Config.load(CONFIG_PATH)
+    dependencies, calls = _dependencies()
+    run_phase1a5(config, "source", False, tmp_path, 100, dependencies=dependencies)
+    first = run_phase1a5(
+        config, "smoke", False, tmp_path, 100, dependencies=dependencies
+    )
+    smoke_path = tmp_path / "stages" / "smoke.json"
+    original_bytes = smoke_path.read_bytes()
+    calls_after_first = len(calls)
+
+    resumed = run_phase1a5(
+        config, "smoke", True, tmp_path, 100, dependencies=dependencies
+    )
+    assert resumed == first
+    assert smoke_path.read_bytes() == original_bytes
+    assert len(calls) == calls_after_first
+    with pytest.raises(StageError, match="immutable"):
+        run_phase1a5(config, "smoke", False, tmp_path, 100, dependencies=dependencies)
+    assert smoke_path.read_bytes() == original_bytes
+    assert len(calls) == calls_after_first
+
+
+def test_report_requires_terminal_predecessors_and_allows_selection_stop(
     tmp_path: Path,
 ) -> None:
     from ppmoe.experiments.phase1a5 import (
@@ -255,22 +297,31 @@ def test_select_requires_complete_local_and_report_allows_scientific_stop(
 
     config = Phase1A5Config.load(CONFIG_PATH)
     dependencies, _ = _dependencies()
-    source = run_phase1a5(
+    run_phase1a5(
         config, "source", False, tmp_path, 100, dependencies=dependencies
     )
     with pytest.raises(StagePrerequisiteError, match="local"):
         run_phase1a5(config, "select", False, tmp_path, 100, dependencies=dependencies)
-    path = tmp_path / "stages" / "smoke.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {
-                "stage": "smoke",
-                "status": "scientifically_stopped",
-                "config_signature": source["config_signature"],
-            }
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(StageError, match="not implemented"):
+    run_phase1a5(config, "smoke", False, tmp_path, 100, dependencies=dependencies)
+    with pytest.raises(StagePrerequisiteError, match="local"):
         run_phase1a5(config, "report", False, tmp_path, 100, dependencies=dependencies)
+    run_phase1a5(config, "local", False, tmp_path, 100, dependencies=dependencies)
+    with pytest.raises(StagePrerequisiteError, match="select"):
+        run_phase1a5(config, "report", False, tmp_path, 100, dependencies=dependencies)
+    run_phase1a5(config, "select", False, tmp_path, 100, dependencies=dependencies)
+    with pytest.raises(StagePrerequisiteError, match="rollout"):
+        run_phase1a5(config, "report", False, tmp_path, 100, dependencies=dependencies)
+
+    stopped = replace(
+        dependencies,
+        selection_runner=lambda _result, _config, output_path: (
+            output_path.write_text(
+                '{"practical_conditions":{},"free_bound_conditions":{}}',
+                encoding="utf-8",
+            ),
+            {"practical_conditions": {}, "free_bound_conditions": {}},
+        )[1],
+    )
+    run_phase1a5(config, "select", False, tmp_path, 100, dependencies=stopped)
+    with pytest.raises(StageError, match="not implemented"):
+        run_phase1a5(config, "report", False, tmp_path, 100, dependencies=stopped)
