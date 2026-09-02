@@ -86,7 +86,9 @@ class FamilyBenchmark:
         if not isfinite(elapsed_seconds) or elapsed_seconds < 0.0:
             raise ValueError("elapsed_seconds must be finite and non-negative")
         if peak_cuda_bytes < 0 or processed_tokens <= 0 or failures < 0:
-            raise ValueError("benchmark counts must be non-negative and tokens positive")
+            raise ValueError(
+                "benchmark counts must be non-negative and tokens positive"
+            )
         projected = elapsed_seconds * 100000.0 / processed_tokens
         feasible = (
             projected <= 7200.0
@@ -141,7 +143,9 @@ def _validate_inputs(target: Tensor, experts: Tensor, k: int) -> None:
         raise ValueError("target and experts must share a device")
     if not target.is_floating_point() or not experts.is_floating_point():
         raise ValueError("target and experts must use floating-point dtypes")
-    if not bool(torch.isfinite(target).all()) or not bool(torch.isfinite(experts).all()):
+    if not bool(torch.isfinite(target).all()) or not bool(
+        torch.isfinite(experts).all()
+    ):
         raise ValueError("target and experts must be finite")
     if not 1 <= k <= num_experts:
         raise ValueError(f"k must satisfy 1 <= k <= {num_experts}; received {k}")
@@ -167,12 +171,16 @@ def _quadratic_loss(
     return loss.clamp_min(0.0)
 
 
-def _materialized_loss(target: Tensor, selected_experts: Tensor, coefficients: Tensor) -> Tensor:
+def _materialized_loss(
+    target: Tensor, selected_experts: Tensor, coefficients: Tensor
+) -> Tensor:
     reconstruction = torch.einsum("tck,tckh->tch", coefficients, selected_experts)
     return (reconstruction - target[:, None, :]).square().sum(dim=-1)
 
 
-def _pseudoinverse_candidates(gs: Tensor, bs: Tensor, settings: SolverSettings) -> tuple[Tensor, Tensor]:
+def _pseudoinverse_candidates(
+    gs: Tensor, bs: Tensor, settings: SolverSettings
+) -> tuple[Tensor, Tensor]:
     eigenvalues, eigenvectors = torch.linalg.eigh(gs)
     maximum = eigenvalues[..., -1]
     keep = (maximum > 0.0)[..., None] & (
@@ -180,7 +188,10 @@ def _pseudoinverse_candidates(gs: Tensor, bs: Tensor, settings: SolverSettings) 
     )
     inverse = torch.where(keep, eigenvalues.reciprocal(), torch.zeros_like(eigenvalues))
     coefficients = torch.einsum(
-        "tcij,tcj,tcj->tci", eigenvectors, inverse, torch.einsum("tcij,tcj->tci", eigenvectors.transpose(-2, -1), bs)
+        "tcij,tcj,tcj->tci",
+        eigenvectors,
+        inverse,
+        torch.einsum("tcij,tcj->tci", eigenvectors.transpose(-2, -1), bs),
     )
     return coefficients, keep.sum(dim=-1)
 
@@ -219,7 +230,9 @@ def _ridge_candidates(
             eigenvalues, eigenvectors = torch.linalg.eigh(fallback_system)
             scale = torch.diagonal(fallback_system, dim1=-2, dim2=-1).sum(dim=-1)
             if bool((eigenvalues[..., 0] <= 0.0).any()):
-                raise FloatingPointError("ridge eigensolve fallback found non-positive system")
+                raise FloatingPointError(
+                    "ridge eigensolve fallback found non-positive system"
+                )
             solution = torch.einsum(
                 "bij,bj->bi",
                 eigenvectors,
@@ -286,7 +299,9 @@ def _pick_registered_candidate(
             | better_norm
             | (
                 tied_norm
-                & _lexicographically_smaller(contender_coefficients, chosen_coefficients)
+                & _lexicographically_smaller(
+                    contender_coefficients, chosen_coefficients
+                )
             )
         )
         chosen_coefficients = torch.where(
@@ -312,7 +327,9 @@ def _choose_subsets_with_tolerance(
     """Choose the first subset whose materialized loss ties the true minimum."""
 
     minimum = losses.min(dim=1).values
-    tied = losses <= minimum[:, None] + objective_tolerance * target_norm[:, None].clamp_min(1.0)
+    tied = losses <= minimum[:, None] + objective_tolerance * target_norm[
+        :, None
+    ].clamp_min(1.0)
     return tied.to(torch.int64).argmax(dim=1)
 
 
@@ -326,11 +343,17 @@ def score_reconstruction(
     k: int,
     condition: ReconstructionCondition,
     settings: SolverSettings,
+    *,
+    allow_full_reference: bool = False,
 ) -> ReconstructionResult:
     """Exhaustively choose each token's best subset under one coefficient family."""
 
     _validate_inputs(target, experts, k)
-    if condition.family == "bounded" and k not in {4, 6}:
+    if (
+        condition.family == "bounded"
+        and k not in {4, 6}
+        and not (allow_full_reference and k == 8)
+    ):
         raise ValueError("bounded reconstruction is registered only for K=4 or K=6")
 
     combinations = enumerate_subsets(experts.shape[1], k, experts.device)
@@ -343,9 +366,7 @@ def score_reconstruction(
     gs = full_gram[:, combinations[:, :, None], combinations[:, None, :]]
     bs = full_linear[:, combinations]
 
-    unit_coefficients = torch.ones(
-        bs.shape, dtype=score_dtype, device=experts.device
-    )
+    unit_coefficients = torch.ones(bs.shape, dtype=score_dtype, device=experts.device)
     unit_loss = _quadratic_loss(target_norm, gs, bs, unit_coefficients)
 
     if condition.family == "unit":
@@ -359,10 +380,7 @@ def score_reconstruction(
             selected_subsets,
         ]
         squared_error = (
-            (
-                torch.einsum("tk,tkh->th", coefficients, selected_experts)
-                - score_target
-            )
+            (torch.einsum("tk,tkh->th", coefficients, selected_experts) - score_target)
             .square()
             .sum(dim=-1)
         )
@@ -373,9 +391,9 @@ def score_reconstruction(
             effective_rank=None,
             solver_source=("unit",) * target.shape[0],
             diagnostics={
-            "cholesky_fallback_count": 0,
-            "degenerate_ridge_count": 0,
-            "max_relative_system_residual": 0.0,
+                "cholesky_fallback_count": 0,
+                "degenerate_ridge_count": 0,
+                "max_relative_system_residual": 0.0,
             },
         )
 
@@ -397,6 +415,7 @@ def score_reconstruction(
             upper=2.0,
             objective_scale=target_norm64[:, None].expand(-1, gs64.shape[1]),
             settings=settings.box_qp,
+            allow_full_reference=allow_full_reference,
         )
         selected_experts64 = experts64[:, combinations, :]
         bounded_loss = _materialized_loss(
@@ -406,7 +425,9 @@ def score_reconstruction(
             bounded.certified, bounded_loss, torch.full_like(bounded_loss, float("inf"))
         )
         if bool(torch.isinf(valid_loss).all(dim=1).any()):
-            raise FloatingPointError("bounded box-QP left a token without a certified subset")
+            raise FloatingPointError(
+                "bounded box-QP left a token without a certified subset"
+            )
         subset_indices = _choose_subsets_with_tolerance(
             valid_loss, target_norm64, objective_tolerance=1e-10
         )
@@ -432,12 +453,22 @@ def score_reconstruction(
             effective_rank=None,
             solver_source=("bounded",) * target.shape[0],
             diagnostics={
-                "bounded_lower_saturation_count": int((coefficients < 1e-6).sum().item()),
-                "bounded_upper_saturation_count": int((coefficients > 2.0 - 1e-6).sum().item()),
-                "bounded_coefficient_bound_violation_count": int(bound_violations.sum().item()),
+                "bounded_lower_saturation_count": int(
+                    (coefficients < 1e-6).sum().item()
+                ),
+                "bounded_upper_saturation_count": int(
+                    (coefficients > 2.0 - 1e-6).sum().item()
+                ),
+                "bounded_coefficient_bound_violation_count": int(
+                    bound_violations.sum().item()
+                ),
                 "bounded_max_primal_residual": float(selected_primal.max().item()),
-                "bounded_max_stationarity_residual": float(selected_stationarity.max().item()),
-                "bounded_max_complementarity_residual": float(selected_complementarity.max().item()),
+                "bounded_max_stationarity_residual": float(
+                    selected_stationarity.max().item()
+                ),
+                "bounded_max_complementarity_residual": float(
+                    selected_complementarity.max().item()
+                ),
                 "bounded_max_iterations": int(selected_iterations.max().item()),
                 "bounded_failure_count": failures,
                 "bounded_uncertified_count": failures,
@@ -466,10 +497,7 @@ def score_reconstruction(
             selected_subsets,
         ]
         squared_error = (
-            (
-                torch.einsum("tk,tkh->th", coefficients, selected_experts64)
-                - target64
-            )
+            (torch.einsum("tk,tkh->th", coefficients, selected_experts64) - target64)
             .square()
             .sum(dim=-1)
         )
@@ -542,7 +570,12 @@ def score_reconstruction(
         torch.arange(target.shape[0], device=experts.device)[:, None], selected_subsets
     ]
     selected_pseudoinverse_loss = (
-        (torch.einsum("tk,tkh->th", selected_pseudoinverse_coefficients, selected_experts64) - target64)
+        (
+            torch.einsum(
+                "tk,tkh->th", selected_pseudoinverse_coefficients, selected_experts64
+            )
+            - target64
+        )
         .square()
         .sum(dim=-1)
     )
@@ -578,9 +611,14 @@ def verify_pseudoinverse_svd(
     pseudoinverse_coefficients = result.diagnostics.get("pseudoinverse_coefficients")
     pseudoinverse_loss = result.diagnostics.get("pseudoinverse_squared_error")
     pseudoinverse_rank = result.diagnostics.get("pseudoinverse_effective_rank")
-    if not all(isinstance(value, Tensor) for value in (
-        pseudoinverse_coefficients, pseudoinverse_loss, pseudoinverse_rank
-    )):
+    if not all(
+        isinstance(value, Tensor)
+        for value in (
+            pseudoinverse_coefficients,
+            pseudoinverse_loss,
+            pseudoinverse_rank,
+        )
+    ):
         raise ValueError("result does not expose primary pseudoinverse candidates")
 
     rows = torch.arange(target.shape[0], device=target.device)
@@ -590,14 +628,18 @@ def verify_pseudoinverse_svd(
     keep = (maximum > 0.0)[..., None] & (
         singular_values > settings.tau_g**0.5 * maximum[..., None]
     )
-    inverse = torch.where(keep, singular_values.reciprocal(), torch.zeros_like(singular_values))
+    inverse = torch.where(
+        keep, singular_values.reciprocal(), torch.zeros_like(singular_values)
+    )
     projected = (u.transpose(-2, -1) @ target.double()[..., None]).squeeze(-1)
     svd_coefficients = vh.transpose(-2, -1) @ (projected * inverse)[..., None]
     svd_coefficients = svd_coefficients.squeeze(-1)
     reconstruction = torch.einsum("tk,thk->th", svd_coefficients, selected)
     svd_loss = (reconstruction - target.double()).square().sum(dim=-1)
     rank_equal = bool(torch.equal(keep.sum(dim=-1), pseudoinverse_rank))
-    relative_objective_error = (svd_loss - pseudoinverse_loss).abs() / target.double().square().sum(dim=-1).clamp_min(1.0)
+    relative_objective_error = (
+        svd_loss - pseudoinverse_loss
+    ).abs() / target.double().square().sum(dim=-1).clamp_min(1.0)
     maximum_error = float(relative_objective_error.max().item())
     if not rank_equal or maximum_error > settings.objective_tolerance:
         raise FloatingPointError("pseudoinverse and direct SVD verification disagree")

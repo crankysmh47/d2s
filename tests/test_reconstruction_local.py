@@ -1,5 +1,5 @@
-from pathlib import Path
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import torch
@@ -108,6 +108,127 @@ def test_reference_labels_remain_distinct_for_bf16_independent_experts(
         (0, "E8", f"R8[{condition_id(condition)}]"),
     }
     assert references[(0, "D0", "E8")].squared_error_sum > 0.0
+
+
+def test_every_sparse_condition_has_a_separately_solved_all_expert_r8_reference(
+    tmp_path: Path,
+) -> None:
+    conditions = (
+        ReconstructionCondition("unit"),
+        ReconstructionCondition("ridge", rho=0.1),
+        ReconstructionCondition("bounded"),
+        ReconstructionCondition("free_bound"),
+    )
+    accumulator = ReconstructionLocalAccumulator(
+        num_layers=1,
+        num_experts=8,
+        conditions={4: conditions},
+        checkpoint_dir=tmp_path,
+        run_signature="all-r8-references",
+    )
+    d0 = torch.tensor([[1.0, -0.5]])
+    experts = torch.tensor(
+        [
+            [
+                [0.2, -0.1],
+                [0.1, -0.1],
+                [0.2, 0.0],
+                [0.0, -0.1],
+                [0.1, 0.0],
+                [0.1, -0.1],
+                [0.2, 0.0],
+                [0.1, -0.1],
+            ]
+        ]
+    )
+
+    accumulator.update_layer(0, d0, experts)
+    references = accumulator.finalize().reference_distances
+
+    for condition in conditions:
+        r8 = f"R8[{condition_id(condition)}]"
+        assert (0, "D0", r8) in references
+        assert (0, "E8", r8) in references
+
+
+def test_tensor_solver_diagnostics_persist_rank_distribution_across_resume(
+    tmp_path: Path,
+) -> None:
+    condition = ReconstructionCondition("free_bound")
+    accumulator = ReconstructionLocalAccumulator(
+        num_layers=1,
+        num_experts=8,
+        conditions={4: (condition,)},
+        checkpoint_dir=tmp_path,
+        run_signature="tensor-diagnostics",
+    )
+    d0 = torch.tensor([[1.0], [0.0]])
+    experts = torch.zeros(2, 8, 1)
+    experts[0, :, 0] = torch.arange(1, 9, dtype=torch.float32)
+
+    accumulator.update_layer(0, d0, experts)
+    accumulator.mark_batch_completed(0)
+    first = accumulator.finalize().solver_diagnostics[(4, condition_id(condition))]
+    resumed = (
+        ReconstructionLocalAccumulator(
+            num_layers=1,
+            num_experts=8,
+            conditions={4: (condition,)},
+            checkpoint_dir=tmp_path,
+            run_signature="tensor-diagnostics",
+        )
+        .finalize()
+        .solver_diagnostics[(4, condition_id(condition))]
+    )
+
+    assert first["pseudoinverse_effective_rank_counts"] == {"0": 1, "1": 1}
+    assert first["sequence_diagnostics"]["candidate_sources"] == [
+        "pseudoinverse",
+        "unit",
+        "ridge:10",
+        "ridge:1",
+        "ridge:0.1",
+        "ridge:0.01",
+        "ridge:0.001",
+    ]
+    assert first == resumed
+
+
+def test_persist_failure_rolls_back_the_entire_batch_and_allows_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    condition = ReconstructionCondition("unit")
+    accumulator = ReconstructionLocalAccumulator(
+        num_layers=1,
+        num_experts=8,
+        conditions={4: (condition,)},
+        checkpoint_dir=tmp_path,
+        run_signature="persist-failure",
+    )
+    target = torch.tensor([[1.0]])
+    experts = torch.zeros(1, 8, 1)
+    calls = 0
+    original = accumulator._persist
+
+    def fail_once() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("injected checkpoint failure")
+        original()
+
+    accumulator.update_layer(0, target, experts)
+    monkeypatch.setattr(accumulator, "_persist", fail_once)
+    with pytest.raises(OSError, match="checkpoint failure"):
+        accumulator.mark_batch_completed(0)
+
+    assert accumulator.completed_batches == set()
+    assert accumulator.failures == {}
+    assert accumulator.finalize().metrics[(4, condition_id(condition))].token_count == 0
+    assert not list((tmp_path / "coefficients").glob("*.json"))
+    accumulator.update_layer(0, target, experts)
+    accumulator.mark_batch_completed(0)
+    assert accumulator.completed_batches == {0}
 
 
 def test_coefficient_chunks_are_sorted_and_deterministic(tmp_path: Path) -> None:

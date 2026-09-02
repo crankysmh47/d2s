@@ -50,18 +50,28 @@ class BoxQPSolution:
 
 
 def _validate_inputs(
-    gs: Tensor, bs: Tensor, objective_scale: Tensor, lower: float, upper: float
+    gs: Tensor,
+    bs: Tensor,
+    objective_scale: Tensor,
+    lower: float,
+    upper: float,
+    *,
+    allow_full_reference: bool,
 ) -> None:
     if gs.ndim < 2 or gs.shape[-1] != gs.shape[-2]:
         raise ValueError("gs must have shape [..., k, k]")
     if bs.shape != gs.shape[:-1]:
         raise ValueError("bs must have shape [..., k] matching gs")
     k = bs.shape[-1]
-    if not 2 <= k <= 6:
+    if not 2 <= k <= 6 and not (allow_full_reference and k == 8):
         raise ValueError(f"box-QP requires 2 <= k <= 6; received {k}")
     if objective_scale.shape != bs.shape[:-1]:
         raise ValueError("objective_scale must have one value per system")
-    if not gs.is_floating_point() or not bs.is_floating_point() or not objective_scale.is_floating_point():
+    if (
+        not gs.is_floating_point()
+        or not bs.is_floating_point()
+        or not objective_scale.is_floating_point()
+    ):
         raise ValueError("gs, bs, and objective_scale must be floating-point tensors")
     if gs.device != bs.device or gs.device != objective_scale.device:
         raise ValueError("gs, bs, and objective_scale must share a device")
@@ -126,10 +136,13 @@ def _kkt_residuals(
     box_width = upper - lower
     if box_width <= 0.0:
         raise ValueError("box width must be positive")
-    primal = torch.maximum(
-        (lower - coefficients).clamp_min(0.0),
-        (coefficients - upper).clamp_min(0.0),
-    ).amax(dim=-1) / box_width
+    primal = (
+        torch.maximum(
+            (lower - coefficients).clamp_min(0.0),
+            (coefficients - upper).clamp_min(0.0),
+        ).amax(dim=-1)
+        / box_width
+    )
     gradient_scale = torch.maximum(
         bs.abs().amax(dim=-1),
         torch.diagonal(gs, dim1=-2, dim2=-1).sum(dim=-1),
@@ -147,10 +160,13 @@ def _kkt_residuals(
 
     lower_multiplier = gradient.clamp_min(0.0)
     upper_multiplier = (-gradient).clamp_min(0.0)
-    complementarity = torch.maximum(
-        ((coefficients - lower).clamp_min(0.0) * lower_multiplier).amax(dim=-1),
-        ((upper - coefficients).clamp_min(0.0) * upper_multiplier).amax(dim=-1),
-    ) / gradient_scale
+    complementarity = (
+        torch.maximum(
+            ((coefficients - lower).clamp_min(0.0) * lower_multiplier).amax(dim=-1),
+            ((upper - coefficients).clamp_min(0.0) * upper_multiplier).amax(dim=-1),
+        )
+        / gradient_scale
+    )
     # Keeping this value materialized prevents an accidental change of the
     # certificate from treating a point in the box interior as a bound point.
     del interior
@@ -180,9 +196,12 @@ def _canonical_rank_deficient_solution(
         coefficients[state > 0] = upper
         if bool(free.any()):
             rhs = bs[free] - gs[free][:, fixed] @ coefficients[fixed]
-            coefficients[free] = torch.linalg.pinv(
-                gs[free][:, free], hermitian=True, rtol=settings.pseudoinverse_rtol
-            ) @ rhs
+            coefficients[free] = (
+                torch.linalg.pinv(
+                    gs[free][:, free], hermitian=True, rtol=settings.pseudoinverse_rtol
+                )
+                @ rhs
+            )
         _, primal, stationarity, complementarity = _kkt_residuals(
             gs.unsqueeze(0),
             bs.unsqueeze(0),
@@ -228,6 +247,8 @@ def solve_box_qp(
     upper: float,
     objective_scale: Tensor,
     settings: BoxQPSettings,
+    *,
+    allow_full_reference: bool = False,
 ) -> BoxQPSolution:
     """Solve ``min a'Ga - 2b'a`` over a finite box with deterministic updates.
 
@@ -237,7 +258,14 @@ def solve_box_qp(
     An iteration cap leaves the result explicitly uncertified.
     """
 
-    _validate_inputs(gs, bs, objective_scale, lower, upper)
+    _validate_inputs(
+        gs,
+        bs,
+        objective_scale,
+        lower,
+        upper,
+        allow_full_reference=allow_full_reference,
+    )
     leading_shape = bs.shape[:-1]
     k = bs.shape[-1]
     flat_gs = gs.reshape(-1, k, k)
@@ -255,9 +283,7 @@ def solve_box_qp(
         lower, upper
     )
     iterations = torch.zeros(systems, dtype=torch.int64, device=bs.device)
-    face_enumeration_count = torch.zeros(
-        systems, dtype=torch.int64, device=bs.device
-    )
+    face_enumeration_count = torch.zeros(systems, dtype=torch.int64, device=bs.device)
     unresolved = torch.ones(systems, dtype=torch.bool, device=bs.device)
 
     identity = torch.eye(k, dtype=dtype, device=bs.device).expand(systems, -1, -1)
@@ -269,16 +295,24 @@ def solve_box_qp(
         fixed_coefficients = torch.where(
             state < 0,
             torch.full_like(coefficients, lower),
-            torch.where(state > 0, torch.full_like(coefficients, upper), torch.zeros_like(coefficients)),
+            torch.where(
+                state > 0,
+                torch.full_like(coefficients, upper),
+                torch.zeros_like(coefficients),
+            ),
         )
         free_outer = free[..., :, None] & free[..., None, :]
-        system = torch.where(free_outer, flat_gs, identity * (~free).to(dtype)[..., None])
+        system = torch.where(
+            free_outer, flat_gs, identity * (~free).to(dtype)[..., None]
+        )
         rhs = (flat_bs - (flat_gs @ fixed_coefficients[..., None]).squeeze(-1)) * free
         free_solution = (
             torch.linalg.pinv(system, hermitian=True, rtol=settings.pseudoinverse_rtol)
             @ rhs[..., None]
         ).squeeze(-1)
-        candidate = fixed_coefficients + torch.where(free, free_solution, torch.zeros_like(free_solution))
+        candidate = fixed_coefficients + torch.where(
+            free, free_solution, torch.zeros_like(free_solution)
+        )
         coefficients = torch.where(unresolved[:, None], candidate, coefficients)
 
         gradient, primal, stationarity, complementarity = _kkt_residuals(
@@ -310,7 +344,9 @@ def solve_box_qp(
             torch.full_like(clamp_index[has_violation], 1, dtype=torch.int8),
         )
 
-        wrong_lower = (state < 0) & (gradient < -settings.kkt_tolerance * scale[:, None])
+        wrong_lower = (state < 0) & (
+            gradient < -settings.kkt_tolerance * scale[:, None]
+        )
         wrong_upper = (state > 0) & (gradient > settings.kkt_tolerance * scale[:, None])
         release = (wrong_lower | wrong_upper) & ~has_violation[:, None]
         has_release = release.any(dim=-1) & unresolved
@@ -337,7 +373,15 @@ def solve_box_qp(
         eigenvalues[..., 0].abs()
         <= settings.pseudoinverse_rtol * largest_eigenvalue.clamp_min(1.0)
     )
-    for system_index in torch.nonzero(certified & rank_deficient, as_tuple=False).flatten().tolist():
+    canonicalize_rank_deficient = certified & rank_deficient
+    if allow_full_reference and k == 8:
+        # The all-expert reference is diagnostic-only.  Its active-set solution
+        # is already KKT-certified; avoid the 3**8 tie-face search reserved for
+        # deployable K=4/6 candidates.
+        canonicalize_rank_deficient = torch.zeros_like(canonicalize_rank_deficient)
+    for system_index in (
+        torch.nonzero(canonicalize_rank_deficient, as_tuple=False).flatten().tolist()
+    ):
         face_enumeration_count[system_index] = 3**k
         canonical = _canonical_rank_deficient_solution(
             flat_gs[system_index],
@@ -358,9 +402,9 @@ def solve_box_qp(
             _,
         ) = canonical
     iterations[unresolved] = settings.max_iterations
-    objective = torch.einsum("bi,bij,bj->b", coefficients, flat_gs, coefficients) - 2.0 * (
-        flat_bs * coefficients
-    ).sum(dim=-1)
+    objective = torch.einsum(
+        "bi,bij,bj->b", coefficients, flat_gs, coefficients
+    ) - 2.0 * (flat_bs * coefficients).sum(dim=-1)
     return BoxQPSolution(
         coefficients=coefficients.reshape(*leading_shape, k),
         objective=objective.reshape(*leading_shape),

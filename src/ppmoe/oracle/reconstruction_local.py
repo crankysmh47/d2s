@@ -100,7 +100,7 @@ class ReconstructionLocalResult:
     layer_metrics: Mapping[tuple[int, int, str], ConditionMetrics]
     selection_counts: Mapping[tuple[int, int, str], tuple[int, ...]]
     co_selection: Mapping[tuple[int, int, str], tuple[tuple[int, ...], ...]]
-    solver_diagnostics: Mapping[tuple[int, str], Mapping[str, float | int]]
+    solver_diagnostics: Mapping[tuple[int, str], Mapping[str, object]]
     reference_distances: Mapping[tuple[int, str, str], ReferenceDistance]
     coefficient_quantiles: Mapping[tuple[int, str], Mapping[str, float]]
     completed_batches: int
@@ -196,11 +196,14 @@ class ReconstructionLocalAccumulator:
             for layer in range(num_layers)
             for key in self._condition_keys
         }
-        self._solver = {key: {} for key in self._condition_keys}
+        self._solver: dict[tuple[int, str], dict[str, object]] = {
+            key: {} for key in self._condition_keys
+        }
         self._references: dict[tuple[int, str, str], list[float | int]] = {}
         self._pending_coefficients: dict[tuple[int, str], list[float]] = {
             key: [] for key in self._condition_keys
         }
+        self._transaction_snapshot: tuple[object, ...] | None = None
         self._load()
 
     @property
@@ -308,6 +311,8 @@ class ReconstructionLocalAccumulator:
                 self._solver,
                 self._references,
                 self._pending_coefficients,
+                self.completed_batches,
+                self.failures,
             )
         )
 
@@ -320,7 +325,10 @@ class ReconstructionLocalAccumulator:
             self._solver,
             self._references,
             self._pending_coefficients,
+            self.completed_batches,
+            self.failures,
         ) = snapshot
+        self._transaction_snapshot = None
 
     @staticmethod
     def _add_metric(
@@ -357,6 +365,88 @@ class ReconstructionLocalAccumulator:
         values[3] += float((left64 * right64).sum().item())
         values[4] += int(left.shape[0])
 
+    def _accumulate_tensor_diagnostic(
+        self, key: tuple[int, str], name: str, value: Tensor
+    ) -> None:
+        diagnostics = self._solver[key]
+        if name == "pseudoinverse_effective_rank":
+            counts = diagnostics.setdefault("pseudoinverse_effective_rank_counts", {})
+            assert isinstance(counts, dict)
+            ranks = value.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
+            for rank in ranks.tolist():
+                label = str(int(rank))
+                counts[label] = int(counts.get(label, 0)) + 1
+            return
+        summaries = diagnostics.setdefault("tensor_diagnostics", {})
+        assert isinstance(summaries, dict)
+        summary = summaries.setdefault(
+            name,
+            {
+                "element_count": 0,
+                "finite_count": 0,
+                "sum": 0.0,
+                "min": None,
+                "max": None,
+            },
+        )
+        assert isinstance(summary, dict)
+        values = value.detach().double().reshape(-1)
+        finite = values[torch.isfinite(values)]
+        summary["element_count"] = int(summary["element_count"]) + int(values.numel())
+        summary["finite_count"] = int(summary["finite_count"]) + int(finite.numel())
+        if finite.numel():
+            minimum = float(finite.min().item())
+            maximum = float(finite.max().item())
+            summary["sum"] = float(summary["sum"]) + float(finite.sum().item())
+            summary["min"] = (
+                minimum
+                if summary["min"] is None
+                else min(float(summary["min"]), minimum)
+            )
+            summary["max"] = (
+                maximum
+                if summary["max"] is None
+                else max(float(summary["max"]), maximum)
+            )
+
+    def _accumulate_solver_diagnostics(
+        self, key: tuple[int, str], result: object
+    ) -> None:
+        if result.effective_rank is not None:
+            self._accumulate_tensor_diagnostic(
+                key, "effective_rank", result.effective_rank
+            )
+        diagnostics = self._solver[key]
+        source_counts = diagnostics.setdefault("solver_source_counts", {})
+        assert isinstance(source_counts, dict)
+        for source in result.solver_source:
+            source_counts[source] = int(source_counts.get(source, 0)) + 1
+        for name, value in result.diagnostics.items():
+            if isinstance(value, Tensor):
+                self._accumulate_tensor_diagnostic(key, name, value)
+            elif isinstance(value, (tuple, list)):
+                sequences = diagnostics.setdefault("sequence_diagnostics", {})
+                assert isinstance(sequences, dict)
+                serialized = list(value)
+                previous = sequences.setdefault(name, serialized)
+                if previous != serialized:
+                    raise RuntimeError(
+                        f"solver diagnostic sequence {name} changed within a run"
+                    )
+            elif isinstance(value, (int, float)) and isfinite(float(value)):
+                if name.startswith("max_"):
+                    diagnostics[name] = max(
+                        float(diagnostics.get(name, value)), float(value)
+                    )
+                elif name == "tau_g":
+                    previous = diagnostics.setdefault(name, value)
+                    if previous != value:
+                        raise RuntimeError(
+                            f"solver diagnostic {name} changed within a run"
+                        )
+                else:
+                    diagnostics[name] = float(diagnostics.get(name, 0)) + float(value)
+
     def update_layer(self, layer: int, d0: Tensor, expert_outputs: Tensor) -> None:
         if not 0 <= layer < self.num_layers or d0.ndim != 2 or expert_outputs.ndim != 3:
             raise ValueError("invalid reconstruction local layer tensors")
@@ -368,6 +458,8 @@ class ReconstructionLocalAccumulator:
             raise ValueError("reconstruction local inputs must be finite")
         if d0.shape[0] == 0:
             return
+        if self._transaction_snapshot is None:
+            self._transaction_snapshot = self.snapshot()
         target_norm = float(d0.detach().double().square().sum().item())
         e8 = expert_outputs.sum(dim=1)
         self._add_reference(layer, "D0", d0, "E8", e8)
@@ -413,20 +505,25 @@ class ReconstructionLocalAccumulator:
                         self._co_selection[metric_key][first][second] += int(
                             co_selection[first][second]
                         )
-                for name, value in result.diagnostics.items():
-                    if isinstance(value, (int, float)) and isfinite(float(value)):
-                        self._solver[key][name] = self._solver[key].get(name, 0) + value
-                if k == self.num_experts:
-                    selected_experts = expert_outputs[
-                        torch.arange(d0.shape[0], device=d0.device)[:, None],
-                        result.subsets,
-                    ].to(result.coefficients.dtype)
-                    reconstruction = torch.einsum(
-                        "tk,tkh->th", result.coefficients, selected_experts
-                    )
-                    r8_name = f"R8[{condition_id(condition)}]"
-                    self._add_reference(layer, "D0", d0, r8_name, reconstruction)
-                    self._add_reference(layer, "E8", e8, r8_name, reconstruction)
+                self._accumulate_solver_diagnostics(key, result)
+                r8_result = score_reconstruction(
+                    d0.double(),
+                    expert_outputs.double(),
+                    self.num_experts,
+                    condition,
+                    self.solver_settings,
+                    allow_full_reference=True,
+                )
+                selected_experts = expert_outputs.double()[
+                    torch.arange(d0.shape[0], device=d0.device)[:, None],
+                    r8_result.subsets,
+                ].to(r8_result.coefficients.dtype)
+                reconstruction = torch.einsum(
+                    "tk,tkh->th", r8_result.coefficients, selected_experts
+                )
+                r8_name = f"R8[{condition_id(condition)}]"
+                self._add_reference(layer, "D0", d0, r8_name, reconstruction)
+                self._add_reference(layer, "E8", e8, r8_name, reconstruction)
 
     def _chunk_path(self, key: tuple[int, str], batch_index: int) -> Path:
         assert self.checkpoint_dir is not None
@@ -444,23 +541,41 @@ class ReconstructionLocalAccumulator:
     def mark_batch_completed(self, batch_index: int) -> None:
         if batch_index in self.completed_batches or batch_index in self.failures:
             raise ValueError("batch is already terminal")
+        transaction = self._transaction_snapshot or self.snapshot()
+        chunk_paths = (
+            [self._chunk_path(key, batch_index) for key in self._condition_keys]
+            if self.checkpoint_dir
+            else []
+        )
         # Chunks are atomically written first.  An interrupted checkpoint leaves only
         # ignored orphan chunks because the completed-batch state remains unchanged.
-        if self.checkpoint_dir:
-            for key in self._condition_keys:
-                atomic_write_json(
-                    self._chunk_path(key, batch_index),
-                    {"coefficients": sorted(self._pending_coefficients[key])},
-                )
-        self._pending_coefficients = {key: [] for key in self._condition_keys}
-        self.completed_batches.add(batch_index)
-        self._persist()
+        try:
+            if self.checkpoint_dir:
+                for key, path in zip(self._condition_keys, chunk_paths, strict=True):
+                    atomic_write_json(
+                        path,
+                        {"coefficients": sorted(self._pending_coefficients[key])},
+                    )
+            self._pending_coefficients = {key: [] for key in self._condition_keys}
+            self.completed_batches.add(batch_index)
+            self._persist()
+        except Exception:
+            self.restore(transaction)
+            for path in chunk_paths:
+                path.unlink(missing_ok=True)
+            raise
+        self._transaction_snapshot = None
 
     def record_failure(self, batch_index: int, message: str) -> None:
         if batch_index in self.completed_batches:
             raise ValueError("completed batch cannot become failed")
-        self.failures[batch_index] = message
-        self._persist()
+        snapshot = self.snapshot()
+        try:
+            self.failures[batch_index] = message
+            self._persist()
+        except Exception:
+            self.restore(snapshot)
+            raise
 
     def _quantiles(self, key: tuple[int, str]) -> Mapping[str, float]:
         if not self.checkpoint_dir or not self.completed_batches:
@@ -630,6 +745,9 @@ def run_reconstruction_local(
                         experts.reshape(-1, 8, experts.shape[-1])[valid],
                     )
             accumulator.mark_batch_completed(batch.index)
+        except OSError:
+            accumulator.restore(snapshot)
+            raise
         except Exception as error:
             accumulator.restore(snapshot)
             accumulator.record_failure(batch.index, f"{type(error).__name__}: {error}")

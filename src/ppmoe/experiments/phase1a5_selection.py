@@ -7,12 +7,13 @@ from datetime import datetime, timezone
 from hashlib import sha256
 import json
 from math import isfinite
+import os
 from pathlib import Path
+import tempfile
 from typing import Mapping
 
 from ppmoe.experiments.phase1a5_config import Phase1A5Config
 from ppmoe.oracle.reconstruction_local import ReconstructionLocalResult
-from ppmoe.provenance import atomic_write_json
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +21,7 @@ class SelectionManifest:
     practical_conditions: Mapping[int, str]
     free_bound_conditions: Mapping[int, str]
     rejected: Mapping[tuple[int, str], str]
+    non_selected: Mapping[tuple[int, str], str]
     diagnostics: Mapping[tuple[int, str], str]
     source_hashes: Mapping[str, str]
     local_hashes: Mapping[str, str]
@@ -37,6 +39,10 @@ def _payload(manifest: SelectionManifest) -> dict[str, object]:
         "rejected": {
             f"{k}|{condition}": value
             for (k, condition), value in manifest.rejected.items()
+        },
+        "non_selected": {
+            f"{k}|{condition}": value
+            for (k, condition), value in manifest.non_selected.items()
         },
         "diagnostics": {
             f"{k}|{condition}": value
@@ -59,11 +65,52 @@ def _from_payload(payload: Mapping[str, object]) -> SelectionManifest:
         {int(k): str(v) for k, v in dict(payload["practical_conditions"]).items()},
         {int(k): str(v) for k, v in dict(payload["free_bound_conditions"]).items()},
         split(payload["rejected"]),
+        split(payload["non_selected"]),
         split(payload["diagnostics"]),
         {str(k): str(v) for k, v in dict(payload["source_hashes"]).items()},
         {str(k): str(v) for k, v in dict(payload["local_hashes"]).items()},
         str(payload["selection_frozen_at"]),
     )
+
+
+def _freeze_manifest(
+    output_path: Path, payload: Mapping[str, object]
+) -> Mapping[str, object]:
+    encoded = (
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        + "\n"
+    ).encode("utf-8")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, output_path)
+        except FileExistsError:
+            existing = json.loads(output_path.read_text(encoding="utf-8"))
+            proposed = dict(payload)
+            proposed.pop("selection_frozen_at", None)
+            comparison = dict(existing)
+            comparison.pop("selection_frozen_at", None)
+            if comparison != proposed:
+                raise ValueError(
+                    "selection manifest is immutable and differs from existing content"
+                )
+            return existing
+        return payload
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def select_calibration_conditions(
@@ -77,6 +124,7 @@ def select_calibration_conditions(
     practical: dict[int, str] = {}
     free_bound: dict[int, str] = {}
     rejected: dict[tuple[int, str], str] = {}
+    non_selected: dict[tuple[int, str], str] = {}
     diagnostics: dict[tuple[int, str], str] = {}
     for k in config.k_values:
         unit = result.metrics.get((k, "unit"))
@@ -132,7 +180,13 @@ def select_calibration_conditions(
                     -rho,
                 )
 
-            practical[k] = min(candidates, key=ordering)[1]
+            _, winner = min(candidates, key=ordering)
+            practical[k] = winner
+            for _, identifier in candidates:
+                if identifier != winner:
+                    non_selected[(k, identifier)] = (
+                        f"eligible practical candidate lost to {winner} by registered ordering"
+                    )
     metric_payload = {
         f"{k}|{identifier}": asdict(metric)
         for (k, identifier), metric in sorted(result.metrics.items())
@@ -146,24 +200,12 @@ def select_calibration_conditions(
         practical,
         free_bound,
         rejected,
+        non_selected,
         diagnostics,
         dict(result.source_hashes),
         {"run_signature": result.run_signature, "metrics_sha256": metrics_sha256},
         datetime.now(timezone.utc).isoformat(),
     )
     proposed = _payload(manifest)
-    if output_path.exists():
-        existing = json.loads(output_path.read_text(encoding="utf-8"))
-        # The timestamp is part of the frozen content but repeated identical selection
-        # returns the prior immutable manifest rather than attempting an overwrite.
-        comparison = dict(proposed)
-        comparison.pop("selection_frozen_at")
-        existing_comparison = dict(existing)
-        existing_comparison.pop("selection_frozen_at", None)
-        if existing_comparison != comparison:
-            raise ValueError(
-                "selection manifest is immutable and differs from existing content"
-            )
-        return _from_payload(existing)
-    atomic_write_json(output_path, proposed)
-    return manifest
+    frozen = _freeze_manifest(output_path, proposed)
+    return manifest if frozen is proposed else _from_payload(frozen)

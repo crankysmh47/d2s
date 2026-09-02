@@ -1,4 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -96,6 +98,10 @@ def test_selection_picks_ridge_then_ties_by_deviation_and_stronger_rho(
         result, CONFIG, tmp_path / "selection-manifest.json"
     )
     assert manifest.practical_conditions[4] == condition_id(stronger)
+    assert (
+        "eligible practical candidate lost"
+        in manifest.non_selected[(4, condition_id(weaker))]
+    )
 
 
 def test_bounded_is_eligible_by_construction_and_free_bound_advances_alone(
@@ -108,7 +114,7 @@ def test_bounded_is_eligible_by_construction_and_free_bound_advances_alone(
         {
             (4, condition_id(unit)): metric(100),
             (4, condition_id(bounded)): metric(
-                60, negative=50, above_two=0, lower=30, upper=20
+                60, negative=0, above_two=0, lower=30, upper=20
             ),
             (6, condition_id(unit)): metric(100),
             (6, condition_id(free)): metric(60, negative=99, above_two=99),
@@ -120,6 +126,7 @@ def test_bounded_is_eligible_by_construction_and_free_bound_advances_alone(
     assert manifest.practical_conditions[4] == condition_id(bounded)
     assert manifest.free_bound_conditions[6] == condition_id(free)
     assert "bounded saturation" in manifest.diagnostics[(4, condition_id(bounded))]
+    assert result.metrics[(4, condition_id(bounded))].negative_rate == 0.0
 
 
 def test_selection_is_immutable_and_refuses_evaluation_artifacts(
@@ -150,3 +157,49 @@ def test_selection_is_immutable_and_refuses_evaluation_artifacts(
     )
     with pytest.raises(ValueError, match="immutable"):
         select_calibration_conditions(changed, CONFIG, path)
+
+
+def test_concurrent_different_selection_cannot_overwrite_frozen_manifest(
+    tmp_path: Path,
+) -> None:
+    unit = ReconstructionCondition("unit")
+    ridge = ReconstructionCondition("ridge", rho=0.1)
+    bounded = ReconstructionCondition("bounded")
+    first = result_for(
+        {
+            (4, condition_id(unit)): metric(100),
+            (4, condition_id(ridge)): metric(60),
+            (6, condition_id(unit)): metric(100),
+        }
+    )
+    second = result_for(
+        {
+            (4, condition_id(unit)): metric(100),
+            (4, condition_id(bounded)): metric(60),
+            (6, condition_id(unit)): metric(100),
+        }
+    )
+    path = tmp_path / "selection-manifest.json"
+    barrier = threading.Barrier(2)
+
+    def writer(result: ReconstructionLocalResult) -> object:
+        barrier.wait(timeout=5)
+        return select_calibration_conditions(result, CONFIG, path)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(writer, result) for result in (first, second)]
+        outcomes = []
+        for future in futures:
+            try:
+                outcomes.append(future.result())
+            except ValueError:
+                outcomes.append(None)
+
+    assert sum(outcome is not None for outcome in outcomes) == 1
+    frozen = select_calibration_conditions(
+        first if outcomes[0] is not None else second, CONFIG, path
+    )
+    assert frozen.practical_conditions[4] in {
+        condition_id(ridge),
+        condition_id(bounded),
+    }
