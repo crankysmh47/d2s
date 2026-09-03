@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from math import ceil, isfinite
 from pathlib import Path
@@ -96,6 +96,16 @@ class ReferenceDistance:
 
 
 @dataclass(frozen=True, slots=True)
+class SubsetJaccard:
+    jaccard_sum: float
+    token_count: int
+
+    @property
+    def mean_jaccard(self) -> float:
+        return self.jaccard_sum / self.token_count if self.token_count else float("nan")
+
+
+@dataclass(frozen=True, slots=True)
 class ReconstructionLocalResult:
     metrics: Mapping[tuple[int, str], ConditionMetrics]
     layer_metrics: Mapping[tuple[int, int, str], ConditionMetrics]
@@ -110,6 +120,9 @@ class ReconstructionLocalResult:
     complete: bool
     run_signature: str
     source_hashes: Mapping[str, str]
+    subset_stability: Mapping[tuple[int, str, str], SubsetJaccard] = field(
+        default_factory=dict
+    )
 
     def relative_improvement(self, k: int, identifier: str) -> float | None:
         """Return pooled SSE improvement over unit; this is never an eligibility rule."""
@@ -203,6 +216,12 @@ class ReconstructionLocalAccumulator:
         }
         self._references: dict[tuple[int, str, str], list[float | int]] = {}
         self._reference_solver: dict[tuple[int, str], dict[str, object]] = {}
+        self._subset_stability = {
+            (k, left, right): [0.0, 0]
+            for k, values in self.conditions.items()
+            for index, left in enumerate(sorted(condition_id(value) for value in values))
+            for right in sorted(condition_id(value) for value in values)[index + 1 :]
+        }
         self._pending_coefficients: dict[tuple[int, str], list[float]] = {
             key: [] for key in self._condition_keys
         }
@@ -270,6 +289,10 @@ class ReconstructionLocalAccumulator:
                 for key, value in state.get("reference_solver", {}).items()
             )
         }
+        for key in self._subset_stability:
+            self._subset_stability[key] = list(
+                state.get("subset_stability", {})["|".join(map(str, key))]
+            )
 
     def _persist(self) -> None:
         path = self._state_path
@@ -312,6 +335,10 @@ class ReconstructionLocalAccumulator:
                     "|".join(map(str, key)): value
                     for key, value in self._reference_solver.items()
                 },
+                "subset_stability": {
+                    "|".join(map(str, key)): value
+                    for key, value in self._subset_stability.items()
+                },
             },
         )
 
@@ -325,6 +352,7 @@ class ReconstructionLocalAccumulator:
                 self._solver,
                 self._references,
                 self._reference_solver,
+                self._subset_stability,
                 self._pending_coefficients,
                 self.completed_batches,
                 self.failures,
@@ -340,6 +368,7 @@ class ReconstructionLocalAccumulator:
             self._solver,
             self._references,
             self._reference_solver,
+            self._subset_stability,
             self._pending_coefficients,
             self.completed_batches,
             self.failures,
@@ -506,6 +535,7 @@ class ReconstructionLocalAccumulator:
                 self._reference_solver.setdefault((layer, r8_name), {}), r8_result
             )
         for k, candidates in self.conditions.items():
+            subsets_by_condition: dict[str, Tensor] = {}
             for condition in candidates:
                 key = (k, condition_id(condition))
                 result = score_reconstruction(
@@ -548,6 +578,16 @@ class ReconstructionLocalAccumulator:
                             co_selection[first][second]
                         )
                 self._accumulate_solver_diagnostics(key, result)
+                subsets_by_condition[condition_id(condition)] = result.subsets.detach()
+            identifiers = sorted(subsets_by_condition)
+            for index, left_name in enumerate(identifiers):
+                for right_name in identifiers[index + 1 :]:
+                    left, right = subsets_by_condition[left_name], subsets_by_condition[right_name]
+                    intersection = (left[:, :, None] == right[:, None, :]).any(dim=2).sum(dim=1)
+                    union = 2 * k - intersection
+                    values = self._subset_stability[(k, left_name, right_name)]
+                    values[0] += float((intersection.to(torch.float64) / union).sum().item())
+                    values[1] += int(left.shape[0])
 
     def _chunk_path(self, key: tuple[int, str], batch_index: int) -> Path:
         assert self.checkpoint_dir is not None
@@ -688,6 +728,10 @@ class ReconstructionLocalAccumulator:
             complete=bool(self.completed_batches) and not self.failures,
             run_signature=self.run_signature,
             source_hashes=dict(self.source_hashes),
+            subset_stability={
+                key: SubsetJaccard(float(value[0]), int(value[1]))
+                for key, value in self._subset_stability.items()
+            },
         )
 
 

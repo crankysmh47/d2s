@@ -803,6 +803,11 @@ def _smoke_stage(
             "r8_fallback_face_enumeration_count": r8_fallback_faces,
             "completed_batches": result.completed_batches,
             "kkt_by_k": kkt_by_k,
+            **(
+                {"bounded_stop_reason": "engineering_infeasible_under_v0_5"}
+                if family == "bounded" and not benchmark.feasible
+                else {}
+            ),
             "result": _json_safe(result),
             }
         return _write_stage(

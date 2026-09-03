@@ -310,6 +310,37 @@ def test_coefficient_chunks_are_sorted_and_deterministic(tmp_path: Path) -> None
     )
 
 
+def test_cross_condition_subset_jaccard_is_known_and_resumable(tmp_path: Path) -> None:
+    unit = ReconstructionCondition("unit")
+    ridge = ReconstructionCondition("ridge", rho=0.1)
+    accumulator = ReconstructionLocalAccumulator(
+        num_layers=1,
+        num_experts=8,
+        conditions={4: (unit, ridge)},
+        checkpoint_dir=tmp_path,
+        run_signature="jaccard",
+    )
+    target = torch.tensor([[1.0], [0.0]])
+    experts = torch.zeros(2, 8, 1)
+    experts[:, 0, 0] = 1.0
+    accumulator.update_layer(0, target, experts)
+    accumulator.mark_batch_completed(0)
+
+    key = (4, "ridge:0.1", "unit")
+    first = accumulator.finalize().subset_stability[key]
+    resumed = ReconstructionLocalAccumulator(
+        num_layers=1,
+        num_experts=8,
+        conditions={4: (unit, ridge)},
+        checkpoint_dir=tmp_path,
+        run_signature="jaccard",
+    ).finalize().subset_stability[key]
+
+    assert first.token_count == 2
+    assert first.mean_jaccard == pytest.approx(1.0)
+    assert resumed == first
+
+
 def test_pooled_improvement_and_gain_recovery_are_analysis_only(tmp_path: Path) -> None:
     unit = ReconstructionCondition("unit")
     ridge = ReconstructionCondition("ridge", rho=0.1)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from itertools import combinations
 from pathlib import Path
 
 import pytest
@@ -73,7 +74,11 @@ def _local_result() -> dict[str, object]:
             str((0, "D0", "E8")): {"squared_error_sum": 1.0, "left_squared_norm_sum": 2.0, "right_squared_norm_sum": 2.0, "dot_sum": 1.0, "token_count": 100_000},
             str((0, "D0", "R8[free_bound]")): {"squared_error_sum": 1.0, "left_squared_norm_sum": 2.0, "right_squared_norm_sum": 2.0, "dot_sum": 1.0, "token_count": 100_000},
         },
-        "subset_stability": {str((4, "unit", "free_bound")): {"jaccard": 0.5}},
+        "subset_stability": {
+            str((k, left, right)): {"jaccard_sum": 50.0, "token_count": 100}
+            for k in (4, 6)
+            for left, right in combinations(sorted(("unit", "free_bound", "ridge:10", "ridge:1", "ridge:0.1", "ridge:0.01", "ridge:0.001", "bounded")), 2)
+        },
         "reference_diagnostics": {},
         "coefficient_quantiles": {str((k, condition)): {"p99_abs": 1.0} for k in (4, 6) for condition in ("unit", "free_bound", "ridge:10", "ridge:1", "ridge:0.1", "ridge:0.01", "ridge:0.001", "bounded")},
         "completed_batches": 4,
@@ -106,11 +111,20 @@ def _rollout_result() -> dict[str, object]:
 
 
 def _write_complete_artifacts(root: Path) -> None:
-    source_hashes = {"stage:local": "a" * 64}
+    from ppmoe.provenance import sha256_file
+
+    source_root = root / "phase1-source"
+    _write_json(source_root / "stages" / "m0.json", {
+        "results": {
+            "wikitext": {"teacher": {"ppl": 2.0}},
+            "fineweb_heldout": {"teacher": {"ppl": 2.5}},
+        }
+    })
+    source_hashes = {"stage:local": "a" * 64, "stage:m0": sha256_file(source_root / "stages" / "m0.json")}
     _write_json(root / "config.json", {"name": CONFIG.name})
     _write_json(
         root / "stages" / "source.json",
-        _stage("source", source_hashes=source_hashes, source_manifest={"solver_version": CONFIG.solver_version}),
+        _stage("source", source_hashes=source_hashes, source_manifest={"solver_version": CONFIG.solver_version, "source_root": str(source_root)}),
     )
     _write_json(
         root / "stages" / "smoke.json",
@@ -156,8 +170,6 @@ def _write_complete_artifacts(root: Path) -> None:
         "local_hashes": {"run_signature": "local-signature"},
     }
     _write_json(root / "selection-manifest.json", selection)
-    from ppmoe.provenance import sha256_file
-
     _write_json(
         root / "stages" / "select.json",
         _stage(

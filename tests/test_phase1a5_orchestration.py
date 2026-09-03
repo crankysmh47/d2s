@@ -420,7 +420,7 @@ def test_report_requires_terminal_predecessors_and_allows_selection_stop(
 
     stopped = replace(dependencies, selection_runner=stopped_selection_runner)
     run_phase1a5(config, "select", False, tmp_path, 100, dependencies=stopped)
-    with pytest.raises(StageError, match="missing local condition"):
+    with pytest.raises(StageError, match="pinned M0 dense baseline hash drift"):
         run_phase1a5(config, "report", False, tmp_path, 100, dependencies=stopped)
 
 

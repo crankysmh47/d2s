@@ -192,6 +192,25 @@ def _decision(selection: Mapping[str, Any]) -> str:
     return "Practical ridge qualifies under the registered local protocol."
 
 
+def _dense_ppl_from_pinned_m0(source: Mapping[str, Any], source_hashes: Mapping[str, str]) -> dict[str, float]:
+    root = source.get("source_root")
+    expected = source_hashes.get("stage:m0")
+    if not isinstance(root, str) or not isinstance(expected, str):
+        raise ReportValidationError("pinned M0 dense baseline is missing")
+    path = Path(root) / "stages" / "m0.json"
+    if not path.is_file() or sha256_file(path) != expected:
+        raise ReportValidationError("pinned M0 dense baseline hash drift")
+    results = _read_json(path, "pinned M0 stage").get("results")
+    if not isinstance(results, Mapping):
+        raise ReportValidationError("pinned M0 dense baseline is invalid")
+    dense: dict[str, float] = {}
+    for corpus in ("wikitext", "fineweb_heldout"):
+        entry = results.get(corpus)
+        teacher = entry.get("teacher") if isinstance(entry, Mapping) else None
+        dense[corpus] = _finite(teacher.get("ppl") if isinstance(teacher, Mapping) else None, f"pinned M0 {corpus} PPL", positive=True)
+    return dense
+
+
 def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase1A5ReportManifest:
     """Render only from complete, immutable, provenance-compatible stage evidence."""
     root = Path(artifact_root)
@@ -201,6 +220,10 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
     selection_stopped = select.get("status") == "scientifically_stopped"
     rollout = None if selection_stopped else _stage(root, "rollout")
     source_hashes = _hashes(source.get("source_hashes"), "source hash manifest")
+    source_manifest = source.get("source_manifest")
+    if not isinstance(source_manifest, Mapping):
+        raise ReportValidationError("source manifest is missing")
+    dense_ppl = _dense_ppl_from_pinned_m0(source_manifest, source_hashes)
     stages_to_validate = (("smoke", smoke), ("local", local), ("select", select))
     if rollout is not None:
         stages_to_validate += (("rollout", rollout),)
@@ -231,7 +254,7 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
             raise ReportValidationError("smoke completed batches are invalid")
         if family == "bounded" and evidence.get("all_certified") is not True:
             raise ReportValidationError("bounded KKT evidence is invalid")
-        if family == "bounded":
+        if family == "bounded" and local.get("bounded_included") is True:
             if evidence.get("feasible") is not True:
                 raise ReportValidationError("bounded smoke is not feasible")
             kkt = evidence.get("kkt_by_k")
@@ -245,6 +268,9 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
                     raise ReportValidationError("bounded KKT evidence is malformed")
                 if record["bounded_failure_count"] or record["bounded_uncertified_count"] or record["bounded_coefficient_bound_violation_count"] or record["bounded_solver_candidate_count"] <= 0 or record["bounded_certified_count"] != record["bounded_solver_candidate_count"]:
                     raise ReportValidationError(f"bounded KKT evidence is invalid for K={k}")
+        elif family == "bounded" and evidence.get("feasible") is not True:
+            if not isinstance(evidence.get("bounded_stop_reason"), str) or not evidence["bounded_stop_reason"]:
+                raise ReportValidationError("bounded engineering stop reason is missing")
 
     selection_path = root / "selection-manifest.json"
     expected_selection_hash = select.get("selection_manifest_sha256")
@@ -387,13 +413,31 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
     if not isinstance(stability, Mapping) or not stability:
         raise ReportValidationError("subset stability evidence is absent")
     stability_rows: list[dict[str, object]] = []
+    expected_stability = {
+        (k, left, right)
+        for k in config.k_values
+        for index, left in enumerate(sorted(identifier for candidate_k, identifier in observed if candidate_k == k))
+        for right in sorted(identifier for candidate_k, identifier in observed if candidate_k == k)[index + 1 :]
+    }
+    seen_stability: set[tuple[int, str, str]] = set()
     for key, value in stability.items():
         if not isinstance(value, Mapping):
             raise ReportValidationError("subset stability evidence is malformed")
-        score = _finite(value.get("jaccard"), "subset stability")
+        parsed = _key(key, "subset stability")
+        if len(parsed) != 3 or not isinstance(parsed[0], int) or not isinstance(parsed[1], str) or not isinstance(parsed[2], str):
+            raise ReportValidationError("subset stability evidence is malformed")
+        identity = (parsed[0], parsed[1], parsed[2])
+        if identity in seen_stability:
+            raise ReportValidationError("duplicate subset stability evidence")
+        seen_stability.add(identity)
+        total = _finite(value.get("jaccard_sum"), "subset stability")
+        tokens = _integer(value.get("token_count"), "subset stability token count", positive=True)
+        score = total / tokens
         if score < 0.0 or score > 1.0:
             raise ReportValidationError("subset stability is outside [0,1]")
         stability_rows.append({"key": key, "jaccard": score, **{str(name): item for name, item in value.items()}})
+    if seen_stability != expected_stability:
+        raise ReportValidationError("subset stability pair coverage is incomplete")
     plot_source = root / "plot-source"
     sources = {
         "local-metrics.json": local_rows,
@@ -416,7 +460,10 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
             matching = [{"corpus": None, "ppl": None, "scored_tokens": None}]
         unit_sse = float(by_condition[(int(row["k"]), "unit")]["total_squared_error"])
         for evaluation in matching:
-            primary_rows.append({**row, "local_relative_improvement": (unit_sse - float(row["total_squared_error"])) / unit_sse, "corpus": evaluation["corpus"], "ppl": evaluation["ppl"], "ppl_delta": None, "ppl_ratio": None, "scored_tokens": evaluation["scored_tokens"], "deployment_status": "registered" if str(row["condition"]) in selected[int(row["k"])] else "local-only"})
+            corpus, ppl = evaluation["corpus"], evaluation["ppl"]
+            evaluated = corpus is not None
+            baseline = dense_ppl[str(corpus)] if evaluated else None
+            primary_rows.append({**row, "local_relative_improvement": (unit_sse - float(row["total_squared_error"])) / unit_sse, "corpus": corpus, "ppl": ppl, "ppl_delta": float(ppl) - baseline if evaluated else None, "ppl_ratio": float(ppl) / baseline if evaluated else None, "scored_tokens": evaluation["scored_tokens"], "deployment_status": "evaluated" if evaluated else "not_evaluated"})
     _write_source(plot_source / "primary-table.json", primary_rows)
     _write_csv(plot_source / "primary-table.csv", primary_rows)
     plots = root / "plots"
@@ -428,7 +475,8 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
         ("05-coefficient-distortion-gain.png", "Coefficient distortion versus gain", local_rows, "absolute_deviation_sum", "nmse"),
         ("06-rank-conditioning-gain.png", "Rank and conditioning diagnostics", solver_rows, "effective_rank_sum", "condition_max"),
         ("07-layer-improvements.png", "Layerwise local NMSE", layer_rows, "layer", "nmse"),
-        ("08-subset-stability-distances.png", "Subset stability and reference distances", stability_rows, "jaccard", "jaccard"),
+        ("08-reference-distances.png", "D0/E8/R8 reference distances", reference_rows, "token_count", "squared_error_sum"),
+        ("09-subset-stability.png", "Cross-condition subset Jaccard", stability_rows, "token_count", "jaccard"),
     )
     for name, title, rows, x, y in specs:
         _save_plot(plots / name, title, rows, x, y)
