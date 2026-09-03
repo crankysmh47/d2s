@@ -146,7 +146,11 @@ class _Accumulator:
         self.nll_sum = float(state["nll_sum"])
         self.scored_tokens = int(state["scored_tokens"])
         self.peak_cuda_bytes = int(state["peak_cuda_bytes"])
-        self.source_hashes = {str(key): str(value) for key, value in state.get("source_hashes", {}).items()}
+        checkpoint_source_hashes = {
+            str(key): str(value) for key, value in state.get("source_hashes", {}).items()
+        }
+        if checkpoint_source_hashes != self.source_hashes:
+            raise ValueError("reconstruction rollout checkpoint source hashes do not match inputs")
 
     def _persist(self) -> None:
         atomic_write_json(self._state_path, {
@@ -168,11 +172,12 @@ class _Accumulator:
         })
 
     def _snapshot(self) -> tuple[object, ...]:
-        return deepcopy((self.completed_batches, self.layer_stats, self.selection_counts, self.solver_diagnostics, self.reference_distances, self.coefficient_diagnostics, self.nll_sum, self.scored_tokens, self.peak_cuda_bytes))
+        return deepcopy((self.completed_batches, self.failures, self.layer_stats, self.selection_counts, self.solver_diagnostics, self.reference_distances, self.coefficient_diagnostics, self.nll_sum, self.scored_tokens, self.peak_cuda_bytes))
 
     def _restore(self, snapshot: tuple[object, ...]) -> None:
         (
             self.completed_batches,
+            self.failures,
             self.layer_stats,
             self.selection_counts,
             self.solver_diagnostics,
@@ -184,13 +189,87 @@ class _Accumulator:
         ) = snapshot
 
     @staticmethod
-    def _merge_diagnostics(destination: dict[str, object], source: Mapping[str, object]) -> None:
+    def _accumulate_tensor_diagnostic(
+        diagnostics: dict[str, object], name: str, value: Tensor
+    ) -> None:
+        if name.endswith("pseudoinverse_effective_rank"):
+            counts = diagnostics.setdefault(f"{name}_counts", {})
+            assert isinstance(counts, dict)
+            ranks = value.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
+            for rank in ranks.tolist():
+                label = str(int(rank))
+                counts[label] = int(counts.get(label, 0)) + 1
+            return
+        summaries = diagnostics.setdefault("tensor_diagnostics", {})
+        assert isinstance(summaries, dict)
+        summary = summaries.setdefault(
+            name,
+            {"element_count": 0, "finite_count": 0, "sum": 0.0, "min": None, "max": None},
+        )
+        assert isinstance(summary, dict)
+        values = value.detach().double().reshape(-1)
+        finite = values[torch.isfinite(values)]
+        summary["element_count"] = int(summary["element_count"]) + int(values.numel())
+        summary["finite_count"] = int(summary["finite_count"]) + int(finite.numel())
+        if finite.numel():
+            minimum, maximum = float(finite.min().item()), float(finite.max().item())
+            summary["sum"] = float(summary["sum"]) + float(finite.sum().item())
+            summary["min"] = minimum if summary["min"] is None else min(float(summary["min"]), minimum)
+            summary["max"] = maximum if summary["max"] is None else max(float(summary["max"]), maximum)
+
+    @classmethod
+    def _accumulate_result_diagnostics(
+        cls, destination: dict[str, object], result: ReconstructionResult, *, prefix: str = ""
+    ) -> None:
+        if result.effective_rank is not None:
+            cls._accumulate_tensor_diagnostic(destination, f"{prefix}effective_rank", result.effective_rank)
+        source_counts = destination.setdefault(f"{prefix}solver_source_counts", {})
+        assert isinstance(source_counts, dict)
+        for source in result.solver_source:
+            source_counts[source] = int(source_counts.get(source, 0)) + 1
+        for name, value in result.diagnostics.items():
+            target_name = f"{prefix}{name}"
+            if isinstance(value, Tensor):
+                cls._accumulate_tensor_diagnostic(destination, target_name, value)
+            elif isinstance(value, (tuple, list)):
+                sequences = destination.setdefault("sequence_diagnostics", {})
+                assert isinstance(sequences, dict)
+                serialized = list(value)
+                previous = sequences.setdefault(target_name, serialized)
+                if previous != serialized:
+                    raise RuntimeError(f"solver diagnostic sequence {target_name} changed within a run")
+            elif isinstance(value, (int, float)) and torch.isfinite(torch.tensor(value)):
+                if name.startswith("max_"):
+                    destination[target_name] = max(float(destination.get(target_name, value)), float(value))
+                elif name == "tau_g":
+                    previous = destination.setdefault(target_name, value)
+                    if previous != value:
+                        raise RuntimeError(f"solver diagnostic {target_name} changed within a run")
+                else:
+                    destination[target_name] = float(destination.get(target_name, 0.0)) + float(value)
+
+    @classmethod
+    def _merge_diagnostics(cls, destination: dict[str, object], source: Mapping[str, object]) -> None:
         for name, value in source.items():
-            if isinstance(value, bool):
+            if isinstance(value, Mapping):
+                nested = destination.setdefault(name, {})
+                assert isinstance(nested, dict)
+                cls._merge_diagnostics(nested, value)
+            elif isinstance(value, list):
+                previous = destination.setdefault(name, list(value))
+                if previous != value:
+                    raise RuntimeError(f"solver diagnostic sequence {name} changed across batches")
+            elif name in {"min"}:
+                destination[name] = value if destination.get(name) is None else min(float(destination[name]), float(value))
+            elif name in {"max"} or name.startswith("max_"):
+                destination[name] = max(float(destination.get(name, value)), float(value))
+            elif isinstance(value, bool):
                 destination[name] = int(destination.get(name, 0)) + int(value)
             elif isinstance(value, (int, float)):
-                if name.startswith("max_"):
-                    destination[name] = max(float(destination.get(name, value)), float(value))
+                if name == "tau_g":
+                    previous = destination.setdefault(name, value)
+                    if previous != value:
+                        raise RuntimeError("solver diagnostic tau_g changed across batches")
                 else:
                     destination[name] = float(destination.get(name, 0.0)) + float(value)
 
@@ -200,6 +279,7 @@ class _Accumulator:
         snapshot = self._snapshot()
         try:
             self.completed_batches.add(batch_index)
+            self.failures.pop(batch_index, None)
             self.nll_sum += delta.nll_sum
             self.scored_tokens += delta.scored_tokens
             self.peak_cuda_bytes = max(self.peak_cuda_bytes, peak_cuda_bytes)
@@ -444,8 +524,14 @@ def run_reconstruction_rollout(
                         _reference_delta(delta.reference_distances[layer_index], "D0", correction_valid, "E8", e8_valid)
                         _reference_delta(delta.reference_distances[layer_index], "D0", correction_valid, r8_name, r8_valid)
                         _reference_delta(delta.reference_distances[layer_index], "E8", e8_valid, r8_name, r8_valid)
-                        _Accumulator._merge_diagnostics(delta.solver_diagnostics[layer_index], result.diagnostics)
-                        _Accumulator._merge_diagnostics(delta.solver_diagnostics[layer_index], {f"r8_{name}": value for name, value in r8_result.diagnostics.items()})
+                        _Accumulator._accumulate_result_diagnostics(
+                            delta.solver_diagnostics[layer_index], result
+                        )
+                        _Accumulator._accumulate_result_diagnostics(
+                            delta.solver_diagnostics[layer_index],
+                            r8_result,
+                            prefix="r8_",
+                        )
                         chosen_next = baseline.double() + weighted.double()
                         target_valid, chosen_valid = target_next[valid].double(), chosen_next[valid]
                         if not bool(torch.isfinite(target_valid).all()) or not bool(torch.isfinite(chosen_valid).all()):

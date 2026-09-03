@@ -77,7 +77,8 @@ def test_reconstruction_h_rollout_is_atomic_and_resume_does_not_double_count(
         lambda *_args, **_kwargs: pytest.fail("completed batch was rescored"),
     )
     assert run_reconstruction_rollout(
-        teacher, student, (batch,), condition, 4, tmp_path, "ridge-k4"
+        teacher, student, (batch,), condition, 4, tmp_path, "ridge-k4",
+        source_hashes={"stage:local": "a" * 64},
     ) == first
 
     teacher, student, batch = _models_and_batch()
@@ -98,3 +99,66 @@ def test_reconstruction_h_rollout_is_atomic_and_resume_does_not_double_count(
     assert failed.completed_batches == 0
     assert failed.failed_batches == 1
     assert all(metric.token_count == 0 for metric in failed.layer_metrics.values())
+
+
+def test_reconstruction_h_retry_clears_failure_before_atomically_completing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    teacher, student, batch = _models_and_batch()
+    condition = ReconstructionCondition("free_bound")
+    real_select = reconstruction_rollout.select_reconstruction_h
+    calls = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected retryable failure")
+        return real_select(*args, **kwargs)
+
+    monkeypatch.setattr(reconstruction_rollout, "select_reconstruction_h", fail_once)
+    failed = run_reconstruction_rollout(
+        teacher, student, (batch,), condition, 4, tmp_path, "retry",
+        source_hashes={"stage:local": "a" * 64},
+    )
+    assert failed.complete is False
+    assert failed.failed_batches == 1
+
+    monkeypatch.setattr(reconstruction_rollout, "select_reconstruction_h", real_select)
+    resumed = run_reconstruction_rollout(
+        teacher, student, (batch,), condition, 4, tmp_path, "retry",
+        source_hashes={"stage:local": "a" * 64},
+    )
+    assert resumed.complete is True
+    assert resumed.failed_batches == 0
+    assert resumed.completed_batches == 1
+    assert resumed.scored_tokens == 2
+    assert all(metric.token_count == 3 for metric in resumed.layer_metrics.values())
+
+
+def test_reconstruction_h_persists_free_bound_tensor_diagnostics_and_provenance(
+    tmp_path,
+) -> None:
+    teacher, student, batch = _models_and_batch()
+    condition = ReconstructionCondition("free_bound")
+    source_hashes = {"stage:local": "a" * 64}
+    first = run_reconstruction_rollout(
+        teacher, student, (batch,), condition, 4, tmp_path, "diagnostics",
+        source_hashes=source_hashes,
+    )
+    diagnostics = first.solver_diagnostics[0]
+    assert diagnostics["solver_source_counts"]
+    assert diagnostics["pseudoinverse_effective_rank_counts"]
+    assert diagnostics["sequence_diagnostics"]["candidate_sources"]
+    assert diagnostics["tensor_diagnostics"]["pseudoinverse_coefficients"]["element_count"] > 0
+
+    resumed = run_reconstruction_rollout(
+        teacher, student, (batch,), condition, 4, tmp_path, "diagnostics",
+        source_hashes=source_hashes,
+    )
+    assert resumed.solver_diagnostics == first.solver_diagnostics
+    with pytest.raises(ValueError, match="source hashes"):
+        run_reconstruction_rollout(
+            teacher, student, (), condition, 4, tmp_path, "diagnostics",
+            source_hashes={"stage:local": "b" * 64},
+        )

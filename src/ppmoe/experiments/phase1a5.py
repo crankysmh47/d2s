@@ -246,17 +246,31 @@ def _load_evaluation_tokens(
             raise StageError(f"{corpus} manifest does not match verified source hash")
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            input_path = manifest_path.parent / "input_ids.pt"
+            mask_path = manifest_path.parent / "attention_mask.pt"
+            if (
+                not isinstance(manifest, Mapping)
+                or not isinstance(manifest.get("input_ids_sha256"), str)
+                or not isinstance(manifest.get("attention_mask_sha256"), str)
+            ):
+                raise StageError(f"{corpus} manifest is malformed")
+            if (
+                sha256_file(input_path) != manifest["input_ids_sha256"]
+                or sha256_file(mask_path) != manifest["attention_mask_sha256"]
+            ):
+                raise StageError(f"{corpus} tensor hash does not match manifest")
             input_ids = torch.load(
-                manifest_path.parent / "input_ids.pt", map_location="cpu", weights_only=True
+                input_path, map_location="cpu", weights_only=True
             )
             attention_mask = torch.load(
-                manifest_path.parent / "attention_mask.pt", map_location="cpu", weights_only=True
+                mask_path, map_location="cpu", weights_only=True
             )
+        except StageError:
+            raise
         except (OSError, json.JSONDecodeError, RuntimeError) as error:
             raise StageError(f"unable to load verified {corpus} tensors") from error
         if (
-            not isinstance(manifest, Mapping)
-            or input_ids.ndim != 2
+            input_ids.ndim != 2
             or attention_mask.shape != input_ids.shape
             or int(attention_mask.sum()) <= 0
         ):

@@ -11,6 +11,7 @@ from ppmoe.oracle.reconstruction_local import (
     ConditionMetrics,
     ReconstructionLocalResult,
 )
+from ppmoe.provenance import sha256_file
 
 
 CONFIG_PATH = Path(__file__).parents[1] / "configs" / "phase1-v0_5.toml"
@@ -398,3 +399,39 @@ def test_rollout_uses_only_byte_frozen_registered_conditions_and_corpora(
         for corpus in ("wikitext", "fineweb_heldout")
         for k, condition in ((4, "unit"), (4, "ridge:1"), (4, "free_bound"), (6, "unit"), (6, "bounded"))
     }
+
+
+def _write_evaluation_source(root: Path) -> dict[str, object]:
+    hashes: dict[str, str] = {}
+    for directory in ("wikitext", "fineweb-heldout"):
+        token_dir = root / "tokens" / directory
+        token_dir.mkdir(parents=True)
+        input_ids = token_dir / "input_ids.pt"
+        attention_mask = token_dir / "attention_mask.pt"
+        torch.save(torch.tensor([[1, 2, 3]]), input_ids)
+        torch.save(torch.ones((1, 3), dtype=torch.long), attention_mask)
+        manifest = token_dir / "manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "input_ids_sha256": sha256_file(input_ids),
+                    "attention_mask_sha256": sha256_file(attention_mask),
+                }
+            ),
+            encoding="utf-8",
+        )
+        hashes[directory] = sha256_file(manifest)
+    return {"dataset_manifest_sha256": hashes}
+
+
+@pytest.mark.parametrize("tensor_name", ("input_ids.pt", "attention_mask.pt"))
+def test_evaluation_loader_rejects_mutated_tensor_after_manifest_hash(
+    tmp_path: Path, tensor_name: str
+) -> None:
+    from ppmoe.experiments.phase1a5 import StageError, _load_evaluation_tokens
+
+    source_manifest = _write_evaluation_source(tmp_path)
+    torch.save(torch.tensor([[99, 99, 99]]), tmp_path / "tokens" / "wikitext" / tensor_name)
+
+    with pytest.raises(StageError, match="tensor hash"):
+        _load_evaluation_tokens(tmp_path, source_manifest)
