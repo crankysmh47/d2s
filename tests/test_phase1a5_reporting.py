@@ -69,7 +69,11 @@ def _local_result() -> dict[str, object]:
             str((k, "bounded")): {"bounded_failure_count": 0, "bounded_uncertified_count": 0, "effective_rank_sum": 4, "condition_max": 2.0}
             for k in (4, 6)
         },
-        "reference_distances": {str((0, "D0", "E8")): {"squared_error_sum": 1.0, "left_squared_norm_sum": 2.0, "right_squared_norm_sum": 2.0, "dot_sum": 1.0, "token_count": 100_000}},
+        "reference_distances": {
+            str((0, "D0", "E8")): {"squared_error_sum": 1.0, "left_squared_norm_sum": 2.0, "right_squared_norm_sum": 2.0, "dot_sum": 1.0, "token_count": 100_000},
+            str((0, "D0", "R8[free_bound]")): {"squared_error_sum": 1.0, "left_squared_norm_sum": 2.0, "right_squared_norm_sum": 2.0, "dot_sum": 1.0, "token_count": 100_000},
+        },
+        "subset_stability": {str((4, "unit", "free_bound")): {"jaccard": 0.5}},
         "reference_diagnostics": {},
         "coefficient_quantiles": {str((k, condition)): {"p99_abs": 1.0} for k in (4, 6) for condition in ("unit", "free_bound", "ridge:10", "ridge:1", "ridge:0.1", "ridge:0.01", "ridge:0.001", "bounded")},
         "completed_batches": 4,
@@ -118,7 +122,12 @@ def _write_complete_artifacts(root: Path) -> None:
             unit_regression={"passed": True, "checked_tokens": 2_048},
             families={
                 family: {"failures": 0, "all_certified": True, "feasible": True,
-                         "elapsed_seconds": 1.0, "peak_cuda_bytes": 1}
+                         "elapsed_seconds": 1.0, "peak_cuda_bytes": 1,
+                         "processed_tokens": 2_048, "completed_batches": 1,
+                         "kkt_by_k": {
+                             "4": {"bounded_failure_count": 0, "bounded_uncertified_count": 0, "bounded_certified_count": 1, "bounded_solver_candidate_count": 1, "bounded_coefficient_bound_violation_count": 0},
+                             "6": {"bounded_failure_count": 0, "bounded_uncertified_count": 0, "bounded_certified_count": 1, "bounded_solver_candidate_count": 1, "bounded_coefficient_bound_violation_count": 0},
+                         } if family == "bounded" else {}}
                 for family in ("unit", "ridge", "free_bound", "bounded")
             },
         ),
@@ -189,6 +198,7 @@ def test_report_writes_hashed_authoritative_sources_and_conservative_decision(tm
     assert manifest.output_hashes
     assert all((tmp_path / path).is_file() for path in manifest.output_hashes)
     assert "plot-source/local-metrics.json" in manifest.output_hashes
+    assert "plot-source/primary-table.csv" in manifest.output_hashes
     assert "plots/01-local-nmse-rho.png" in manifest.output_hashes
     report = (tmp_path / "report.md").read_text(encoding="utf-8")
     assert "Registered Free-Reconstruction Candidate Bound" in report
@@ -228,6 +238,37 @@ def test_report_rejects_existing_output_hash_mismatch(tmp_path: Path) -> None:
     victim.write_bytes(b"tampered")
 
     with pytest.raises(ReportValidationError, match="output hash mismatch"):
+        _render(tmp_path)
+
+
+def test_report_refuses_fabricated_subset_stability(tmp_path: Path) -> None:
+    from ppmoe.reporting.phase1a5 import ReportValidationError
+
+    _write_complete_artifacts(tmp_path)
+    _replace(tmp_path / "stages" / "local.json", ("result", "subset_stability"), {})
+
+    with pytest.raises(ReportValidationError, match="subset stability evidence is absent"):
+        _render(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("keys", "value", "message"),
+    [
+        (("families", "unit", "elapsed_seconds"), None, "smoke elapsed"),
+        (("families", "ridge", "peak_cuda_bytes"), -1, "smoke peak"),
+        (("families", "free_bound", "processed_tokens"), 2_047, "smoke processed"),
+        (("families", "bounded", "completed_batches"), 0, "smoke completed"),
+    ],
+)
+def test_report_rejects_incomplete_smoke_family_measurements(
+    tmp_path: Path, keys: tuple[str, ...], value: object, message: str
+) -> None:
+    from ppmoe.reporting.phase1a5 import ReportValidationError
+
+    _write_complete_artifacts(tmp_path)
+    _replace(tmp_path / "stages" / "smoke.json", keys, value)
+
+    with pytest.raises(ReportValidationError, match=message):
         _render(tmp_path)
 
 

@@ -2,6 +2,7 @@ import json
 from dataclasses import dataclass
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -43,7 +44,16 @@ def _result(
         layer_metrics={},
         selection_counts={},
         co_selection={},
-        solver_diagnostics={},
+        solver_diagnostics={
+            (k, "bounded"): {
+                "bounded_failure_count": 0,
+                "bounded_uncertified_count": 0,
+                "bounded_certified_count": 1,
+                "bounded_solver_candidate_count": 1,
+                "bounded_coefficient_bound_violation_count": 0,
+            }
+            for k in (4, 6)
+        },
         reference_distances={},
         reference_diagnostics={},
         coefficient_quantiles={},
@@ -286,6 +296,86 @@ def test_compatible_smoke_evidence_is_immutable_on_resume_and_nonresume(
         run_phase1a5(config, "smoke", False, tmp_path, 100, dependencies=dependencies)
     assert smoke_path.read_bytes() == original_bytes
     assert len(calls) == calls_after_first
+
+
+def test_unit_regression_consumes_captured_inference_tensors_inside_inference_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A trainable linear rejects captured inference tensors outside this scope."""
+    import ppmoe.experiments.phase1a5 as experiment
+
+    class TeacherMLP(torch.nn.Identity):
+        pass
+
+    class Teacher(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mlp = TeacherMLP()
+            self.model = SimpleNamespace(language_model=self._forward)
+
+        def _forward(self, **_kwargs):
+            return self.mlp(torch.ones((1, 1, 4)))
+
+    class StudentMLP(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear = torch.nn.Linear(4, 4)
+
+        def expert_outputs(self, values: torch.Tensor) -> torch.Tensor:
+            return self.linear(values).unsqueeze(-2).expand(-1, -1, 8, -1)
+
+    class Student(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mlp = StudentMLP()
+
+    monkeypatch.setattr(
+        experiment, "iter_text_mlps", lambda model: ((0, model.mlp),)
+    )
+    monkeypatch.setattr(experiment, "PartitionedQwen35MLP", StudentMLP)
+    subsets = torch.zeros((1, 4), dtype=torch.long)
+    monkeypatch.setattr(
+        experiment, "score_reconstruction", lambda *_args, **_kwargs: SimpleNamespace(subsets=subsets)
+    )
+    monkeypatch.setattr(
+        experiment, "exact_gram_oracle", lambda *_args, **_kwargs: SimpleNamespace(subsets=subsets)
+    )
+    batch = SimpleNamespace(
+        input_ids=torch.ones((1, 1), dtype=torch.long),
+        attention_mask=torch.ones((1, 1), dtype=torch.long),
+    )
+
+    result = experiment._default_unit_regression(
+        Teacher(), Student(), (batch,), Phase1A5Config.load(CONFIG_PATH)
+    )
+
+    assert result["checked_tokens"] == 1
+
+
+def test_smoke_failure_is_preserved_without_a_success_stage(tmp_path: Path) -> None:
+    from ppmoe.experiments.phase1a5 import StageError, run_phase1a5
+
+    config = Phase1A5Config.load(CONFIG_PATH)
+    dependencies, _ = _dependencies()
+    dependencies.unit_regression_runner = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        RuntimeError("captured inference tensor")
+    )
+    run_phase1a5(config, "source", False, tmp_path, 1, dependencies=dependencies)
+
+    with pytest.raises(RuntimeError, match="captured inference tensor"):
+        run_phase1a5(config, "smoke", False, tmp_path, 1, dependencies=dependencies)
+
+    failures = list((tmp_path / "failures" / "smoke").glob("*.json"))
+    assert len(failures) == 1
+    evidence = json.loads(failures[0].read_text(encoding="utf-8"))
+    assert evidence["status"] == "failed"
+    assert evidence["exception_type"] == "RuntimeError"
+    assert evidence["completed_batches"] is None
+    assert not (tmp_path / "stages" / "smoke.json").exists()
+    original = failures[0].read_bytes()
+    with pytest.raises(StageError, match="immutable failure evidence"):
+        run_phase1a5(config, "smoke", False, tmp_path, 1, dependencies=dependencies)
+    assert failures[0].read_bytes() == original
 
 
 def test_report_requires_terminal_predecessors_and_allows_selection_stop(

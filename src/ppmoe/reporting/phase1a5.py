@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import csv
 from dataclasses import asdict, dataclass
 import json
 from math import isfinite
@@ -117,7 +118,10 @@ def _metric(metric: object, label: str) -> dict[str, float | int | bool]:
     }
     if not values["finite"]:
         raise ReportValidationError(f"{label} is non-finite")
-    if values["negative_count"] > values["coefficient_count"] or values["above_two_count"] > values["coefficient_count"]:
+    physical = ("total_squared_error", "total_d0_squared_norm", "absolute_deviation_sum", "negative_count", "above_two_count", "unresolved_failures", "bounded_lower_saturation_count", "bounded_upper_saturation_count")
+    if any(float(values[name]) < 0 for name in physical):
+        raise ReportValidationError(f"{label} has negative physical metric")
+    if any(int(values[name]) > int(values["coefficient_count"]) for name in ("negative_count", "above_two_count", "bounded_lower_saturation_count", "bounded_upper_saturation_count")):
         raise ReportValidationError(f"{label} coefficient counts are invalid")
     return values
 
@@ -146,6 +150,17 @@ def _selection_conditions(selection: Mapping[str, Any], config: Phase1A5Config) 
 def _write_source(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(path, value)
+
+
+def _write_csv(path: Path, rows: list[Mapping[str, object]]) -> None:
+    if not rows:
+        raise ReportValidationError(f"authoritative source {path.name} is empty")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = sorted({str(key) for row in rows for key in row})
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _save_plot(path: Path, title: str, rows: list[Mapping[str, object]], x: str, y: str) -> None:
@@ -206,8 +221,30 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
         evidence = families.get(family)
         if not isinstance(evidence, Mapping) or evidence.get("failures") != 0:
             raise ReportValidationError("smoke failed batches")
+        _finite(evidence.get("elapsed_seconds"), "smoke elapsed")
+        peak = evidence.get("peak_cuda_bytes")
+        if not isinstance(peak, int) or isinstance(peak, bool) or peak < 0:
+            raise ReportValidationError("smoke peak CUDA is invalid")
+        if evidence.get("processed_tokens") != 2_048:
+            raise ReportValidationError("smoke processed token coverage is invalid")
+        if not isinstance(evidence.get("completed_batches"), int) or evidence["completed_batches"] <= 0:
+            raise ReportValidationError("smoke completed batches are invalid")
         if family == "bounded" and evidence.get("all_certified") is not True:
             raise ReportValidationError("bounded KKT evidence is invalid")
+        if family == "bounded":
+            if evidence.get("feasible") is not True:
+                raise ReportValidationError("bounded smoke is not feasible")
+            kkt = evidence.get("kkt_by_k")
+            if not isinstance(kkt, Mapping) or set(kkt) != {str(k) for k in config.k_values}:
+                raise ReportValidationError("bounded KKT evidence is incomplete")
+            for k, record in kkt.items():
+                if not isinstance(record, Mapping):
+                    raise ReportValidationError("bounded KKT evidence is malformed")
+                required = ("bounded_failure_count", "bounded_uncertified_count", "bounded_certified_count", "bounded_solver_candidate_count", "bounded_coefficient_bound_violation_count")
+                if any(not isinstance(record.get(name), int) or record[name] < 0 for name in required):
+                    raise ReportValidationError("bounded KKT evidence is malformed")
+                if record["bounded_failure_count"] or record["bounded_uncertified_count"] or record["bounded_coefficient_bound_violation_count"] or record["bounded_solver_candidate_count"] <= 0 or record["bounded_certified_count"] != record["bounded_solver_candidate_count"]:
+                    raise ReportValidationError(f"bounded KKT evidence is invalid for K={k}")
 
     selection_path = root / "selection-manifest.json"
     expected_selection_hash = select.get("selection_manifest_sha256")
@@ -244,8 +281,11 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
         if not isinstance(k, int) or k not in config.k_values or not isinstance(identifier, str):
             raise ReportValidationError("missing local condition")
         parsed = _metric(entry.get("metric"), f"local K={k} {identifier}")
+        if (k, identifier) in observed:
+            raise ReportValidationError("duplicate local metric key")
         observed.add((k, identifier))
-        local_rows.append({"k": k, "condition": identifier, **parsed, "nmse": parsed["total_squared_error"] / parsed["total_d0_squared_norm"], "active_fraction": k / 8})
+        family, separator, rho_value = identifier.partition(":")
+        local_rows.append({"k": k, "condition": identifier, "family": family, "rho": float(rho_value) if separator else None, "constraint": "[0,2]" if identifier == "bounded" else None, **parsed, "nmse": parsed["total_squared_error"] / parsed["total_d0_squared_norm"], "active_fraction": k / 8})
     if observed != {(k, identifier) for k in config.k_values for identifier in expected_ids}:
         raise ReportValidationError("missing local condition")
     by_condition = {(int(row["k"]), str(row["condition"])): row for row in local_rows}
@@ -258,10 +298,26 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
         tolerance = 1e-9 * max(abs(float(unit_row["total_squared_error"])), abs(float(free_row["total_squared_error"])), 1.0)
         recovery = None if identifier == "free_bound" or denominator <= tolerance else (float(unit_row["total_squared_error"]) - float(row["total_squared_error"])) / denominator
         gain_recovery_rows.append({"k": k, "condition": identifier, "gain_recovery": recovery})
+    persisted_metrics: dict[tuple[int, str], dict[str, float | int | bool]] = {}
     for key, value in metrics.items():
         parsed = _key(key, "local metric")
-        if len(parsed) == 2:
-            _metric(value, "local persisted metric")
+        if len(parsed) != 2 or not isinstance(parsed[0], int) or not isinstance(parsed[1], str):
+            raise ReportValidationError("local persisted metric key is invalid")
+        metric_key = (parsed[0], parsed[1])
+        if metric_key in persisted_metrics:
+            raise ReportValidationError("duplicate local persisted metric key")
+        persisted_metrics[metric_key] = _metric(value, "local persisted metric")
+    if set(persisted_metrics) != observed:
+        raise ReportValidationError("local metric reconciliation is incomplete")
+    for row in local_rows:
+        key = (int(row["k"]), str(row["condition"]))
+        if persisted_metrics[key] != {name: row[name] for name in persisted_metrics[key]}:
+            raise ReportValidationError("local metric reconciliation mismatch")
+    for k, values in selected.items():
+        if any((k, identifier) not in observed for identifier in values):
+            raise ReportValidationError("selected condition is absent from local metrics")
+        if "bounded" in values and local.get("bounded_included") is not True:
+            raise ReportValidationError("bounded selection lacks feasible smoke evidence")
 
     layer_metrics = local_result.get("layer_metrics")
     if not isinstance(layer_metrics, Mapping):
@@ -318,6 +374,26 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
         if not isinstance(value, Mapping):
             raise ReportValidationError("reference distances are invalid")
         reference_rows.append({"key": key, **{str(k): v for k, v in value.items()}})
+    reference_labels = {
+        str(item)
+        for row in reference_rows
+        for item in _key(str(row["key"]), "reference distance")[1:]
+    }
+    if not {"D0", "E8"}.issubset(reference_labels) or not any(
+        label.startswith("R8[") for label in reference_labels
+    ):
+        raise ReportValidationError("D0/E8/R8 distance evidence is incomplete")
+    stability = local_result.get("subset_stability")
+    if not isinstance(stability, Mapping) or not stability:
+        raise ReportValidationError("subset stability evidence is absent")
+    stability_rows: list[dict[str, object]] = []
+    for key, value in stability.items():
+        if not isinstance(value, Mapping):
+            raise ReportValidationError("subset stability evidence is malformed")
+        score = _finite(value.get("jaccard"), "subset stability")
+        if score < 0.0 or score > 1.0:
+            raise ReportValidationError("subset stability is outside [0,1]")
+        stability_rows.append({"key": key, "jaccard": score, **{str(name): item for name, item in value.items()}})
     plot_source = root / "plot-source"
     sources = {
         "local-metrics.json": local_rows,
@@ -327,26 +403,36 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
         "gain-recovery.json": gain_recovery_rows,
         "rank-conditioning.json": solver_rows,
         "layer-improvements.json": layer_rows,
-        "subset-stability.json": [{"k": row["k"], "condition": row["condition"], "stability": 1.0} for row in local_rows],
+        "subset-stability.json": stability_rows,
         "reference-distances.json": reference_rows,
         "evaluation-ppl.json": evaluation_rows,
     }
     for name, value in sources.items():
         _write_source(plot_source / name, value)
+    primary_rows: list[dict[str, object]] = []
+    for row in local_rows:
+        matching = [item for item in evaluation_rows if item["k"] == row["k"] and item["condition"] == row["condition"]]
+        if not matching:
+            matching = [{"corpus": None, "ppl": None, "scored_tokens": None}]
+        unit_sse = float(by_condition[(int(row["k"]), "unit")]["total_squared_error"])
+        for evaluation in matching:
+            primary_rows.append({**row, "local_relative_improvement": (unit_sse - float(row["total_squared_error"])) / unit_sse, "corpus": evaluation["corpus"], "ppl": evaluation["ppl"], "ppl_delta": None, "ppl_ratio": None, "scored_tokens": evaluation["scored_tokens"], "deployment_status": "registered" if str(row["condition"]) in selected[int(row["k"])] else "local-only"})
+    _write_source(plot_source / "primary-table.json", primary_rows)
+    _write_csv(plot_source / "primary-table.csv", primary_rows)
     plots = root / "plots"
     specs = (
-        ("01-local-nmse-rho.png", "Local NMSE versus condition", local_rows, "active_fraction", "nmse"),
+        ("01-local-nmse-rho.png", "Local NMSE versus ridge rho", local_rows, "rho", "nmse"),
         ("02-local-active-fraction.png", "Local NMSE versus active fraction", local_rows, "active_fraction", "nmse"),
         ("03-evaluation-ppl.png", "Evaluation PPL", evaluation_rows, "k", "ppl"),
         ("04-coefficient-distributions.png", "Coefficient above-two rate", local_rows, "active_fraction", "above_two_count"),
         ("05-coefficient-distortion-gain.png", "Coefficient distortion versus gain", local_rows, "absolute_deviation_sum", "nmse"),
         ("06-rank-conditioning-gain.png", "Rank and conditioning diagnostics", solver_rows, "effective_rank_sum", "condition_max"),
         ("07-layer-improvements.png", "Layerwise local NMSE", layer_rows, "layer", "nmse"),
-        ("08-subset-stability-distances.png", "Subset stability and reference distances", sources["subset-stability.json"], "k", "stability"),
+        ("08-subset-stability-distances.png", "Subset stability and reference distances", stability_rows, "jaccard", "jaccard"),
     )
     for name, title, rows, x, y in specs:
         _save_plot(plots / name, title, rows, x, y)
-    outputs = [*sorted(plot_source.glob("*.json")), *sorted(plots.glob("*.png"))]
+    outputs = [*sorted(plot_source.glob("*.json")), *sorted(plot_source.glob("*.csv")), *sorted(plots.glob("*.png"))]
     output_hashes = {path.relative_to(root).as_posix(): sha256_file(path) for path in outputs}
     stage_names = ("source", "smoke", "local", "select") if selection_stopped else ("source", "smoke", "local", "select", "rollout")
     source_stage_hashes = {f"stages/{name}.json": sha256_file(root / "stages" / f"{name}.json") for name in stage_names}

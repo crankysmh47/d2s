@@ -11,7 +11,9 @@ from dataclasses import asdict, dataclass, is_dataclass
 from hashlib import sha256
 import json
 from math import isfinite
+import os
 from pathlib import Path
+import tempfile
 from time import perf_counter
 from typing import Any, Callable, Iterable, Mapping
 
@@ -384,39 +386,42 @@ def _default_unit_regression(
                     captured[layer_index] = (args[0].detach(), output.detach())
 
                 handles.append(mlp.register_forward_hook(capture))
+            # The hook captures inference tensors.  Their expert evaluation and
+            # both oracle calls must remain in this mode: a trainable Linear
+            # otherwise attempts to save the inference tensor for backward.
             with torch.inference_mode():
                 teacher.model.language_model(
                     input_ids=batch.input_ids.to(teacher_device),
                     attention_mask=batch.attention_mask.to(teacher_device),
                     use_cache=False,
                 )
-            if captured.keys() != teacher_mlps.keys():
-                raise StageError("unit regression teacher forward missed a text MLP")
-            for layer, (teacher_input, target) in captured.items():
-                experts = (
-                    student_mlps[layer]
-                    .expert_outputs(teacher_input.to(student_device))
-                    .to(target.device)
-                )
-                valid = batch.attention_mask.to(
-                    target.device, dtype=torch.bool
-                ).reshape(-1)
-                target = target.reshape(-1, target.shape[-1])[valid]
-                experts = experts.reshape(-1, 8, experts.shape[-1])[valid]
-                for k in config.k_values:
-                    actual = score_reconstruction(
-                        target,
-                        experts,
-                        k,
-                        ReconstructionCondition("unit"),
-                        _solver_settings(config),
+                if captured.keys() != teacher_mlps.keys():
+                    raise StageError("unit regression teacher forward missed a text MLP")
+                for layer, (teacher_input, target) in captured.items():
+                    experts = (
+                        student_mlps[layer]
+                        .expert_outputs(teacher_input.to(student_device))
+                        .to(target.device)
                     )
-                    expected = exact_gram_oracle(target, experts, k)
-                    if not torch.equal(actual.subsets, expected.subsets):
-                        raise StageError(
-                            f"untied unit-subset regression failed at layer {layer}, K={k}"
+                    valid = batch.attention_mask.to(
+                        target.device, dtype=torch.bool
+                    ).reshape(-1)
+                    target = target.reshape(-1, target.shape[-1])[valid]
+                    experts = experts.reshape(-1, 8, experts.shape[-1])[valid]
+                    for k in config.k_values:
+                        actual = score_reconstruction(
+                            target,
+                            experts,
+                            k,
+                            ReconstructionCondition("unit"),
+                            _solver_settings(config),
                         )
-                checked_token_layers += int(target.shape[0])
+                        expected = exact_gram_oracle(target, experts, k)
+                        if not torch.equal(actual.subsets, expected.subsets):
+                            raise StageError(
+                                f"untied unit-subset regression failed at layer {layer}, K={k}"
+                            )
+                    checked_token_layers += int(target.shape[0])
             checked_tokens += int(batch.attention_mask.sum())
         finally:
             for handle in handles:
@@ -547,6 +552,46 @@ def _read_current_smoke(
     return smoke
 
 
+def _smoke_family_permits_progress(
+    evidence: object, family: str, config: Phase1A5Config
+) -> bool:
+    """Validate persisted smoke measurements before they unlock later stages."""
+    if not isinstance(evidence, Mapping):
+        raise StagePrerequisiteError("required feasible smoke record is invalid")
+    elapsed, peak, processed, completed, failures = (
+        evidence.get("elapsed_seconds"), evidence.get("peak_cuda_bytes"),
+        evidence.get("processed_tokens"), evidence.get("completed_batches"),
+        evidence.get("failures"),
+    )
+    if (
+        not isinstance(elapsed, (int, float)) or isinstance(elapsed, bool)
+        or not isfinite(float(elapsed)) or float(elapsed) < 0.0
+        or not isinstance(peak, int) or isinstance(peak, bool) or peak < 0
+        or processed != 2_048
+        or not isinstance(completed, int) or completed <= 0
+        or not isinstance(failures, int) or failures < 0
+    ):
+        raise StagePrerequisiteError("required feasible smoke record is invalid")
+    if family != "bounded":
+        return failures == 0 and evidence.get("feasible") is True
+    if failures or evidence.get("all_certified") is not True or evidence.get("feasible") is not True:
+        return False
+    kkt = evidence.get("kkt_by_k")
+    if not isinstance(kkt, Mapping) or set(kkt) != {str(k) for k in config.k_values}:
+        return False
+    for record in kkt.values():
+        if not isinstance(record, Mapping):
+            return False
+        try:
+            if any(int(record[name]) < 0 for name in ("bounded_failure_count", "bounded_uncertified_count", "bounded_certified_count", "bounded_solver_candidate_count", "bounded_coefficient_bound_violation_count")):
+                return False
+            if record["bounded_failure_count"] or record["bounded_uncertified_count"] or record["bounded_coefficient_bound_violation_count"] or record["bounded_solver_candidate_count"] <= 0 or record["bounded_certified_count"] != record["bounded_solver_candidate_count"]:
+                return False
+        except (KeyError, TypeError, ValueError):
+            return False
+    return True
+
+
 def _diagnostic_count(diagnostics: Mapping[object, object], name: str) -> int:
     total = 0
     for value in diagnostics.values():
@@ -555,6 +600,76 @@ def _diagnostic_count(diagnostics: Mapping[object, object], name: str) -> int:
             if isinstance(item, (int, float)) and isfinite(float(item)):
                 total += int(item)
     return total
+
+
+def _bounded_kkt_by_k(
+    result: ReconstructionLocalResult, config: Phase1A5Config
+) -> dict[str, dict[str, int]]:
+    """Require complete, zero-failure bounded certificates for every locked K."""
+    records: dict[str, dict[str, int]] = {}
+    for k in config.k_values:
+        values = result.solver_diagnostics.get((k, "bounded"))
+        if not isinstance(values, Mapping):
+            raise StageError(f"bounded smoke lacks K={k} solver diagnostics")
+        required = (
+            "bounded_failure_count",
+            "bounded_uncertified_count",
+            "bounded_certified_count",
+            "bounded_solver_candidate_count",
+            "bounded_coefficient_bound_violation_count",
+        )
+        try:
+            record = {name: int(values[name]) for name in required}
+        except (KeyError, TypeError, ValueError) as error:
+            raise StageError(f"bounded smoke has malformed K={k} KKT diagnostics") from error
+        if (
+            any(value < 0 for value in record.values())
+            or record["bounded_failure_count"]
+            or record["bounded_uncertified_count"]
+            or record["bounded_coefficient_bound_violation_count"]
+            or record["bounded_solver_candidate_count"] <= 0
+            or record["bounded_certified_count"] != record["bounded_solver_candidate_count"]
+        ):
+            raise StageError(f"bounded smoke has invalid K={k} KKT certificate")
+        records[str(k)] = record
+    return records
+
+
+def _smoke_failure_path(artifact_root: Path, signature: str) -> Path:
+    return artifact_root / "failures" / "smoke" / f"{signature}.json"
+
+
+def _preserve_smoke_failure(path: Path, payload: Mapping[str, object]) -> dict[str, Any]:
+    """Atomically create immutable source-native failure evidence once."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        return _read_json_failure(path)
+    encoded = (json.dumps(_json_safe(payload), sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return _read_json_failure(path)
+        return json.loads(encoded)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _read_json_failure(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise StageError("immutable smoke failure evidence is invalid") from error
+    if not isinstance(value, dict):
+        raise StageError("immutable smoke failure evidence is invalid")
+    return value
 
 
 def _smoke_stage(
@@ -601,63 +716,81 @@ def _smoke_stage(
     token_hash = _canonical_hash(
         {"tokens": input_ids.tolist(), "mask": attention_mask.tolist()}
     )
-    teacher, student = dependencies.converted_pair_loader(config)
-    batches = tuple(
-        iter_evaluation_batches(
-            input_ids, attention_mask, microbatch_size=microbatch_size
-        )
+    signature = _execution_signature(
+        config, source_manifest, microbatch_size, stage="smoke", token_hash=token_hash
     )
-    regression = dependencies.unit_regression_runner(teacher, student, batches, config)
-    if not regression.get("passed") or regression.get("checked_tokens") != 2_048:
-        raise StageError("exact untied unit-subset smoke regression did not pass")
-    families: dict[str, object] = {}
-    for family in ("unit", "ridge", "bounded", "free_bound"):
-        dependencies.cuda_peak_reset()
-        started = dependencies.clock()
-        signature = _execution_signature(
-            config,
-            source_manifest,
-            microbatch_size,
-            stage="smoke",
-            token_hash=token_hash,
-            extra={"family": family},
+    failure_path = _smoke_failure_path(artifact_root, signature)
+    if failure_path.exists():
+        raise StageError("immutable failure evidence exists for this smoke signature")
+    started = dependencies.clock()
+    try:
+        teacher, student = dependencies.converted_pair_loader(config)
+        batches = tuple(
+            iter_evaluation_batches(
+                input_ids, attention_mask, microbatch_size=microbatch_size
+            )
         )
-        result = dependencies.local_runner(
+        regression = dependencies.unit_regression_runner(teacher, student, batches, config)
+        if not regression.get("passed") or regression.get("checked_tokens") != 2_048:
+            raise StageError("exact untied unit-subset smoke regression did not pass")
+        families: dict[str, object] = {}
+        for family in ("unit", "ridge", "bounded", "free_bound"):
+            dependencies.cuda_peak_reset()
+            family_started = dependencies.clock()
+            family_signature = _execution_signature(
+                config, source_manifest, microbatch_size, stage="smoke", token_hash=token_hash,
+                extra={"family": family},
+            )
+            result = dependencies.local_runner(
             teacher,
             student,
             batches,
             _family_conditions(config, family),
-            artifact_root / "checkpoints" / "smoke" / family / signature,
-            signature,
+            artifact_root / "checkpoints" / "smoke" / family / family_signature,
+            family_signature,
             source_hashes=source_hashes,
-        )
-        elapsed = dependencies.clock() - started
-        if elapsed < 0.0:
-            raise StageError("smoke clock moved backwards")
-        solver_failures = _diagnostic_count(
+            )
+            elapsed = dependencies.clock() - family_started
+            peak_cuda_bytes = int(dependencies.cuda_peak_probe())
+            if not isfinite(elapsed) or elapsed < 0.0 or peak_cuda_bytes < 0:
+                raise StageError("smoke measurement is invalid")
+            if not result.complete or result.completed_batches <= 0 or result.failed_batches != 0:
+                raise StageError(f"{family} smoke run lacks complete batches")
+            solver_failures = _diagnostic_count(
             result.solver_diagnostics, "bounded_failure_count"
-        )
-        r8_failures = _diagnostic_count(
+            )
+            r8_failures = _diagnostic_count(
             result.reference_diagnostics, "bounded_failure_count"
-        )
-        r8_fallback_faces = _diagnostic_count(
+            )
+            r8_fallback_faces = _diagnostic_count(
             result.reference_diagnostics, "bounded_face_enumeration_count"
-        )
-        certification_failures = _diagnostic_count(
+            )
+            certification_failures = _diagnostic_count(
             result.solver_diagnostics, "bounded_uncertified_count"
-        ) + _diagnostic_count(result.reference_diagnostics, "bounded_uncertified_count")
-        failures = int(result.failed_batches) + solver_failures + r8_failures
-        all_certified = certification_failures == 0
-        if family != "bounded" and (not result.complete or failures):
-            raise StageError(f"{family} smoke run did not complete without failures")
-        benchmark = FamilyBenchmark.from_measurement(
+            ) + _diagnostic_count(result.reference_diagnostics, "bounded_uncertified_count")
+            failures = int(result.failed_batches) + solver_failures + r8_failures
+            all_certified = certification_failures == 0
+            if family == "bounded":
+                try:
+                    kkt_by_k = _bounded_kkt_by_k(result, config)
+                except StageError:
+                    # Preserve the bounded engineering failure in the smoke
+                    # record; it makes bounded infeasible rather than allowing
+                    # local selection to treat an incomplete certificate as pass.
+                    kkt_by_k = {}
+                    all_certified = False
+            else:
+                kkt_by_k = {}
+            if family != "bounded" and failures:
+                raise StageError(f"{family} smoke run did not complete without failures")
+            benchmark = FamilyBenchmark.from_measurement(
             elapsed_seconds=elapsed,
-            peak_cuda_bytes=int(dependencies.cuda_peak_probe()),
+            peak_cuda_bytes=peak_cuda_bytes,
             processed_tokens=2_048,
             failures=failures,
             all_certified=all_certified,
-        )
-        families[family] = {
+            )
+            families[family] = {
             "elapsed_seconds": benchmark.elapsed_seconds,
             "peak_cuda_bytes": benchmark.peak_cuda_bytes,
             "processed_tokens": benchmark.processed_tokens,
@@ -669,12 +802,10 @@ def _smoke_stage(
             "all_certified": all_certified,
             "r8_fallback_face_enumeration_count": r8_fallback_faces,
             "completed_batches": result.completed_batches,
+            "kkt_by_k": kkt_by_k,
             "result": _json_safe(result),
-        }
-    signature = _execution_signature(
-        config, source_manifest, microbatch_size, stage="smoke", token_hash=token_hash
-    )
-    return _write_stage(
+            }
+        return _write_stage(
         artifact_root,
         "smoke",
         _config_signature(config),
@@ -687,7 +818,23 @@ def _smoke_stage(
             "source_hashes": source_hashes,
             "source_stage_input_signature": source_stage["input_signature"],
         },
-    )
+        )
+    except Exception as error:
+        elapsed = dependencies.clock() - started
+        try:
+            peak_cuda_bytes: int | None = int(dependencies.cuda_peak_probe())
+        except Exception:
+            peak_cuda_bytes = None
+        _preserve_smoke_failure(failure_path, {
+            "stage": "smoke", "status": "failed", "input_signature": signature,
+            "source_stage_input_signature": source_stage["input_signature"],
+            "source_hashes": source_hashes, "execution_microbatch_size": microbatch_size,
+            "exception_type": type(error).__name__, "exception_message": str(error),
+            "elapsed_seconds": elapsed if isfinite(elapsed) and elapsed >= 0.0 else None,
+            "peak_cuda_bytes": peak_cuda_bytes,
+            "completed_batches": None, "failed_batches": None,
+        })
+        raise
 
 
 def _local_stage(
@@ -712,18 +859,16 @@ def _local_stage(
             raise StagePrerequisiteError("local requires feasible smoke") from error
         raise
     families = smoke.get("families")
-    if not isinstance(families, Mapping) or not isinstance(
-        families.get("bounded"), Mapping
-    ):
+    if not isinstance(families, Mapping):
         raise StagePrerequisiteError("required feasible smoke record is invalid")
     for family in ("unit", "ridge", "free_bound"):
-        if not isinstance(families.get(family), Mapping) or not families[family].get(
-            "feasible"
-        ):
+        if not _smoke_family_permits_progress(families.get(family), family, config):
             raise StagePrerequisiteError(
                 "local requires feasible smoke for unit, ridge, and free_bound"
             )
-    include_bounded = bool(families["bounded"].get("feasible"))
+    include_bounded = _smoke_family_permits_progress(
+        families.get("bounded"), "bounded", config
+    )
     assert (
         dependencies.calibration_loader is not None
         and dependencies.converted_pair_loader is not None
