@@ -341,6 +341,33 @@ def test_cross_condition_subset_jaccard_is_known_and_resumable(tmp_path: Path) -
     assert resumed == first
 
 
+def test_jaccard_transaction_rolls_back_on_persist_failure_then_retries_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    unit, ridge = ReconstructionCondition("unit"), ReconstructionCondition("ridge", rho=0.1)
+    accumulator = ReconstructionLocalAccumulator(num_layers=1, num_experts=8, conditions={4: (unit, ridge)}, checkpoint_dir=tmp_path, run_signature="jaccard-rollback")
+    target, experts = torch.tensor([[1.0], [0.0]]), torch.zeros(2, 8, 1)
+    experts[:, 0, 0] = 1.0
+    accumulator.update_layer(0, target, experts)
+    original, calls = accumulator._persist, 0
+
+    def fail_once() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("injected persist failure")
+        original()
+
+    monkeypatch.setattr(accumulator, "_persist", fail_once)
+    with pytest.raises(OSError, match="injected persist failure"):
+        accumulator.mark_batch_completed(0)
+    assert accumulator.finalize().subset_stability[(4, "ridge:0.1", "unit")].token_count == 0
+    accumulator.update_layer(0, target, experts)
+    accumulator.mark_batch_completed(0)
+    record = accumulator.finalize().subset_stability[(4, "ridge:0.1", "unit")]
+    assert record.token_count == 2 and record.mean_jaccard == pytest.approx(1.0)
+
+
 def test_pooled_improvement_and_gain_recovery_are_analysis_only(tmp_path: Path) -> None:
     unit = ReconstructionCondition("unit")
     ridge = ReconstructionCondition("ridge", rho=0.1)

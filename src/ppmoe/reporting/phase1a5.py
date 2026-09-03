@@ -242,9 +242,11 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
         raise ReportValidationError("smoke family evidence is missing")
     for family in ("unit", "ridge", "free_bound", "bounded"):
         evidence = families.get(family)
-        if not isinstance(evidence, Mapping) or evidence.get("failures") != 0:
+        if not isinstance(evidence, Mapping):
             raise ReportValidationError("smoke failed batches")
-        _finite(evidence.get("elapsed_seconds"), "smoke elapsed")
+        elapsed = _finite(evidence.get("elapsed_seconds"), "smoke elapsed")
+        if elapsed < 0.0:
+            raise ReportValidationError("smoke elapsed is negative")
         peak = evidence.get("peak_cuda_bytes")
         if not isinstance(peak, int) or isinstance(peak, bool) or peak < 0:
             raise ReportValidationError("smoke peak CUDA is invalid")
@@ -252,9 +254,14 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
             raise ReportValidationError("smoke processed token coverage is invalid")
         if not isinstance(evidence.get("completed_batches"), int) or evidence["completed_batches"] <= 0:
             raise ReportValidationError("smoke completed batches are invalid")
-        if family == "bounded" and evidence.get("all_certified") is not True:
+        bounded_included = local.get("bounded_included") is True
+        if family != "bounded" and evidence.get("failures") != 0:
+            raise ReportValidationError("smoke failed batches")
+        if family == "bounded" and bounded_included and evidence.get("all_certified") is not True:
             raise ReportValidationError("bounded KKT evidence is invalid")
-        if family == "bounded" and local.get("bounded_included") is True:
+        if family == "bounded" and bounded_included:
+            if evidence.get("failures") != 0:
+                raise ReportValidationError("bounded smoke failed batches")
             if evidence.get("feasible") is not True:
                 raise ReportValidationError("bounded smoke is not feasible")
             kkt = evidence.get("kkt_by_k")
@@ -271,6 +278,8 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
         elif family == "bounded" and evidence.get("feasible") is not True:
             if not isinstance(evidence.get("bounded_stop_reason"), str) or not evidence["bounded_stop_reason"]:
                 raise ReportValidationError("bounded engineering stop reason is missing")
+        elif family == "bounded":
+            raise ReportValidationError("bounded exclusion requires engineering stop")
 
     selection_path = root / "selection-manifest.json"
     expected_selection_hash = select.get("selection_manifest_sha256")
@@ -453,6 +462,12 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
     }
     for name, value in sources.items():
         _write_source(plot_source / name, value)
+    feasibility_rows = [
+        {"family": family, "feasible": evidence.get("feasible"), "bounded_stop_reason": evidence.get("bounded_stop_reason")}
+        for family, evidence in families.items()
+        if isinstance(evidence, Mapping)
+    ]
+    _write_source(plot_source / "smoke-feasibility.json", feasibility_rows)
     primary_rows: list[dict[str, object]] = []
     for row in local_rows:
         matching = [item for item in evaluation_rows if item["k"] == row["k"] and item["condition"] == row["condition"]]
@@ -485,13 +500,17 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
     stage_names = ("source", "smoke", "local", "select") if selection_stopped else ("source", "smoke", "local", "select", "rollout")
     source_stage_hashes = {f"stages/{name}.json": sha256_file(root / "stages" / f"{name}.json") for name in stage_names}
     decision = _decision(selection)
-    report = "\n".join((
+    bounded_stop_reason = families["bounded"].get("bounded_stop_reason") if isinstance(families.get("bounded"), Mapping) else None
+    report_lines = [
         "# Phase 1A.5 sparse reconstruction oracle report", "",
         f"Decision: {decision}", "",
         "The Registered Free-Reconstruction Candidate Bound is a registered candidate bound, not an exact-span optimum.",
         "This report makes no claim of an exact-span optimum, a trained router, or an inference speedup.",
         "Gain recovery is analysis-only and never affects eligibility.",
-    ))
+    ]
+    if isinstance(bounded_stop_reason, str):
+        report_lines.append(f"Bounded engineering stop: {bounded_stop_reason}.")
+    report = "\n".join(report_lines)
     (root / "report.md").write_text(report, encoding="utf-8")
     output_hashes["report.md"] = sha256_file(root / "report.md")
     manifest = Phase1A5ReportManifest(

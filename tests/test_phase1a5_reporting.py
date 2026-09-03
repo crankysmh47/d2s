@@ -263,10 +263,21 @@ def test_report_refuses_fabricated_subset_stability(tmp_path: Path) -> None:
         _render(tmp_path)
 
 
+def test_report_accepts_bounded_engineering_stop_when_bounded_is_absent(tmp_path: Path) -> None:
+    _write_complete_artifacts(tmp_path)
+    _make_bounded_engineering_stop(tmp_path)
+
+    manifest = _render(tmp_path)
+
+    assert "plot-source/smoke-feasibility.json" in manifest.output_hashes
+    assert "engineering_infeasible_under_v0_5" in (tmp_path / "report.md").read_text(encoding="utf-8")
+
+
 @pytest.mark.parametrize(
     ("keys", "value", "message"),
     [
         (("families", "unit", "elapsed_seconds"), None, "smoke elapsed"),
+        (("families", "unit", "elapsed_seconds"), -1.0, "smoke elapsed"),
         (("families", "ridge", "peak_cuda_bytes"), -1, "smoke peak"),
         (("families", "free_bound", "processed_tokens"), 2_047, "smoke processed"),
         (("families", "bounded", "completed_batches"), 0, "smoke completed"),
@@ -319,3 +330,19 @@ def _add_unregistered_rollout(root: Path) -> None:
     payload = _load(path)
     payload["results"] = {"wikitext:k6:ridge:1": {"complete": True}}
     _write_json(path, payload)
+
+
+def _make_bounded_engineering_stop(root: Path) -> None:
+    local_path = root / "stages" / "local.json"
+    local = _load(local_path)
+    local["bounded_included"] = False
+    local["selection_metrics"] = [row for row in local["selection_metrics"] if row["condition"] != "bounded"]
+    for name in ("metrics", "layer_metrics", "selection_counts", "coefficient_quantiles"):
+        local["result"][name] = {key: value for key, value in local["result"][name].items() if "bounded" not in key}
+    local["result"]["solver_diagnostics"] = {key: value for key, value in local["result"]["solver_diagnostics"].items() if "bounded" not in key}
+    local["result"]["subset_stability"] = {key: value for key, value in local["result"]["subset_stability"].items() if "bounded" not in key}
+    _write_json(local_path, local)
+    smoke_path = root / "stages" / "smoke.json"
+    smoke = _load(smoke_path)
+    smoke["families"]["bounded"].update({"feasible": False, "all_certified": False, "failures": 1, "kkt_by_k": {}, "bounded_stop_reason": "engineering_infeasible_under_v0_5"})
+    _write_json(smoke_path, smoke)
