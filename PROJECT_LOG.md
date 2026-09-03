@@ -541,3 +541,15 @@ This file is an append-only record of material project actions, decisions, verif
   - bounded `[0,2]` reports lower/upper saturation rates at `1e-6` and is practical independently of the negative-rate diagnostic.
 - Added free-reconstruction gain recovery as an analysis-only metric; it cannot affect the pre-registered 30% eligibility gate.
 - Implementation plan written at `docs/superpowers/plans/2026-09-01-phase1a5-sparse-reconstruction-oracle.md`. It separates protocol provenance, solver core, certified bounded QP, local calibration/selection, orchestration, Reconstruction-H rollout, and hashed reporting into major reviewed checkpoints.
+
+### 2026-09-03 — Phase 1A.5 Task 7 source complete; 2,048-token smoke stopped before scoring
+
+- Reporting implementation checkpoint: `88d0e8e feat: add phase 1a5 reporting`. Fresh verification before this production attempt: `uv run pytest -q` passed `230/230`; `uv lock --check` resolved the locked 85 packages; `git diff --check` passed.
+- Source command: `uv run python scripts/run_phase1a5.py --stage source --artifact-root artifacts/phase1-v0_5 --microbatch-size 1`.
+  - Exit code `0`; source-stage signature `7d41b9700d33c9151b1cc1aca325187acd41514d5ceada847f50a4fcb52d832b`.
+  - `artifacts/phase1-v0_5/stages/source.json` records code revision `88d0e8ebe4469d0ece42932c877df361dd1244c5` with `dirty: false` and the frozen Phase 1 source/dataset/model hashes.
+- Smoke command (one permitted execution): `uv run python scripts/run_phase1a5.py --stage smoke --artifact-root artifacts/phase1-v0_5 --microbatch-size 1`.
+  - Exit code `1`; wall time approximately `9.6` seconds including cached model loading. The environment emitted an unauthenticated Hugging Face Hub warning but loaded all 473 cached weight shards for each model.
+  - Failure occurred before unit regression completed and before any family timing, CUDA peak, SVD, bounded-KKT, feasibility, completed-batch, or failed-batch aggregate could be persisted: `RuntimeError: Inference tensors cannot be saved for backward` in `PartitionedQwen35MLP.expert_outputs` while `_default_unit_regression` fed a tensor captured under `torch.inference_mode()` into a student linear layer outside an inference/no-grad context.
+  - Durable artifact state after failure: only `source-manifest.json` and `stages/source.json` exist under `artifacts/phase1-v0_5`; no smoke stage or smoke checkpoint exists. Therefore completed/failed batch counts and solver/KKT/SVD evidence are unavailable, rather than zero or passing.
+- Decision: the smoke gate is **not passed**. No retry, tolerance change, microbatch change, 100K local calibration, selection, rollout, or report execution was performed. A separately reviewed regression fix must make the unit-regression capture/consumer autograd modes compatible and prove the failure path with a test before a new source signature and smoke attempt.
