@@ -44,6 +44,7 @@ from ppmoe.oracle.reconstruction_rollout import (
     run_reconstruction_rollout,
 )
 from ppmoe.provenance import atomic_write_json, sha256_file
+from ppmoe.reporting.phase1a5 import ReportValidationError, render_phase1a5_report
 
 
 class StageError(RuntimeError):
@@ -1125,7 +1126,10 @@ def run_phase1a5(
         source_hashes,
         allow_scientific_stop=True,
     )
-    if _selection_is_scientifically_stopped(artifact_root, selection):
-        raise StageError("report is not implemented until Task 7")
-    _read_report_stage(artifact_root, "rollout", config, source_stage, source_hashes)
-    raise StageError("report is not implemented until Task 7")
+    stopped = _selection_is_scientifically_stopped(artifact_root, selection)
+    if not stopped:
+        _read_report_stage(artifact_root, "rollout", config, source_stage, source_hashes)
+    try:
+        return _json_safe(asdict(render_phase1a5_report(artifact_root, config)))
+    except ReportValidationError as error:
+        raise StageError(f"report integrity validation failed: {error}") from error

@@ -314,18 +314,23 @@ def test_report_requires_terminal_predecessors_and_allows_selection_stop(
     with pytest.raises(StagePrerequisiteError, match="rollout"):
         run_phase1a5(config, "report", False, tmp_path, 100, dependencies=dependencies)
 
-    stopped = replace(
-        dependencies,
-        selection_runner=lambda _result, _config, output_path: (
-            output_path.write_text(
-                '{"practical_conditions":{},"free_bound_conditions":{}}',
-                encoding="utf-8",
+    def stopped_selection_runner(result, _config, output_path):
+        output_path.write_text(
+            json.dumps(
+                {
+                    "practical_conditions": {},
+                    "free_bound_conditions": {},
+                    "source_hashes": dict(result.source_hashes),
+                    "local_hashes": {"run_signature": result.run_signature},
+                }
             ),
-            {"practical_conditions": {}, "free_bound_conditions": {}},
-        )[1],
-    )
+            encoding="utf-8",
+        )
+        return {"practical_conditions": {}, "free_bound_conditions": {}}
+
+    stopped = replace(dependencies, selection_runner=stopped_selection_runner)
     run_phase1a5(config, "select", False, tmp_path, 100, dependencies=stopped)
-    with pytest.raises(StageError, match="not implemented"):
+    with pytest.raises(StageError, match="missing local condition"):
         run_phase1a5(config, "report", False, tmp_path, 100, dependencies=stopped)
 
 
