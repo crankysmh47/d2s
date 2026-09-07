@@ -20,6 +20,7 @@ from ppmoe.oracle.box_qp import (
     solve_box_qp,
     solve_full_reference_box_qp,
 )
+from ppmoe.oracle.exact import exact_gram_oracle
 
 
 _FAMILY = Literal["unit", "ridge", "bounded", "free_bound"]
@@ -361,30 +362,18 @@ def _score_reconstruction(
         raise ValueError("bounded reconstruction is registered only for K=4 or K=6")
 
     combinations = enumerate_subsets(experts.shape[1], k, experts.device)
-    score_dtype = _scoring_dtype(target, experts)
-    score_target = target.to(score_dtype)
-    score_experts = experts.to(score_dtype)
-    target_norm = score_target.square().sum(dim=-1)
-    full_gram = torch.einsum("teh,tfh->tef", score_experts, score_experts)
-    full_linear = torch.einsum("th,teh->te", score_target, score_experts)
-    gs = full_gram[:, combinations[:, :, None], combinations[:, None, :]]
-    bs = full_linear[:, combinations]
-
-    unit_coefficients = torch.ones(bs.shape, dtype=score_dtype, device=experts.device)
-    unit_loss = _quadratic_loss(target_norm, gs, bs, unit_coefficients)
-
     if condition.family == "unit":
-        subset_indices = _choose_subsets(unit_loss)
-        coefficients = _gather_by_subset(unit_coefficients, subset_indices)
-        selected_subsets = _gather_by_subset(
-            combinations.expand(target.shape[0], -1, -1), subset_indices
+        selected_subsets = exact_gram_oracle(target, experts, k).subsets
+        coefficients = torch.ones(
+            selected_subsets.shape, dtype=torch.float64, device=experts.device
         )
-        selected_experts = score_experts[
+        target64 = target.double()
+        selected_experts64 = experts.double()[
             torch.arange(target.shape[0], device=experts.device)[:, None],
             selected_subsets,
         ]
         squared_error = (
-            (torch.einsum("tk,tkh->th", coefficients, selected_experts) - score_target)
+            (torch.einsum("tk,tkh->th", coefficients, selected_experts64) - target64)
             .square()
             .sum(dim=-1)
         )
@@ -400,6 +389,18 @@ def _score_reconstruction(
                 "max_relative_system_residual": 0.0,
             },
         )
+
+    score_dtype = _scoring_dtype(target, experts)
+    score_target = target.to(score_dtype)
+    score_experts = experts.to(score_dtype)
+    target_norm = score_target.square().sum(dim=-1)
+    full_gram = torch.einsum("teh,tfh->tef", score_experts, score_experts)
+    full_linear = torch.einsum("th,teh->te", score_target, score_experts)
+    gs = full_gram[:, combinations[:, :, None], combinations[:, None, :]]
+    bs = full_linear[:, combinations]
+
+    unit_coefficients = torch.ones(bs.shape, dtype=score_dtype, device=experts.device)
+    _quadratic_loss(target_norm, gs, bs, unit_coefficients)
 
     # Numerical coefficient systems are constructed from promoted vectors,
     # never from an FP32 Gram matrix cast after accumulation.

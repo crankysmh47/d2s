@@ -7,6 +7,7 @@ from ppmoe.oracle.reconstruction import (
     ReconstructionCondition,
     SolverSettings,
     _pick_registered_candidate,
+    enumerate_subsets,
     score_reconstruction,
     verify_pseudoinverse_svd,
 )
@@ -68,6 +69,55 @@ def test_unit_reconstruction_matches_fp32_gram_oracle() -> None:
     torch.testing.assert_close(
         new.squared_error, materialized_loss(target, experts, new)
     )
+
+
+def test_unit_uses_phase1a_indicator_ranking_at_fp32_near_margin() -> None:
+    """Catches replacing Phase 1A indicator ranking with gathered contractions."""
+
+    target = torch.tensor([[-0.6875]], dtype=torch.bfloat16)
+    experts = torch.tensor(
+        [
+            [
+                [-0.0556640625],
+                [-0.26171875],
+                [-0.1748046875],
+                [0.0029449462890625],
+                [-0.390625],
+                [-0.212890625],
+                [-0.2451171875],
+                [-0.15625],
+            ]
+        ],
+        dtype=torch.bfloat16,
+    )
+
+    combinations = enumerate_subsets(8, 4, target.device)
+    target32, experts32 = target.float(), experts.float()
+    gram = torch.einsum("teh,tfh->tef", experts32, experts32)
+    linear = torch.einsum("th,teh->te", target32, experts32)
+    gathered_gram = gram[:, combinations[:, :, None], combinations[:, None, :]]
+    gathered_linear = linear[:, combinations]
+    gathered_losses = (
+        target32.square().sum(dim=-1)[:, None]
+        - 2.0 * gathered_linear.sum(dim=-1)
+        + gathered_gram.sum(dim=(-2, -1))
+    )
+    gathered_subset = combinations[gathered_losses.argmin(dim=1)]
+
+    reference = exact_gram_oracle(target, experts, 4)
+    result = score_reconstruction(target, experts, 4, UNIT, SETTINGS)
+
+    assert reference.subsets.tolist() == [[0, 3, 4, 6]]
+    assert gathered_subset.tolist() == [[0, 1, 5, 7]]
+    assert torch.equal(result.subsets, reference.subsets)
+    selected_loss = materialized_loss(target.double(), experts.double(), result)
+    competing_experts = experts.double()[:, gathered_subset[0]]
+    competing_loss = (
+        (competing_experts.sum(dim=1) - target.double()).square().sum(dim=-1)
+    )
+    assert result.squared_error.dtype == torch.float64
+    torch.testing.assert_close(result.squared_error, selected_loss, rtol=0.0, atol=0.0)
+    assert torch.all(result.squared_error <= competing_loss)
 
 
 def test_unit_reconstruction_preserves_cancellation_and_lexicographic_ties() -> None:
