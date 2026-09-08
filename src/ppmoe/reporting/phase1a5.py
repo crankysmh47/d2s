@@ -6,7 +6,7 @@ import ast
 import csv
 from dataclasses import asdict, dataclass
 import json
-from math import isfinite
+from math import isclose, isfinite, sqrt
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -100,7 +100,21 @@ def _validate_existing_manifest(root: Path) -> None:
             raise ReportValidationError("output hash mismatch")
 
 
-def _metric(metric: object, label: str) -> dict[str, float | int | bool]:
+def _optional_distribution(
+    metric: Mapping[str, object],
+    names: tuple[str, ...],
+    label: str,
+    *,
+    defined_count: int,
+) -> dict[str, float | None]:
+    if defined_count == 0:
+        if any(metric.get(name) is not None for name in names):
+            raise ReportValidationError(f"{label} local metric schema is invalid")
+        return {name: None for name in names}
+    return {name: _finite(metric.get(name), f"{label} local metric schema") for name in names}
+
+
+def _metric(metric: object, label: str) -> dict[str, object]:
     if not isinstance(metric, Mapping):
         raise ReportValidationError(f"{label} is missing")
     values = {
@@ -112,18 +126,208 @@ def _metric(metric: object, label: str) -> dict[str, float | int | bool]:
         "above_two_count": _integer(metric.get("above_two_count"), f"{label} above-two count"),
         "absolute_deviation_sum": _finite(metric.get("absolute_deviation_sum"), f"{label} coefficient deviation"),
         "unresolved_failures": _integer(metric.get("unresolved_failures"), f"{label} unresolved failures"),
-        "finite": bool(metric.get("finite")),
+        "finite": metric.get("finite") is True,
         "bounded_lower_saturation_count": _integer(metric.get("bounded_lower_saturation_count", 0), f"{label} lower saturation"),
         "bounded_upper_saturation_count": _integer(metric.get("bounded_upper_saturation_count", 0), f"{label} upper saturation"),
+        "coefficient_sum": _finite(metric.get("coefficient_sum"), f"{label} local metric schema"),
+        "coefficient_squared_sum": _finite(metric.get("coefficient_squared_sum"), f"{label} local metric schema"),
+        "above_four_count": _integer(metric.get("above_four_count"), f"{label} local metric schema"),
+        "squared_deviation_sum": _finite(metric.get("squared_deviation_sum"), f"{label} local metric schema"),
+        "relative_error_sum": _finite(metric.get("relative_error_sum"), f"{label} local metric schema"),
+        "cosine_sum": _finite(metric.get("cosine_sum"), f"{label} local metric schema"),
+        "cosine_defined_count": _integer(metric.get("cosine_defined_count"), f"{label} local metric schema"),
+        "cosine_undefined_count": _integer(metric.get("cosine_undefined_count"), f"{label} local metric schema"),
+        "gram_condition_defined_count": _integer(metric.get("gram_condition_defined_count"), f"{label} local metric schema"),
+        "gram_condition_undefined_count": _integer(metric.get("gram_condition_undefined_count"), f"{label} local metric schema"),
+        "coefficient_mean": _finite(metric.get("coefficient_mean"), f"{label} local metric schema"),
+        "coefficient_std": _finite(metric.get("coefficient_std"), f"{label} local metric schema"),
+        "coefficient_p01": _finite(metric.get("coefficient_p01"), f"{label} local metric schema"),
+        "coefficient_p05": _finite(metric.get("coefficient_p05"), f"{label} local metric schema"),
+        "coefficient_median": _finite(metric.get("coefficient_median"), f"{label} local metric schema"),
+        "coefficient_p95": _finite(metric.get("coefficient_p95"), f"{label} local metric schema"),
+        "coefficient_p99": _finite(metric.get("coefficient_p99"), f"{label} local metric schema"),
+        "coefficient_p99_abs": _finite(metric.get("coefficient_p99_abs"), f"{label} local metric schema"),
+        "coefficient_max_abs": _finite(metric.get("coefficient_max_abs"), f"{label} local metric schema"),
+        "negative_rate": _finite(metric.get("negative_rate"), f"{label} local metric schema"),
+        "above_two_rate": _finite(metric.get("above_two_rate"), f"{label} local metric schema"),
+        "above_four_rate": _finite(metric.get("above_four_rate"), f"{label} local metric schema"),
+        "bounded_lower_saturation_rate": _finite(metric.get("bounded_lower_saturation_rate"), f"{label} local metric schema"),
+        "bounded_upper_saturation_rate": _finite(metric.get("bounded_upper_saturation_rate"), f"{label} local metric schema"),
+        "mean_absolute_deviation_from_one": _finite(metric.get("mean_absolute_deviation_from_one"), f"{label} local metric schema"),
+        "l2_deviation_from_one": _finite(metric.get("l2_deviation_from_one"), f"{label} local metric schema"),
+        "l2_deviation_denominator": _integer(metric.get("l2_deviation_denominator"), f"{label} local metric schema", positive=True),
+        "relative_error_mean": _finite(metric.get("relative_error_mean"), f"{label} local metric schema"),
+        "relative_error_median": _finite(metric.get("relative_error_median"), f"{label} local metric schema"),
+        "relative_error_p90": _finite(metric.get("relative_error_p90"), f"{label} local metric schema"),
+        "relative_error_p95": _finite(metric.get("relative_error_p95"), f"{label} local metric schema"),
+        "relative_error_p99": _finite(metric.get("relative_error_p99"), f"{label} local metric schema"),
     }
+    values.update(
+        _optional_distribution(
+            metric,
+            ("cosine_mean", "cosine_median", "cosine_p90", "cosine_p95", "cosine_p99"),
+            label,
+            defined_count=int(values["cosine_defined_count"]),
+        )
+    )
+    values.update(
+        _optional_distribution(
+            metric,
+            ("gram_condition_median", "gram_condition_p90", "gram_condition_p99", "gram_condition_max"),
+            label,
+            defined_count=int(values["gram_condition_defined_count"]),
+        )
+    )
+    rank_counts = metric.get("effective_rank_counts")
+    if not isinstance(rank_counts, Mapping) or not rank_counts:
+        raise ReportValidationError(f"{label} local metric schema is invalid")
+    parsed_ranks: dict[str, int] = {}
+    try:
+        for rank, count in rank_counts.items():
+            parsed_rank = int(rank)
+            if str(parsed_rank) != str(rank) or not 0 <= parsed_rank <= 8:
+                raise ValueError
+            parsed_count = _integer(count, f"{label} local metric schema")
+            if parsed_count < 0:
+                raise ValueError
+            parsed_ranks[str(parsed_rank)] = parsed_count
+    except (TypeError, ValueError) as error:
+        raise ReportValidationError(f"{label} local metric schema is invalid") from error
+    values["effective_rank_counts"] = parsed_ranks
     if not values["finite"]:
-        raise ReportValidationError(f"{label} is non-finite")
-    physical = ("total_squared_error", "total_d0_squared_norm", "absolute_deviation_sum", "negative_count", "above_two_count", "unresolved_failures", "bounded_lower_saturation_count", "bounded_upper_saturation_count")
+        raise ReportValidationError(f"{label} local metric schema finite flag is invalid")
+    physical = ("total_squared_error", "total_d0_squared_norm", "coefficient_squared_sum", "absolute_deviation_sum", "squared_deviation_sum", "relative_error_sum", "negative_count", "above_two_count", "above_four_count", "unresolved_failures", "bounded_lower_saturation_count", "bounded_upper_saturation_count")
     if any(float(values[name]) < 0 for name in physical):
         raise ReportValidationError(f"{label} has negative physical metric")
-    if any(int(values[name]) > int(values["coefficient_count"]) for name in ("negative_count", "above_two_count", "bounded_lower_saturation_count", "bounded_upper_saturation_count")):
+    if any(int(values[name]) > int(values["coefficient_count"]) for name in ("negative_count", "above_two_count", "above_four_count", "bounded_lower_saturation_count", "bounded_upper_saturation_count")):
         raise ReportValidationError(f"{label} coefficient counts are invalid")
+    coefficient_count = int(values["coefficient_count"])
+    token_count = int(values["token_count"])
+    if (
+        int(values["l2_deviation_denominator"]) != coefficient_count
+        or int(values["cosine_defined_count"])
+        + int(values["cosine_undefined_count"])
+        != token_count
+        or int(values["gram_condition_defined_count"])
+        + int(values["gram_condition_undefined_count"])
+        != token_count
+        or sum(parsed_ranks.values()) != token_count
+    ):
+        raise ReportValidationError(f"{label} local metric schema counts are invalid")
+    expected = {
+        "coefficient_mean": float(values["coefficient_sum"]) / coefficient_count,
+        "coefficient_std": sqrt(
+            max(
+                float(values["coefficient_squared_sum"]) / coefficient_count
+                - (float(values["coefficient_sum"]) / coefficient_count) ** 2,
+                0.0,
+            )
+        ),
+        "negative_rate": int(values["negative_count"]) / coefficient_count,
+        "above_two_rate": int(values["above_two_count"]) / coefficient_count,
+        "above_four_rate": int(values["above_four_count"]) / coefficient_count,
+        "bounded_lower_saturation_rate": int(values["bounded_lower_saturation_count"]) / coefficient_count,
+        "bounded_upper_saturation_rate": int(values["bounded_upper_saturation_count"]) / coefficient_count,
+        "mean_absolute_deviation_from_one": float(values["absolute_deviation_sum"]) / coefficient_count,
+        "l2_deviation_from_one": sqrt(float(values["squared_deviation_sum"]) / coefficient_count),
+        "relative_error_mean": float(values["relative_error_sum"]) / token_count,
+    }
+    if int(values["cosine_defined_count"]):
+        expected["cosine_mean"] = float(values["cosine_sum"]) / int(
+            values["cosine_defined_count"]
+        )
+    if any(
+        not isclose(float(values[name]), target, rel_tol=1e-12, abs_tol=1e-15)
+        for name, target in expected.items()
+    ):
+        raise ReportValidationError(f"{label} local metric schema summary mismatch")
+    signed = [float(values[name]) for name in ("coefficient_p01", "coefficient_p05", "coefficient_median", "coefficient_p95", "coefficient_p99")]
+    relative = [float(values[name]) for name in ("relative_error_median", "relative_error_p90", "relative_error_p95", "relative_error_p99")]
+    if (
+        signed != sorted(signed)
+        or relative != sorted(relative)
+        or min(relative) < 0.0
+        or float(values["coefficient_p99_abs"]) < 0.0
+        or float(values["coefficient_max_abs"]) < float(values["coefficient_p99_abs"])
+    ):
+        raise ReportValidationError(f"{label} local metric schema quantiles are invalid")
+    if int(values["cosine_defined_count"]):
+        cosines = [float(values[name]) for name in ("cosine_median", "cosine_p90", "cosine_p95", "cosine_p99")]
+        if cosines != sorted(cosines) or any(not -1.000000000001 <= value <= 1.000000000001 for value in cosines):
+            raise ReportValidationError(f"{label} local metric schema cosine is invalid")
+    if int(values["gram_condition_defined_count"]):
+        conditions = [float(values[name]) for name in ("gram_condition_median", "gram_condition_p90", "gram_condition_p99", "gram_condition_max")]
+        if conditions != sorted(conditions) or min(conditions) < 0.0:
+            raise ReportValidationError(f"{label} local metric schema conditioning is invalid")
     return values
+
+
+def _validate_svd_verification(value: object, config: Phase1A5Config) -> None:
+    expected = {
+        *(f"sparse:K{k}:free_bound" for k in config.k_values),
+        "R8[free_bound]",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise ReportValidationError("SVD verification evidence is incomplete")
+    expected_layers = {str(layer): 16 for layer in range(24)}
+    for identity in expected:
+        record = value.get(identity)
+        maximum = record.get("max_relative_objective_error") if isinstance(record, Mapping) else None
+        if (
+            not isinstance(record, Mapping)
+            or record.get("identity") != identity
+            or record.get("sample_count") != 384
+            or record.get("sample_count_by_layer") != expected_layers
+            or record.get("rank_equal") is not True
+            or not isinstance(maximum, (int, float))
+            or isinstance(maximum, bool)
+            or not isfinite(float(maximum))
+            or not 0.0 <= float(maximum) <= 1e-9
+        ):
+            raise ReportValidationError("SVD verification evidence is invalid")
+
+
+def _validate_solver_record(
+    value: object, label: str, *, identifier: str, token_count: int
+) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ReportValidationError(f"{label} are invalid")
+    source_counts = value.get("solver_source_counts")
+    if not isinstance(source_counts, Mapping) or not source_counts:
+        raise ReportValidationError(f"{label} lack solver counts")
+    parsed_sources: dict[str, int] = {}
+    for source, count in source_counts.items():
+        parsed = _integer(count, f"{label} solver count")
+        if parsed < 0:
+            raise ReportValidationError(f"{label} solver counts are invalid")
+        parsed_sources[str(source)] = parsed
+    if sum(parsed_sources.values()) != token_count:
+        raise ReportValidationError(f"{label} solver counts are incomplete")
+    required = (
+        (
+            "bounded_failure_count",
+            "bounded_uncertified_count",
+            "bounded_certified_count",
+            "bounded_solver_candidate_count",
+            "bounded_coefficient_bound_violation_count",
+        )
+        if identifier == "bounded"
+        else (
+            "cholesky_fallback_count",
+            "degenerate_ridge_count",
+            "max_relative_system_residual",
+        )
+    )
+    for name in required:
+        item = value.get(name)
+        if (
+            not isinstance(item, (int, float))
+            or isinstance(item, bool)
+            or not isfinite(float(item))
+            or float(item) < 0.0
+        ):
+            raise ReportValidationError(f"{label} lack {name}")
+    return {str(name): item for name, item in value.items()}
 
 
 def _selection_conditions(selection: Mapping[str, Any], config: Phase1A5Config) -> dict[int, set[str]]:
@@ -280,6 +484,8 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
                 raise ReportValidationError("bounded engineering stop reason is missing")
         elif family == "bounded":
             raise ReportValidationError("bounded exclusion requires engineering stop")
+        if family == "free_bound":
+            _validate_svd_verification(evidence.get("svd_verification"), config)
 
     selection_path = root / "selection-manifest.json"
     expected_selection_hash = select.get("selection_manifest_sha256")
@@ -300,6 +506,7 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
     local_result = local.get("result")
     if not isinstance(local_result, Mapping) or local_result.get("complete") is not True or local_result.get("failed_batches") != 0:
         raise ReportValidationError("local failed batches")
+    _validate_svd_verification(local_result.get("svd_verification"), config)
     metrics = local_result.get("metrics")
     staged_metrics = local.get("selection_metrics")
     if not isinstance(metrics, Mapping) or not isinstance(staged_metrics, list):
@@ -323,6 +530,13 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
         local_rows.append({"k": k, "condition": identifier, "family": family, "rho": float(rho_value) if separator else None, "constraint": "[0,2]" if identifier == "bounded" else None, **parsed, "nmse": parsed["total_squared_error"] / parsed["total_d0_squared_norm"], "active_fraction": k / 8})
     if observed != {(k, identifier) for k in config.k_values for identifier in expected_ids}:
         raise ReportValidationError("missing local condition")
+    for row in local_rows:
+        k = int(row["k"])
+        if (
+            row["token_count"] != 24 * 100_000
+            or row["coefficient_count"] != k * int(row["token_count"])
+        ):
+            raise ReportValidationError("pooled local metric coverage is invalid")
     by_condition = {(int(row["k"]), str(row["condition"])): row for row in local_rows}
     gain_recovery_rows: list[dict[str, object]] = []
     for row in local_rows:
@@ -348,6 +562,49 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
         key = (int(row["k"]), str(row["condition"]))
         if persisted_metrics[key] != {name: row[name] for name in persisted_metrics[key]}:
             raise ReportValidationError("local metric reconciliation mismatch")
+    coefficient_quantiles = local_result.get("coefficient_quantiles")
+    if not isinstance(coefficient_quantiles, Mapping):
+        raise ReportValidationError("coefficient quantile evidence is missing")
+    observed_quantiles: set[tuple[int, str]] = set()
+    for key, value in coefficient_quantiles.items():
+        parsed = _key(key, "coefficient quantile")
+        if (
+            len(parsed) != 2
+            or not isinstance(parsed[0], int)
+            or not isinstance(parsed[1], str)
+            or not isinstance(value, Mapping)
+        ):
+            raise ReportValidationError("coefficient quantile evidence is invalid")
+        identity = (parsed[0], parsed[1])
+        if identity not in persisted_metrics:
+            raise ReportValidationError("coefficient quantile evidence is invalid")
+        quantiles = {
+            name: _finite(value.get(name), "coefficient quantile evidence")
+            for name in (
+                "p01",
+                "p05",
+                "median",
+                "p95",
+                "p99",
+                "p99_signed",
+                "max_abs",
+            )
+        }
+        metric = persisted_metrics[identity]
+        expected_quantiles = {
+            "p01": metric["coefficient_p01"],
+            "p05": metric["coefficient_p05"],
+            "median": metric["coefficient_median"],
+            "p95": metric["coefficient_p95"],
+            "p99": metric["coefficient_p99_abs"],
+            "p99_signed": metric["coefficient_p99"],
+            "max_abs": metric["coefficient_max_abs"],
+        }
+        if any(quantiles[name] != expected_quantiles[name] for name in quantiles):
+            raise ReportValidationError("coefficient quantile evidence mismatch")
+        observed_quantiles.add(identity)
+    if observed_quantiles != observed:
+        raise ReportValidationError("coefficient quantile evidence is incomplete")
     for k, values in selected.items():
         if any((k, identifier) not in observed for identifier in values):
             raise ReportValidationError("selected condition is absent from local metrics")
@@ -358,27 +615,109 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
     if not isinstance(layer_metrics, Mapping):
         raise ReportValidationError("layer coverage is missing")
     observed_layers: set[int] = set()
+    observed_layer_keys: set[tuple[int, int, str]] = set()
     layer_rows: list[dict[str, object]] = []
     for key, value in layer_metrics.items():
         parsed = _key(key, "layer metric")
-        if len(parsed) != 3 or not isinstance(parsed[0], int):
+        if (
+            len(parsed) != 3
+            or not isinstance(parsed[0], int)
+            or not isinstance(parsed[1], int)
+            or not isinstance(parsed[2], str)
+        ):
             raise ReportValidationError("layer coverage is invalid")
         metric = _metric(value, "layer metric")
         observed_layers.add(parsed[0])
-        layer_rows.append({"layer": parsed[0], "k": parsed[1], "condition": parsed[2], "nmse": metric["total_squared_error"] / metric["total_d0_squared_norm"]})
-    if observed_layers != set(range(24)):
+        identity = (parsed[0], parsed[1], parsed[2])
+        observed_layer_keys.add(identity)
+        if (
+            metric["token_count"] != 100_000
+            or metric["coefficient_count"]
+            != parsed[1] * int(metric["token_count"])
+        ):
+            raise ReportValidationError("layer metric coverage is invalid")
+        layer_rows.append({"layer": parsed[0], "k": parsed[1], "condition": parsed[2], "nmse": metric["total_squared_error"] / metric["total_d0_squared_norm"], **metric})
+    expected_layer_keys = {
+        (layer, k, identifier)
+        for layer in range(24)
+        for k in config.k_values
+        for identifier in expected_ids
+    }
+    if observed_layers != set(range(24)) or observed_layer_keys != expected_layer_keys:
         raise ReportValidationError("layer coverage is incomplete")
     solver = local_result.get("solver_diagnostics")
     if not isinstance(solver, Mapping):
         raise ReportValidationError("solver diagnostics are missing")
     solver_rows: list[dict[str, object]] = []
+    observed_solver: set[tuple[int, str]] = set()
     for key, value in solver.items():
         parsed = _key(key, "solver diagnostic")
-        if not isinstance(value, Mapping):
+        if (
+            len(parsed) != 2
+            or not isinstance(parsed[0], int)
+            or not isinstance(parsed[1], str)
+            or (parsed[0], parsed[1]) not in observed
+        ):
             raise ReportValidationError("solver diagnostics are invalid")
-        if len(parsed) == 2 and parsed[1] == "bounded" and (value.get("bounded_failure_count", 0) != 0 or value.get("bounded_uncertified_count", 0) != 0):
+        identity = (parsed[0], parsed[1])
+        metric = persisted_metrics[identity]
+        record = _validate_solver_record(
+            value,
+            "solver diagnostics",
+            identifier=parsed[1],
+            token_count=int(metric["token_count"]),
+        )
+        observed_solver.add(identity)
+        if parsed[1] == "bounded" and (record.get("bounded_failure_count", 0) != 0 or record.get("bounded_uncertified_count", 0) != 0):
             raise ReportValidationError("bounded KKT evidence is invalid")
-        solver_rows.append({"key": key, **{str(k): v for k, v in value.items()}})
+    if observed_solver != observed:
+        raise ReportValidationError("solver diagnostics are incomplete")
+    layer_solver = local_result.get("layer_solver_diagnostics")
+    if not isinstance(layer_solver, Mapping):
+        raise ReportValidationError("layer solver diagnostics are missing")
+    observed_layer_solver: set[tuple[int, int, str]] = set()
+    for key, value in layer_solver.items():
+        parsed = _key(key, "layer solver diagnostic")
+        if (
+            len(parsed) != 3
+            or not isinstance(parsed[0], int)
+            or not isinstance(parsed[1], int)
+            or not isinstance(parsed[2], str)
+        ):
+            raise ReportValidationError("layer solver diagnostics are invalid")
+        identity = (parsed[0], parsed[1], parsed[2])
+        if identity not in observed_layer_keys:
+            raise ReportValidationError("layer solver diagnostics are invalid")
+        layer_metric = next(
+            row
+            for row in layer_rows
+            if (row["layer"], row["k"], row["condition"]) == identity
+        )
+        _validate_solver_record(
+            value,
+            "layer solver diagnostics",
+            identifier=parsed[2],
+            token_count=int(layer_metric["token_count"]),
+        )
+        observed_layer_solver.add(identity)
+    if observed_layer_solver != observed_layer_keys:
+        raise ReportValidationError("layer solver diagnostics are incomplete")
+    rank_condition_rows = [
+        {
+            "scope": "pooled",
+            "k": row["k"],
+            "condition": row["condition"],
+            "effective_rank_counts": row["effective_rank_counts"],
+            "gram_condition_median": row["gram_condition_median"],
+            "gram_condition_p90": row["gram_condition_p90"],
+            "gram_condition_p99": row["gram_condition_p99"],
+            "gram_condition_max": row["gram_condition_max"],
+            "gram_condition_undefined_count": row[
+                "gram_condition_undefined_count"
+            ],
+        }
+        for row in local_rows
+    ]
 
     expected_rollout = set() if selection_stopped else {f"{corpus}:k{k}:{condition}" for corpus in ("wikitext", "fineweb_heldout") for k, conditions in selected.items() for condition in conditions}
     results = {} if rollout is None else rollout.get("results")
@@ -450,11 +789,66 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
     plot_source = root / "plot-source"
     sources = {
         "local-metrics.json": local_rows,
-        "coefficient-distributions.json": [{key: row[key] for key in ("k", "condition", "coefficient_count", "negative_count", "above_two_count", "bounded_lower_saturation_count", "bounded_upper_saturation_count")} for row in local_rows],
-        "bound-saturation.json": [{key: row[key] for key in ("k", "condition", "bounded_lower_saturation_count", "bounded_upper_saturation_count")} for row in local_rows],
-        "coefficient-distortion-gain.json": [{"k": row["k"], "condition": row["condition"], "coefficient_distortion": row["absolute_deviation_sum"], "gain_recovery": next(item["gain_recovery"] for item in gain_recovery_rows if item["k"] == row["k"] and item["condition"] == row["condition"])} for row in local_rows],
+        "coefficient-distributions.json": [
+            {
+                key: row[key]
+                for key in (
+                    "k",
+                    "condition",
+                    "coefficient_count",
+                    "coefficient_mean",
+                    "coefficient_std",
+                    "coefficient_p01",
+                    "coefficient_p05",
+                    "coefficient_median",
+                    "coefficient_p95",
+                    "coefficient_p99",
+                    "coefficient_p99_abs",
+                    "coefficient_max_abs",
+                    "negative_count",
+                    "negative_rate",
+                    "above_two_count",
+                    "above_two_rate",
+                    "above_four_count",
+                    "above_four_rate",
+                )
+            }
+            for row in local_rows
+        ],
+        "bound-saturation.json": [
+            {
+                key: row[key]
+                for key in (
+                    "k",
+                    "condition",
+                    "bounded_lower_saturation_count",
+                    "bounded_lower_saturation_rate",
+                    "bounded_upper_saturation_count",
+                    "bounded_upper_saturation_rate",
+                )
+            }
+            for row in local_rows
+        ],
+        "coefficient-distortion-gain.json": [
+            {
+                "k": row["k"],
+                "condition": row["condition"],
+                "mean_absolute_deviation_from_one": row[
+                    "mean_absolute_deviation_from_one"
+                ],
+                "l2_deviation_from_one": row["l2_deviation_from_one"],
+                "l2_deviation_denominator": row["l2_deviation_denominator"],
+                "gain_recovery": next(
+                    item["gain_recovery"]
+                    for item in gain_recovery_rows
+                    if item["k"] == row["k"]
+                    and item["condition"] == row["condition"]
+                ),
+            }
+            for row in local_rows
+        ],
         "gain-recovery.json": gain_recovery_rows,
-        "rank-conditioning.json": solver_rows,
+        "rank-conditioning.json": rank_condition_rows,
         "layer-improvements.json": layer_rows,
         "subset-stability.json": stability_rows,
         "reference-distances.json": reference_rows,
@@ -488,7 +882,7 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
         ("03-evaluation-ppl.png", "Evaluation PPL", evaluation_rows, "k", "ppl"),
         ("04-coefficient-distributions.png", "Coefficient above-two rate", local_rows, "active_fraction", "above_two_count"),
         ("05-coefficient-distortion-gain.png", "Coefficient distortion versus gain", local_rows, "absolute_deviation_sum", "nmse"),
-        ("06-rank-conditioning-gain.png", "Rank and conditioning diagnostics", solver_rows, "effective_rank_sum", "condition_max"),
+        ("06-rank-conditioning-gain.png", "Winning-subset Gram conditioning", rank_condition_rows, "k", "gram_condition_max"),
         ("07-layer-improvements.png", "Layerwise local NMSE", layer_rows, "layer", "nmse"),
         ("08-reference-distances.png", "D0/E8/R8 reference distances", reference_rows, "token_count", "squared_error_sum"),
         ("09-subset-stability.png", "Cross-condition subset Jaccard", stability_rows, "token_count", "jaccard"),
@@ -507,6 +901,10 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
         "The Registered Free-Reconstruction Candidate Bound is a registered candidate bound, not an exact-span optimum.",
         "This report makes no claim of an exact-span optimum, a trained router, or an inference speedup.",
         "Gain recovery is analysis-only and never affects eligibility.",
+        (
+            f"Cosine quantiles exclude {sum(int(row['cosine_undefined_count']) for row in local_rows)} "
+            "undefined cosine samples caused by zero-vector denominators."
+        ),
     ]
     if isinstance(bounded_stop_reason, str):
         report_lines.append(f"Bounded engineering stop: {bounded_stop_reason}.")

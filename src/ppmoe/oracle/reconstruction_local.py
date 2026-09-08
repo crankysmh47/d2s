@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
-from math import ceil, isfinite
+from math import ceil, isfinite, sqrt
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
@@ -17,9 +17,11 @@ from ppmoe.evaluation.perplexity import EvaluationBatch
 from ppmoe.moefication.qwen35 import PartitionedQwen35MLP
 from ppmoe.oracle.reconstruction import (
     ReconstructionCondition,
+    ReconstructionResult,
     SolverSettings,
     score_full_reference,
     score_reconstruction,
+    verify_pseudoinverse_svd,
 )
 from ppmoe.provenance import atomic_write_json
 
@@ -43,6 +45,102 @@ class ConditionMetrics:
     bounded_lower_saturation_count: int
     bounded_upper_saturation_count: int
     finite: bool
+    coefficient_sum: float = 0.0
+    coefficient_squared_sum: float = 0.0
+    above_four_count: int = 0
+    squared_deviation_sum: float = 0.0
+    relative_error_sum: float = 0.0
+    cosine_sum: float = 0.0
+    cosine_defined_count: int = 0
+    cosine_undefined_count: int = 0
+    gram_condition_defined_count: int = 0
+    gram_condition_undefined_count: int = 0
+    coefficient_mean: float | None = None
+    coefficient_std: float | None = None
+    coefficient_p01: float | None = None
+    coefficient_p05: float | None = None
+    coefficient_median: float | None = None
+    coefficient_p95: float | None = None
+    coefficient_p99: float | None = None
+    coefficient_p99_abs: float | None = None
+    coefficient_max_abs: float | None = None
+    negative_rate: float | None = None
+    above_two_rate: float | None = None
+    above_four_rate: float | None = None
+    bounded_lower_saturation_rate: float | None = None
+    bounded_upper_saturation_rate: float | None = None
+    mean_absolute_deviation_from_one: float | None = None
+    l2_deviation_from_one: float | None = None
+    l2_deviation_denominator: int = 0
+    relative_error_mean: float | None = None
+    relative_error_median: float | None = None
+    relative_error_p90: float | None = None
+    relative_error_p95: float | None = None
+    relative_error_p99: float | None = None
+    cosine_mean: float | None = None
+    cosine_median: float | None = None
+    cosine_p90: float | None = None
+    cosine_p95: float | None = None
+    cosine_p99: float | None = None
+    gram_condition_median: float | None = None
+    gram_condition_p90: float | None = None
+    gram_condition_p99: float | None = None
+    gram_condition_max: float | None = None
+    effective_rank_counts: Mapping[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        coefficient_count = self.coefficient_count
+        defaults = {
+            "coefficient_mean": self.coefficient_sum / coefficient_count
+            if coefficient_count
+            else 0.0,
+            "coefficient_std": sqrt(
+                max(
+                    self.coefficient_squared_sum / coefficient_count
+                    - (self.coefficient_sum / coefficient_count) ** 2,
+                    0.0,
+                )
+            )
+            if coefficient_count
+            else 0.0,
+            "negative_rate": self.negative_count / coefficient_count
+            if coefficient_count
+            else 0.0,
+            "above_two_rate": self.above_two_count / coefficient_count
+            if coefficient_count
+            else 0.0,
+            "above_four_rate": self.above_four_count / coefficient_count
+            if coefficient_count
+            else 0.0,
+            "bounded_lower_saturation_rate": self.bounded_lower_saturation_count
+            / coefficient_count
+            if coefficient_count
+            else 0.0,
+            "bounded_upper_saturation_rate": self.bounded_upper_saturation_count
+            / coefficient_count
+            if coefficient_count
+            else 0.0,
+            "mean_absolute_deviation_from_one": self.absolute_deviation_sum
+            / coefficient_count
+            if coefficient_count
+            else 0.0,
+            "l2_deviation_from_one": sqrt(
+                self.squared_deviation_sum / coefficient_count
+            )
+            if coefficient_count
+            else 0.0,
+            "relative_error_mean": self.relative_error_sum / self.token_count
+            if self.token_count
+            else 0.0,
+            "cosine_mean": self.cosine_sum / self.cosine_defined_count
+            if self.cosine_defined_count
+            else None,
+        }
+        for name, value in defaults.items():
+            if getattr(self, name) is None:
+                object.__setattr__(self, name, value)
+        if self.l2_deviation_denominator == 0 and coefficient_count:
+            object.__setattr__(self, "l2_deviation_denominator", coefficient_count)
 
     @property
     def aggregate_nmse(self) -> float:
@@ -50,29 +148,15 @@ class ConditionMetrics:
             return 0.0 if self.total_squared_error == 0.0 else float("inf")
         return self.total_squared_error / self.total_d0_squared_norm
 
-    @property
-    def negative_rate(self) -> float:
-        return (
-            self.negative_count / self.coefficient_count
-            if self.coefficient_count
-            else 0.0
-        )
 
-    @property
-    def above_two_rate(self) -> float:
-        return (
-            self.above_two_count / self.coefficient_count
-            if self.coefficient_count
-            else 0.0
-        )
 
-    @property
-    def mean_absolute_deviation_from_one(self) -> float:
-        return (
-            self.absolute_deviation_sum / self.coefficient_count
-            if self.coefficient_count
-            else 0.0
-        )
+@dataclass(frozen=True, slots=True)
+class SVDVerificationEvidence:
+    identity: str
+    sample_count: int
+    sample_count_by_layer: Mapping[int, int]
+    rank_equal: bool
+    max_relative_objective_error: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +205,12 @@ class ReconstructionLocalResult:
     run_signature: str
     source_hashes: Mapping[str, str]
     subset_stability: Mapping[tuple[int, str, str], SubsetJaccard] = field(
+        default_factory=dict
+    )
+    layer_solver_diagnostics: Mapping[
+        tuple[int, int, str], Mapping[str, object]
+    ] = field(default_factory=dict)
+    svd_verification: Mapping[str, SVDVerificationEvidence] = field(
         default_factory=dict
     )
 
@@ -193,11 +283,11 @@ class ReconstructionLocalAccumulator:
         self.completed_batches: set[int] = set()
         self.failures: dict[int, str] = {}
         self._metrics = {
-            key: [0, 0.0, 0.0, 0, 0, 0, 0.0, 0, 0, 0, True]
+            key: self._empty_metric_state()
             for key in self._condition_keys
         }
         self._layer_metrics = {
-            (layer, *key): [0, 0.0, 0.0, 0, 0, 0, 0.0, 0, 0, 0, True]
+            (layer, *key): self._empty_metric_state()
             for layer in range(num_layers)
             for key in self._condition_keys
         }
@@ -214,6 +304,11 @@ class ReconstructionLocalAccumulator:
         self._solver: dict[tuple[int, str], dict[str, object]] = {
             key: {} for key in self._condition_keys
         }
+        self._layer_solver: dict[tuple[int, int, str], dict[str, object]] = {
+            (layer, *key): {}
+            for layer in range(num_layers)
+            for key in self._condition_keys
+        }
         self._references: dict[tuple[int, str, str], list[float | int]] = {}
         self._reference_solver: dict[tuple[int, str], dict[str, object]] = {}
         self._subset_stability = {
@@ -222,11 +317,72 @@ class ReconstructionLocalAccumulator:
             for index, left in enumerate(sorted(condition_id(value) for value in values))
             for right in sorted(condition_id(value) for value in values)[index + 1 :]
         }
-        self._pending_coefficients: dict[tuple[int, str], list[float]] = {
-            key: [] for key in self._condition_keys
+        self._pending_distributions: dict[
+            tuple[int, str], dict[int, dict[str, list[float]]]
+        ] = {
+            key: {} for key in self._condition_keys
+        }
+        self._svd_verification: dict[str, dict[str, object]] = {
+            **{
+                f"sparse:K{k}:free_bound": {
+                    "identity": f"sparse:K{k}:free_bound",
+                    "sample_count": 0,
+                    "sample_count_by_layer": {layer: 0 for layer in range(num_layers)},
+                    "rank_equal": True,
+                    "max_relative_objective_error": 0.0,
+                }
+                for k in sorted(self.conditions)
+                if any(value.family == "free_bound" for value in self.conditions[k])
+            },
+            **(
+                {
+                    "R8[free_bound]": {
+                        "identity": "R8[free_bound]",
+                        "sample_count": 0,
+                        "sample_count_by_layer": {
+                            layer: 0 for layer in range(num_layers)
+                        },
+                        "rank_equal": True,
+                        "max_relative_objective_error": 0.0,
+                    }
+                }
+                if any(
+                    value.family == "free_bound"
+                    for values in self.conditions.values()
+                    for value in values
+                )
+                else {}
+            ),
         }
         self._transaction_snapshot: tuple[object, ...] | None = None
         self._load()
+
+    @staticmethod
+    def _empty_metric_state() -> list[object]:
+        return [
+            0,
+            0.0,
+            0.0,
+            0,
+            0,
+            0,
+            0.0,
+            0,
+            0,
+            0,
+            True,
+            0.0,
+            0.0,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            0,
+            0,
+            0,
+            {},
+        ]
 
     @property
     def _state_path(self) -> Path | None:
@@ -270,6 +426,9 @@ class ReconstructionLocalAccumulator:
             self._layer_metrics[key] = list(
                 state["layer_metrics"][self._layer_key(key)]
             )
+            self._layer_solver[key] = dict(
+                state.get("layer_solver", {}).get(self._layer_key(key), {})
+            )
             self._selection[key] = list(state["selection"][self._layer_key(key)])
             self._co_selection[key] = [
                 list(row) for row in state["co_selection"][self._layer_key(key)]
@@ -293,6 +452,40 @@ class ReconstructionLocalAccumulator:
             self._subset_stability[key] = list(
                 state.get("subset_stability", {})["|".join(map(str, key))]
             )
+        persisted_svd = state.get("svd_verification", {})
+        if not isinstance(persisted_svd, Mapping):
+            raise ValueError("reconstruction local SVD checkpoint is malformed")
+        for identity in self._svd_verification:
+            value = persisted_svd.get(identity)
+            if not isinstance(value, Mapping):
+                raise ValueError("reconstruction local SVD checkpoint is incomplete")
+            by_layer = value.get("sample_count_by_layer")
+            if not isinstance(by_layer, Mapping):
+                raise ValueError("reconstruction local SVD layer coverage is malformed")
+            parsed_by_layer = {
+                int(layer): int(count) for layer, count in by_layer.items()
+            }
+            sample_count = int(value.get("sample_count", -1))
+            maximum = float(
+                value.get("max_relative_objective_error", float("nan"))
+            )
+            if (
+                value.get("identity") != identity
+                or set(parsed_by_layer) != set(range(self.num_layers))
+                or any(not 0 <= count <= 16 for count in parsed_by_layer.values())
+                or sample_count != sum(parsed_by_layer.values())
+                or value.get("rank_equal") is not True
+                or not isfinite(maximum)
+                or not 0.0 <= maximum <= self.solver_settings.objective_tolerance
+            ):
+                raise ValueError("reconstruction local SVD checkpoint is invalid")
+            self._svd_verification[identity] = {
+                "identity": str(value.get("identity")),
+                "sample_count": sample_count,
+                "sample_count_by_layer": parsed_by_layer,
+                "rank_equal": bool(value.get("rank_equal")),
+                "max_relative_objective_error": maximum,
+            }
 
     def _persist(self) -> None:
         path = self._state_path
@@ -327,6 +520,10 @@ class ReconstructionLocalAccumulator:
                 "solver": {
                     self._key(key): value for key, value in self._solver.items()
                 },
+                "layer_solver": {
+                    self._layer_key(key): value
+                    for key, value in self._layer_solver.items()
+                },
                 "references": {
                     "|".join(map(str, key)): value
                     for key, value in self._references.items()
@@ -339,6 +536,7 @@ class ReconstructionLocalAccumulator:
                     "|".join(map(str, key)): value
                     for key, value in self._subset_stability.items()
                 },
+                "svd_verification": self._svd_verification,
             },
         )
 
@@ -350,10 +548,12 @@ class ReconstructionLocalAccumulator:
                 self._selection,
                 self._co_selection,
                 self._solver,
+                self._layer_solver,
                 self._references,
                 self._reference_solver,
                 self._subset_stability,
-                self._pending_coefficients,
+                self._pending_distributions,
+                self._svd_verification,
                 self.completed_batches,
                 self.failures,
             )
@@ -366,37 +566,206 @@ class ReconstructionLocalAccumulator:
             self._selection,
             self._co_selection,
             self._solver,
+            self._layer_solver,
             self._references,
             self._reference_solver,
             self._subset_stability,
-            self._pending_coefficients,
+            self._pending_distributions,
+            self._svd_verification,
             self.completed_batches,
             self.failures,
         ) = snapshot
         self._transaction_snapshot = None
 
     @staticmethod
+    def _slice_result(result: ReconstructionResult, count: int) -> ReconstructionResult:
+        token_count = result.subsets.shape[0]
+        diagnostics = {
+            name: value[:count]
+            if isinstance(value, Tensor)
+            and value.ndim > 0
+            and value.shape[0] == token_count
+            else value
+            for name, value in result.diagnostics.items()
+        }
+        return replace(
+            result,
+            subsets=result.subsets[:count],
+            coefficients=result.coefficients[:count],
+            squared_error=result.squared_error[:count],
+            effective_rank=result.effective_rank[:count]
+            if result.effective_rank is not None
+            else None,
+            solver_source=result.solver_source[:count],
+            diagnostics=diagnostics,
+        )
+
+    def _verify_pseudoinverse_sample(
+        self,
+        identity: str,
+        layer: int,
+        target: Tensor,
+        experts: Tensor,
+        result: ReconstructionResult,
+    ) -> None:
+        record = self._svd_verification[identity]
+        by_layer = record["sample_count_by_layer"]
+        assert isinstance(by_layer, dict)
+        checked = int(by_layer[layer])
+        count = min(16 - checked, target.shape[0])
+        if count <= 0:
+            return
+        sampled_result = self._slice_result(result, count)
+        verification = verify_pseudoinverse_svd(
+            target[:count], experts[:count], sampled_result, self.solver_settings
+        )
+        rank_equal = verification.get("rank_equal") is True
+        maximum = verification.get("max_relative_objective_error")
+        if (
+            not rank_equal
+            or not isinstance(maximum, (int, float))
+            or isinstance(maximum, bool)
+            or not isfinite(float(maximum))
+            or float(maximum) > self.solver_settings.objective_tolerance
+        ):
+            raise FloatingPointError(
+                f"{identity} pseudoinverse and direct SVD verification disagree"
+            )
+        record["sample_count"] = int(record["sample_count"]) + count
+        by_layer[layer] = checked + count
+        record["rank_equal"] = bool(record["rank_equal"]) and rank_equal
+        record["max_relative_objective_error"] = max(
+            float(record["max_relative_objective_error"]), float(maximum)
+        )
+
+    def _winning_subset_diagnostics(
+        self, expert_outputs: Tensor, result: ReconstructionResult
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        rows = torch.arange(expert_outputs.shape[0], device=expert_outputs.device)
+        selected = expert_outputs.double()[rows[:, None], result.subsets]
+        gram = torch.einsum("tkh,tlh->tkl", selected, selected)
+        eigenvalues = torch.linalg.eigvalsh(gram)
+        maximum = eigenvalues[:, -1].clamp_min(0.0)
+        keep = (maximum > 0.0)[:, None] & (
+            eigenvalues > self.solver_settings.tau_g * maximum[:, None]
+        )
+        ranks = keep.sum(dim=-1)
+        minimum = torch.where(
+            keep, eigenvalues, torch.full_like(eigenvalues, float("inf"))
+        ).min(dim=-1).values
+        defined = ranks > 0
+        condition = maximum[defined] / minimum[defined]
+        if not bool(torch.isfinite(condition).all()):
+            raise FloatingPointError("winning-subset Gram conditioning is non-finite")
+        if result.effective_rank is not None and not torch.equal(
+            ranks, result.effective_rank.to(device=ranks.device, dtype=ranks.dtype)
+        ):
+            raise FloatingPointError("winning-subset effective rank is inconsistent")
+        return ranks, condition, defined
+
+    @staticmethod
+    def _distribution_bucket(
+        pending: dict[int, dict[str, list[float]]], layer: int
+    ) -> dict[str, list[float]]:
+        return pending.setdefault(
+            layer,
+            {
+                "coefficients": [],
+                "coefficient_abs": [],
+                "relative_error": [],
+                "cosine": [],
+                "gram_condition": [],
+            },
+        )
+
     def _add_metric(
-        values: list[float | int | bool], target_norm: float, result: object
+        self,
+        values: list[object],
+        layer: int,
+        d0: Tensor,
+        expert_outputs: Tensor,
+        result: ReconstructionResult,
+        pending: dict[int, dict[str, list[float]]],
+        *,
+        record_distribution: bool = True,
     ) -> None:
         coefficients = result.coefficients.detach().double().cpu()
         squared_error = float(result.squared_error.detach().double().sum().item())
         values[0] += int(result.squared_error.numel())
         values[1] += squared_error
-        values[2] += target_norm
+        target64 = d0.detach().double()
+        target_norm_by_token = target64.square().sum(dim=-1)
+        values[2] += float(target_norm_by_token.sum().item())
         values[3] += int(coefficients.numel())
         values[4] += int((coefficients < 0).sum().item())
         values[5] += int((coefficients.abs() > 2).sum().item())
         values[6] += float((coefficients - 1).abs().sum().item())
+        values[11] += float(coefficients.sum().item())
+        values[12] += float(coefficients.square().sum().item())
+        values[13] += int((coefficients.abs() > 4).sum().item())
+        values[14] += float((coefficients - 1).square().sum().item())
         diagnostics = result.diagnostics
         values[7] += int(diagnostics.get("bounded_failure_count", 0))
-        values[8] += int(diagnostics.get("bounded_lower_saturation_count", 0))
-        values[9] += int(diagnostics.get("bounded_upper_saturation_count", 0))
+        bounded = "bounded_lower_saturation_count" in diagnostics
+        lower = int((coefficients < 1e-6).sum().item()) if bounded else 0
+        upper = int((coefficients > 2.0 - 1e-6).sum().item()) if bounded else 0
+        if bounded and int(diagnostics["bounded_lower_saturation_count"]) != lower:
+            raise FloatingPointError("bounded lower-saturation diagnostic mismatch")
+        if bounded and int(diagnostics["bounded_upper_saturation_count"]) != upper:
+            raise FloatingPointError("bounded upper-saturation diagnostic mismatch")
+        values[8] += lower
+        values[9] += upper
         values[10] = (
             bool(values[10])
             and bool(torch.isfinite(result.squared_error).all())
             and bool(torch.isfinite(result.coefficients).all())
         )
+        rows = torch.arange(d0.shape[0], device=d0.device)
+        selected = expert_outputs.double()[rows[:, None], result.subsets]
+        reconstruction = torch.einsum(
+            "tk,tkh->th", result.coefficients.double(), selected
+        )
+        materialized_error = (reconstruction - target64).square().sum(dim=-1)
+        tolerance = self.solver_settings.objective_tolerance * target_norm_by_token.clamp_min(1.0)
+        if bool((materialized_error - result.squared_error.double()).abs().gt(tolerance).any()):
+            raise FloatingPointError("stored reconstruction loss is not materialized loss")
+        relative_error = torch.sqrt(
+            materialized_error / target_norm_by_token.clamp_min(torch.finfo(torch.float64).eps)
+        )
+        reconstruction_norm = reconstruction.square().sum(dim=-1)
+        cosine_defined = (target_norm_by_token > 0.0) & (reconstruction_norm > 0.0)
+        cosine = (
+            (target64[cosine_defined] * reconstruction[cosine_defined]).sum(dim=-1)
+            / torch.sqrt(
+                target_norm_by_token[cosine_defined]
+                * reconstruction_norm[cosine_defined]
+            )
+        )
+        ranks, gram_condition, gram_defined = self._winning_subset_diagnostics(
+            expert_outputs, result
+        )
+        if not bool(torch.isfinite(relative_error).all()) or not bool(
+            torch.isfinite(cosine).all()
+        ):
+            raise FloatingPointError("per-token reconstruction metrics are non-finite")
+        values[15] += float(relative_error.sum().item())
+        values[16] += float(cosine.sum().item())
+        values[17] += int(cosine.numel())
+        values[18] += int((~cosine_defined).sum().item())
+        values[19] += int(gram_condition.numel())
+        values[20] += int((~gram_defined).sum().item())
+        rank_counts = values[21]
+        assert isinstance(rank_counts, dict)
+        for rank in ranks.detach().cpu().tolist():
+            label = str(int(rank))
+            rank_counts[label] = int(rank_counts.get(label, 0)) + 1
+        if record_distribution:
+            bucket = self._distribution_bucket(pending, layer)
+            bucket["coefficients"].extend(coefficients.reshape(-1).tolist())
+            bucket["coefficient_abs"].extend(coefficients.abs().reshape(-1).tolist())
+            bucket["relative_error"].extend(relative_error.detach().cpu().tolist())
+            bucket["cosine"].extend(cosine.detach().cpu().tolist())
+            bucket["gram_condition"].extend(gram_condition.detach().cpu().tolist())
 
     def _add_reference(
         self, layer: int, left_name: str, left: Tensor, right_name: str, right: Tensor
@@ -437,6 +806,8 @@ class ReconstructionLocalAccumulator:
         assert isinstance(summary, dict)
         values = value.detach().double().reshape(-1)
         finite = values[torch.isfinite(values)]
+        if finite.numel() != values.numel():
+            raise FloatingPointError(f"solver diagnostic {name} is non-finite")
         summary["element_count"] = int(summary["element_count"]) + int(values.numel())
         summary["finite_count"] = int(summary["finite_count"]) + int(finite.numel())
         if finite.numel():
@@ -477,8 +848,12 @@ class ReconstructionLocalAccumulator:
                     raise RuntimeError(
                         f"solver diagnostic sequence {name} changed within a run"
                     )
-            elif isinstance(value, (int, float)) and isfinite(float(value)):
-                if name.startswith("max_"):
+            elif isinstance(value, (int, float)):
+                if not isfinite(float(value)):
+                    raise FloatingPointError(
+                        f"solver diagnostic {name} is non-finite"
+                    )
+                if name.startswith("max_") or "_max_" in name:
                     diagnostics[name] = max(
                         float(diagnostics.get(name, value)), float(value)
                     )
@@ -488,6 +863,8 @@ class ReconstructionLocalAccumulator:
                         raise RuntimeError(
                             f"solver diagnostic {name} changed within a run"
                         )
+                elif name.endswith("_count") and isinstance(value, int):
+                    diagnostics[name] = int(diagnostics.get(name, 0)) + value
                 else:
                     diagnostics[name] = float(diagnostics.get(name, 0)) + float(value)
 
@@ -509,7 +886,6 @@ class ReconstructionLocalAccumulator:
             return
         if self._transaction_snapshot is None:
             self._transaction_snapshot = self.snapshot()
-        target_norm = float(d0.detach().double().square().sum().item())
         e8 = expert_outputs.sum(dim=1)
         self._add_reference(layer, "D0", d0, "E8", e8)
         unique_conditions = {
@@ -521,6 +897,14 @@ class ReconstructionLocalAccumulator:
             r8_result = score_full_reference(
                 d0.double(), expert_outputs.double(), condition, self.solver_settings
             )
+            if condition.family == "free_bound":
+                self._verify_pseudoinverse_sample(
+                    "R8[free_bound]",
+                    layer,
+                    d0.double(),
+                    expert_outputs.double(),
+                    r8_result,
+                )
             selected_experts = expert_outputs.double()[
                 torch.arange(d0.shape[0], device=d0.device)[:, None],
                 r8_result.subsets,
@@ -541,18 +925,31 @@ class ReconstructionLocalAccumulator:
                 result = score_reconstruction(
                     d0, expert_outputs, k, condition, self.solver_settings
                 )
-                metric_key = (layer, *key)
-                self._add_metric(self._metrics[key], target_norm, result)
-                self._add_metric(self._layer_metrics[metric_key], target_norm, result)
-                self._pending_coefficients[key].extend(
-                    sorted(
-                        float(value)
-                        for value in result.coefficients.detach()
-                        .double()
-                        .cpu()
-                        .reshape(-1)
-                        .tolist()
+                if condition.family == "free_bound":
+                    self._verify_pseudoinverse_sample(
+                        f"sparse:K{k}:free_bound",
+                        layer,
+                        d0,
+                        expert_outputs,
+                        result,
                     )
+                metric_key = (layer, *key)
+                self._add_metric(
+                    self._metrics[key],
+                    layer,
+                    d0,
+                    expert_outputs,
+                    result,
+                    self._pending_distributions[key],
+                )
+                self._add_metric(
+                    self._layer_metrics[metric_key],
+                    layer,
+                    d0,
+                    expert_outputs,
+                    result,
+                    self._pending_distributions[key],
+                    record_distribution=False,
                 )
                 selection = (
                     torch.bincount(
@@ -578,6 +975,9 @@ class ReconstructionLocalAccumulator:
                             co_selection[first][second]
                         )
                 self._accumulate_solver_diagnostics(key, result)
+                self._accumulate_result_diagnostics(
+                    self._layer_solver[metric_key], result
+                )
                 subsets_by_condition[condition_id(condition)] = result.subsets.detach()
             identifiers = sorted(subsets_by_condition)
             for index, left_name in enumerate(identifiers):
@@ -618,9 +1018,19 @@ class ReconstructionLocalAccumulator:
                 for key, path in zip(self._condition_keys, chunk_paths, strict=True):
                     atomic_write_json(
                         path,
-                        {"coefficients": sorted(self._pending_coefficients[key])},
+                        {
+                            "layers": {
+                                str(layer): {
+                                    name: sorted(values)
+                                    for name, values in distributions.items()
+                                }
+                                for layer, distributions in sorted(
+                                    self._pending_distributions[key].items()
+                                )
+                            }
+                        },
                     )
-            self._pending_coefficients = {key: [] for key in self._condition_keys}
+            self._pending_distributions = {key: {} for key in self._condition_keys}
             self.completed_batches.add(batch_index)
             self._persist()
         except Exception:
@@ -641,39 +1051,70 @@ class ReconstructionLocalAccumulator:
             self.restore(snapshot)
             raise
 
-    def _quantiles(self, key: tuple[int, str]) -> Mapping[str, float]:
+    def _distribution_values(
+        self, key: tuple[int, str], name: str, layer: int | None = None
+    ) -> list[float]:
         if not self.checkpoint_dir or not self.completed_batches:
-            return {}
+            return []
         values: list[float] = []
         for batch in sorted(self.completed_batches):
             path = self._chunk_path(key, batch)
             if not path.exists():
                 raise RuntimeError("completed batch is missing its coefficient chunk")
-            values.extend(
-                float(value)
-                for value in json.loads(path.read_text(encoding="utf-8"))[
-                    "coefficients"
-                ]
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            layers = payload.get("layers")
+            if not isinstance(layers, Mapping):
+                raise RuntimeError("completed batch has malformed distribution chunk")
+            selected_layers = (
+                (str(layer), layers.get(str(layer)))
+                if layer is not None
+                else None
             )
-        if not values:
-            return {}
+            items = (selected_layers,) if selected_layers is not None else layers.items()
+            for _, distributions in items:
+                if distributions is None:
+                    continue
+                if not isinstance(distributions, Mapping) or not isinstance(
+                    distributions.get(name), list
+                ):
+                    raise RuntimeError("completed batch has malformed distribution chunk")
+                values.extend(float(value) for value in distributions[name])
         values.sort()
-        absolute = sorted(abs(value) for value in values)
+        return values
 
-        def nearest(sorted_values: list[float], percentile: float) -> float:
-            return sorted_values[max(0, ceil(percentile * len(sorted_values)) - 1)]
+    @staticmethod
+    def _nearest(sorted_values: list[float], percentile: float) -> float | None:
+        if not sorted_values:
+            return None
+        return sorted_values[max(0, ceil(percentile * len(sorted_values)) - 1)]
 
+    def _quantiles(self, key: tuple[int, str]) -> Mapping[str, float]:
+        values = self._distribution_values(key, "coefficients")
+        absolute = self._distribution_values(key, "coefficient_abs")
+        if not values or not absolute:
+            return {}
         return {
-            "p01": nearest(values, 0.01),
-            "p05": nearest(values, 0.05),
-            "median": nearest(values, 0.5),
-            "p95": nearest(values, 0.95),
-            "p99": nearest(absolute, 0.99),
+            "p01": float(self._nearest(values, 0.01)),
+            "p05": float(self._nearest(values, 0.05)),
+            "median": float(self._nearest(values, 0.5)),
+            "p95": float(self._nearest(values, 0.95)),
+            "p99": float(self._nearest(absolute, 0.99)),
+            "p99_signed": float(self._nearest(values, 0.99)),
             "max_abs": absolute[-1],
         }
 
-    @staticmethod
-    def _public_metric(values: list[float | int | bool]) -> ConditionMetrics:
+    def _public_metric(
+        self,
+        values: list[object],
+        key: tuple[int, str],
+        *,
+        layer: int | None = None,
+    ) -> ConditionMetrics:
+        coefficients = self._distribution_values(key, "coefficients", layer)
+        coefficient_abs = self._distribution_values(key, "coefficient_abs", layer)
+        relative_error = self._distribution_values(key, "relative_error", layer)
+        cosine = self._distribution_values(key, "cosine", layer)
+        gram_condition = self._distribution_values(key, "gram_condition", layer)
         return ConditionMetrics(
             int(values[0]),
             float(values[1]),
@@ -686,15 +1127,49 @@ class ReconstructionLocalAccumulator:
             int(values[8]),
             int(values[9]),
             bool(values[10]),
+            coefficient_sum=float(values[11]),
+            coefficient_squared_sum=float(values[12]),
+            above_four_count=int(values[13]),
+            squared_deviation_sum=float(values[14]),
+            relative_error_sum=float(values[15]),
+            cosine_sum=float(values[16]),
+            cosine_defined_count=int(values[17]),
+            cosine_undefined_count=int(values[18]),
+            gram_condition_defined_count=int(values[19]),
+            gram_condition_undefined_count=int(values[20]),
+            coefficient_p01=self._nearest(coefficients, 0.01),
+            coefficient_p05=self._nearest(coefficients, 0.05),
+            coefficient_median=self._nearest(coefficients, 0.5),
+            coefficient_p95=self._nearest(coefficients, 0.95),
+            coefficient_p99=self._nearest(coefficients, 0.99),
+            coefficient_p99_abs=self._nearest(coefficient_abs, 0.99),
+            coefficient_max_abs=coefficient_abs[-1] if coefficient_abs else None,
+            relative_error_median=self._nearest(relative_error, 0.5),
+            relative_error_p90=self._nearest(relative_error, 0.9),
+            relative_error_p95=self._nearest(relative_error, 0.95),
+            relative_error_p99=self._nearest(relative_error, 0.99),
+            cosine_median=self._nearest(cosine, 0.5),
+            cosine_p90=self._nearest(cosine, 0.9),
+            cosine_p95=self._nearest(cosine, 0.95),
+            cosine_p99=self._nearest(cosine, 0.99),
+            gram_condition_median=self._nearest(gram_condition, 0.5),
+            gram_condition_p90=self._nearest(gram_condition, 0.9),
+            gram_condition_p99=self._nearest(gram_condition, 0.99),
+            gram_condition_max=gram_condition[-1] if gram_condition else None,
+            effective_rank_counts={
+                str(rank): int(count)
+                for rank, count in dict(values[21]).items()
+            },
         )
 
     def finalize(self) -> ReconstructionLocalResult:
         return ReconstructionLocalResult(
             metrics={
-                key: self._public_metric(value) for key, value in self._metrics.items()
+                key: self._public_metric(value, key)
+                for key, value in self._metrics.items()
             },
             layer_metrics={
-                key: self._public_metric(value)
+                key: self._public_metric(value, (key[1], key[2]), layer=key[0])
                 for key, value in self._layer_metrics.items()
             },
             selection_counts={
@@ -731,6 +1206,26 @@ class ReconstructionLocalAccumulator:
             subset_stability={
                 key: SubsetJaccard(float(value[0]), int(value[1]))
                 for key, value in self._subset_stability.items()
+            },
+            layer_solver_diagnostics={
+                key: dict(value) for key, value in self._layer_solver.items()
+            },
+            svd_verification={
+                identity: SVDVerificationEvidence(
+                    identity=str(value["identity"]),
+                    sample_count=int(value["sample_count"]),
+                    sample_count_by_layer={
+                        int(layer): int(count)
+                        for layer, count in dict(
+                            value["sample_count_by_layer"]
+                        ).items()
+                    },
+                    rank_equal=bool(value["rank_equal"]),
+                    max_relative_objective_error=float(
+                        value["max_relative_objective_error"]
+                    ),
+                )
+                for identity, value in self._svd_verification.items()
             },
         )
 

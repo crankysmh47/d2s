@@ -7,7 +7,7 @@ not execute until their separately reviewed implementations land.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass
 from hashlib import sha256
 import json
 from math import isfinite
@@ -572,6 +572,10 @@ def _smoke_family_permits_progress(
         or not isinstance(failures, int) or failures < 0
     ):
         raise StagePrerequisiteError("required feasible smoke record is invalid")
+    if family == "free_bound" and not _svd_verification_is_complete(
+        evidence.get("svd_verification"), config
+    ):
+        return False
     if family != "bounded":
         return failures == 0 and evidence.get("feasible") is True
     if failures or evidence.get("all_certified") is not True or evidence.get("feasible") is not True:
@@ -590,6 +594,53 @@ def _smoke_family_permits_progress(
         except (KeyError, TypeError, ValueError):
             return False
     return True
+
+
+def _expected_svd_identities(config: Phase1A5Config) -> tuple[str, ...]:
+    return (
+        *(f"sparse:K{k}:free_bound" for k in config.k_values),
+        "R8[free_bound]",
+    )
+
+
+def _svd_verification_is_complete(
+    evidence: object, config: Phase1A5Config
+) -> bool:
+    if not isinstance(evidence, Mapping) or set(evidence) != set(
+        _expected_svd_identities(config)
+    ):
+        return False
+    expected_layers = {str(layer): 16 for layer in range(24)}
+    for identity in _expected_svd_identities(config):
+        record = evidence.get(identity)
+        if not isinstance(record, Mapping) or record.get("identity") != identity:
+            return False
+        maximum = record.get("max_relative_objective_error")
+        if (
+            record.get("sample_count") != 384
+            or record.get("rank_equal") is not True
+            or record.get("sample_count_by_layer") != expected_layers
+            or not isinstance(maximum, (int, float))
+            or isinstance(maximum, bool)
+            or not isfinite(float(maximum))
+            or float(maximum) > 1e-9
+            or float(maximum) < 0.0
+        ):
+            return False
+    return True
+
+
+def _validated_svd_verification(
+    result: ReconstructionLocalResult, config: Phase1A5Config
+) -> dict[str, object]:
+    evidence = _json_safe(result.svd_verification)
+    if not _svd_verification_is_complete(evidence, config):
+        raise StageError(
+            "free-bound SVD verification requires exactly 16 tokens per layer "
+            "for sparse K4/K6 and R8"
+        )
+    assert isinstance(evidence, dict)
+    return evidence
 
 
 def _diagnostic_count(diagnostics: Mapping[object, object], name: str) -> int:
@@ -781,6 +832,11 @@ def _smoke_stage(
                     all_certified = False
             else:
                 kkt_by_k = {}
+            svd_verification = (
+                _validated_svd_verification(result, config)
+                if family == "free_bound"
+                else None
+            )
             if family != "bounded" and failures:
                 raise StageError(f"{family} smoke run did not complete without failures")
             benchmark = FamilyBenchmark.from_measurement(
@@ -803,6 +859,11 @@ def _smoke_stage(
             "r8_fallback_face_enumeration_count": r8_fallback_faces,
             "completed_batches": result.completed_batches,
             "kkt_by_k": kkt_by_k,
+            **(
+                {"svd_verification": svd_verification}
+                if svd_verification is not None
+                else {}
+            ),
             **(
                 {"bounded_stop_reason": "engineering_infeasible_under_v0_5"}
                 if family == "bounded" and not benchmark.feasible
@@ -914,6 +975,7 @@ def _local_stage(
         raise StageError(
             "local reconstruction did not complete against the verified source"
         )
+    _validated_svd_verification(result, config)
     selection_metrics = [
         {"k": k, "condition": condition, "metric": _json_safe(metric)}
         for (k, condition), metric in sorted(result.metrics.items())
@@ -967,21 +1029,10 @@ def _select_stage(
                 raise ValueError
             metric = entry["metric"]
             metrics[(int(entry["k"]), str(entry["condition"]))] = ConditionMetrics(
-                token_count=int(metric["token_count"]),
-                total_squared_error=float(metric["total_squared_error"]),
-                total_d0_squared_norm=float(metric["total_d0_squared_norm"]),
-                coefficient_count=int(metric["coefficient_count"]),
-                negative_count=int(metric["negative_count"]),
-                above_two_count=int(metric["above_two_count"]),
-                absolute_deviation_sum=float(metric["absolute_deviation_sum"]),
-                unresolved_failures=int(metric["unresolved_failures"]),
-                bounded_lower_saturation_count=int(
-                    metric["bounded_lower_saturation_count"]
-                ),
-                bounded_upper_saturation_count=int(
-                    metric["bounded_upper_saturation_count"]
-                ),
-                finite=bool(metric["finite"]),
+                **{
+                    field.name: metric[field.name]
+                    for field in fields(ConditionMetrics)
+                }
             )
     except (KeyError, TypeError, ValueError) as error:
         raise StagePrerequisiteError(

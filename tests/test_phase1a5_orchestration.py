@@ -11,6 +11,7 @@ from ppmoe.experiments.phase1a5_config import Phase1A5Config
 from ppmoe.oracle.reconstruction_local import (
     ConditionMetrics,
     ReconstructionLocalResult,
+    SVDVerificationEvidence,
 )
 from ppmoe.provenance import sha256_file
 
@@ -62,6 +63,20 @@ def _result(
         complete=True,
         run_signature=run_signature,
         source_hashes=source_hashes,
+        svd_verification={
+            identity: SVDVerificationEvidence(
+                identity=identity,
+                sample_count=384,
+                sample_count_by_layer={layer: 16 for layer in range(24)},
+                rank_equal=True,
+                max_relative_objective_error=5e-10,
+            )
+            for identity in (
+                "sparse:K4:free_bound",
+                "sparse:K6:free_bound",
+                "R8[free_bound]",
+            )
+        },
     )
 
 
@@ -170,6 +185,13 @@ def test_smoke_and_local_use_exact_token_counts_and_pass_verified_source_hashes(
     assert {call["tokens"] for call in calls[:4]} == {2_048}
     assert calls[-1]["tokens"] == 100_000
     assert calls[-1]["source_hashes"]["stage:local"] == "a" * 64
+    evidence = smoke["families"]["free_bound"]["svd_verification"]
+    assert set(evidence) == {
+        "sparse:K4:free_bound",
+        "sparse:K6:free_bound",
+        "R8[free_bound]",
+    }
+    assert all(record["sample_count"] == 384 for record in evidence.values())
 
 
 def test_local_omits_bounded_only_after_the_bounded_smoke_gate_fails(
@@ -269,6 +291,62 @@ def test_execution_signature_isolates_checkpoint_paths_for_code_and_microbatch(
     assert changed_smoke["input_signature"] != first_smoke["input_signature"]
     assert changed_local["input_signature"] != first["input_signature"]
     assert calls[-1]["checkpoint_dir"] != first_local_checkpoint
+
+
+@pytest.mark.parametrize(
+    ("mutation", "value"),
+    [
+        ("absent", None),
+        ("sample_count", 0),
+        ("sample_count", 383),
+        ("sample_count", 385),
+        ("rank_equal", False),
+        ("max_relative_objective_error", float("nan")),
+        ("max_relative_objective_error", 1.01e-9),
+    ],
+)
+def test_local_rejects_tampered_smoke_svd_evidence(
+    tmp_path: Path, mutation: str, value: object
+) -> None:
+    from ppmoe.experiments.phase1a5 import StagePrerequisiteError, run_phase1a5
+
+    config = Phase1A5Config.load(CONFIG_PATH)
+    dependencies, _ = _dependencies()
+    run_phase1a5(config, "source", False, tmp_path, 100, dependencies=dependencies)
+    run_phase1a5(config, "smoke", False, tmp_path, 100, dependencies=dependencies)
+    path = tmp_path / "stages" / "smoke.json"
+    smoke = json.loads(path.read_text(encoding="utf-8"))
+    evidence = smoke["families"]["free_bound"]["svd_verification"]
+    if mutation == "absent":
+        evidence.pop("sparse:K4:free_bound")
+    else:
+        evidence["sparse:K4:free_bound"][mutation] = value
+    path.write_text(json.dumps(smoke), encoding="utf-8")
+
+    with pytest.raises(StagePrerequisiteError, match="feasible smoke"):
+        run_phase1a5(config, "local", False, tmp_path, 100, dependencies=dependencies)
+
+
+def test_local_stage_rejects_incomplete_own_svd_evidence(tmp_path: Path) -> None:
+    from ppmoe.experiments.phase1a5 import StageError, run_phase1a5
+
+    config = Phase1A5Config.load(CONFIG_PATH)
+    dependencies, _ = _dependencies()
+    original = dependencies.local_runner
+    calls = 0
+
+    def drop_local_evidence(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        assert original is not None
+        result = original(*args, **kwargs)
+        return replace(result, svd_verification={}) if calls == 5 else result
+
+    dependencies.local_runner = drop_local_evidence
+    run_phase1a5(config, "source", False, tmp_path, 100, dependencies=dependencies)
+    run_phase1a5(config, "smoke", False, tmp_path, 100, dependencies=dependencies)
+    with pytest.raises(StageError, match="SVD verification"):
+        run_phase1a5(config, "local", False, tmp_path, 100, dependencies=dependencies)
 
 
 def test_compatible_smoke_evidence_is_immutable_on_resume_and_nonresume(

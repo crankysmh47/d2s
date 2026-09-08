@@ -1,11 +1,14 @@
 from dataclasses import replace
+from math import sqrt
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 import ppmoe.oracle.reconstruction_local as reconstruction_local
-from ppmoe.oracle.reconstruction import ReconstructionCondition
+from ppmoe.evaluation.perplexity import EvaluationBatch
+from ppmoe.oracle.reconstruction import ReconstructionCondition, ReconstructionResult
 from ppmoe.oracle.reconstruction_local import (
     ReconstructionLocalAccumulator,
     condition_id,
@@ -13,6 +16,23 @@ from ppmoe.oracle.reconstruction_local import (
 
 
 RIDGE = ReconstructionCondition("ridge", rho=0.1)
+
+
+def _result(
+    subsets: torch.Tensor,
+    coefficients: torch.Tensor,
+    squared_error: torch.Tensor,
+    *,
+    diagnostics: dict[str, object] | None = None,
+) -> ReconstructionResult:
+    return ReconstructionResult(
+        subsets=subsets,
+        coefficients=coefficients,
+        squared_error=squared_error,
+        effective_rank=None,
+        solver_source=("test",) * subsets.shape[0],
+        diagnostics=diagnostics or {},
+    )
 
 
 def test_accumulator_commits_only_completed_batches_and_resumes_exactly(
@@ -397,3 +417,270 @@ def test_pooled_improvement_and_gain_recovery_are_analysis_only(tmp_path: Path) 
         replace(result, metrics=zero_denominator).gain_recovery(4, condition_id(ridge))
         is None
     )
+
+
+def test_free_bound_svd_checks_first_sixteen_tokens_per_layer_once_and_resumes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    free = ReconstructionCondition("free_bound")
+    calls: list[tuple[int, int]] = []
+
+    def verify(
+        target: torch.Tensor,
+        _experts: torch.Tensor,
+        result: ReconstructionResult,
+        _settings: object,
+    ) -> dict[str, object]:
+        k = result.subsets.shape[1]
+        calls.append((k, target.shape[0]))
+        base = {4: 2e-10, 6: 3e-10, 8: 4e-10}[k]
+        error = base * calls.count((k, target.shape[0]))
+        return {
+            "rank_equal": True,
+            "relative_objective_error": torch.full(
+                (target.shape[0],), error, dtype=torch.float64
+            ),
+            "max_relative_objective_error": error,
+        }
+
+    monkeypatch.setattr(reconstruction_local, "verify_pseudoinverse_svd", verify)
+    kwargs = dict(
+        num_layers=2,
+        num_experts=8,
+        conditions={4: (free,), 6: (free,)},
+        checkpoint_dir=tmp_path,
+        run_signature="svd-resume",
+    )
+    generator = torch.Generator().manual_seed(103)
+    first = ReconstructionLocalAccumulator(**kwargs)
+    for layer, tokens in ((0, 20), (1, 8)):
+        experts = torch.randn(tokens, 8, 3, generator=generator)
+        first.update_layer(layer, experts.sum(dim=1), experts)
+    first.mark_batch_completed(0)
+
+    resumed = ReconstructionLocalAccumulator(**kwargs)
+    experts = torch.randn(10, 8, 3, generator=generator)
+    resumed.update_layer(1, experts.sum(dim=1), experts)
+    resumed.mark_batch_completed(1)
+    evidence = resumed.finalize().svd_verification
+
+    expected = {
+        "sparse:K4:free_bound": 4e-10,
+        "sparse:K6:free_bound": 6e-10,
+        "R8[free_bound]": 8e-10,
+    }
+    for identity, maximum in expected.items():
+        record = evidence[identity]
+        assert record.identity == identity
+        assert record.sample_count == 32
+        assert record.sample_count_by_layer == {0: 16, 1: 16}
+        assert record.rank_equal is True
+        assert record.max_relative_objective_error == pytest.approx(maximum)
+    assert calls.count((4, 16)) == 1
+    assert calls.count((6, 16)) == 1
+    assert calls.count((8, 16)) == 1
+    assert calls.count((4, 8)) == calls.count((6, 8)) == calls.count((8, 8)) == 2
+
+
+def test_svd_mismatch_is_a_failed_batch_and_rolls_back_all_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class TeacherMLP(torch.nn.Identity):
+        pass
+
+    class Teacher(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mlp = TeacherMLP()
+            self.model = SimpleNamespace(language_model=self.forward_language)
+
+        def forward_language(self, *, input_ids: torch.Tensor, **_kwargs: object) -> None:
+            values = input_ids.to(torch.float32).unsqueeze(-1)
+            self.mlp(values)
+
+    class StudentMLP(torch.nn.Module):
+        num_experts = 8
+
+        def expert_outputs(self, values: torch.Tensor) -> torch.Tensor:
+            return values.unsqueeze(-2).expand(*values.shape[:-1], 8, values.shape[-1])
+
+    class Student(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mlp = StudentMLP()
+
+    monkeypatch.setattr(
+        reconstruction_local, "iter_text_mlps", lambda model: ((0, model.mlp),)
+    )
+    monkeypatch.setattr(reconstruction_local, "PartitionedQwen35MLP", StudentMLP)
+    monkeypatch.setattr(
+        reconstruction_local,
+        "verify_pseudoinverse_svd",
+        lambda *_args, **_kwargs: {
+            "rank_equal": False,
+            "relative_objective_error": torch.zeros(4, dtype=torch.float64),
+            "max_relative_objective_error": 0.0,
+        },
+    )
+    free = ReconstructionCondition("free_bound")
+    result = reconstruction_local.run_reconstruction_local(
+        Teacher(),
+        Student(),
+        (
+            EvaluationBatch(
+                index=0,
+                input_ids=torch.ones((1, 4), dtype=torch.long),
+                attention_mask=torch.ones((1, 4), dtype=torch.long),
+            ),
+        ),
+        {4: (free,), 6: (free,)},
+        tmp_path,
+        "svd-mismatch",
+    )
+
+    assert result.complete is False
+    assert result.completed_batches == 0
+    assert result.failed_batches == 1
+    assert all(metric.token_count == 0 for metric in result.metrics.values())
+    assert result.reference_distances == {}
+    assert all(record.sample_count == 0 for record in result.svd_verification.values())
+
+
+def test_condition_metrics_are_exact_known_values_pooled_per_layer_and_resumable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    subsets = torch.tensor([[0, 1, 2, 3]] * 3)
+    coefficients = torch.tensor(
+        [[1.0, -1.0, 3.0, 5.0], [1.0, 0.0, 2.0, 4.0], [0.0, 1.0, 1.0, 1.0]],
+        dtype=torch.float64,
+    )
+    squared_error = torch.tensor([0.0, 2.0, 0.0], dtype=torch.float64)
+    sparse = _result(
+        subsets,
+        coefficients,
+        squared_error,
+        diagnostics={
+            "cholesky_fallback_count": 2,
+            "degenerate_ridge_count": 1,
+            "max_relative_system_residual": 1e-12,
+        },
+    )
+    full = _result(
+        torch.arange(8).expand(3, -1),
+        torch.ones((3, 8), dtype=torch.float64),
+        torch.zeros(3, dtype=torch.float64),
+    )
+    monkeypatch.setattr(reconstruction_local, "score_reconstruction", lambda *_args: sparse)
+    monkeypatch.setattr(reconstruction_local, "score_full_reference", lambda *_args: full)
+    accumulator = ReconstructionLocalAccumulator(
+        num_layers=1,
+        num_experts=8,
+        conditions={4: (RIDGE,)},
+        checkpoint_dir=tmp_path,
+        run_signature="known-metrics",
+    )
+    target = torch.tensor([[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]])
+    experts = torch.zeros(3, 8, 2)
+    experts[0, 0] = torch.tensor([1.0, 0.0])
+    experts[1, 0] = torch.tensor([1.0, 0.0])
+    accumulator.update_layer(0, target, experts)
+    accumulator.mark_batch_completed(0)
+
+    result = accumulator.finalize()
+    metric = result.metrics[(4, "ridge:0.1")]
+    assert metric == result.layer_metrics[(0, 4, "ridge:0.1")]
+    assert metric.coefficient_count == metric.l2_deviation_denominator == 12
+    assert metric.coefficient_mean == pytest.approx(1.5)
+    assert metric.coefficient_std == pytest.approx(sqrt(2.75))
+    assert metric.coefficient_p01 == -1.0
+    assert metric.coefficient_p05 == -1.0
+    assert metric.coefficient_median == 1.0
+    assert metric.coefficient_p95 == 5.0
+    assert metric.coefficient_p99 == 5.0
+    assert metric.coefficient_p99_abs == 5.0
+    assert metric.coefficient_max_abs == 5.0
+    assert (metric.negative_count, metric.negative_rate) == (1, pytest.approx(1 / 12))
+    assert (metric.above_two_count, metric.above_two_rate) == (3, pytest.approx(3 / 12))
+    assert (metric.above_four_count, metric.above_four_rate) == (1, pytest.approx(1 / 12))
+    assert metric.mean_absolute_deviation_from_one == pytest.approx(14 / 12)
+    assert metric.l2_deviation_from_one == pytest.approx(sqrt(36 / 12))
+    assert metric.relative_error_mean == pytest.approx(sqrt(2) / 3)
+    assert metric.relative_error_median == 0.0
+    assert metric.relative_error_p90 == pytest.approx(sqrt(2))
+    assert metric.relative_error_p95 == pytest.approx(sqrt(2))
+    assert metric.relative_error_p99 == pytest.approx(sqrt(2))
+    assert metric.cosine_defined_count == 2
+    assert metric.cosine_undefined_count == 1
+    assert metric.cosine_mean == pytest.approx(0.5)
+    assert metric.cosine_median == 0.0
+    assert metric.cosine_p90 == 1.0
+    assert metric.cosine_p95 == 1.0
+    assert metric.cosine_p99 == 1.0
+    assert metric.gram_condition_defined_count == 2
+    assert metric.gram_condition_undefined_count == 1
+    assert metric.gram_condition_median == 1.0
+    assert metric.gram_condition_p90 == 1.0
+    assert metric.gram_condition_p99 == 1.0
+    assert metric.gram_condition_max == 1.0
+    assert metric.effective_rank_counts == {"0": 1, "1": 2}
+    diagnostics = result.layer_solver_diagnostics[(0, 4, "ridge:0.1")]
+    assert diagnostics["cholesky_fallback_count"] == 2
+    assert diagnostics["degenerate_ridge_count"] == 1
+    resumed = ReconstructionLocalAccumulator(
+        num_layers=1,
+        num_experts=8,
+        conditions={4: (RIDGE,)},
+        checkpoint_dir=tmp_path,
+        run_signature="known-metrics",
+    ).finalize()
+    assert resumed.metrics == result.metrics
+    assert resumed.layer_metrics == result.layer_metrics
+    assert resumed.layer_solver_diagnostics == result.layer_solver_diagnostics
+
+
+def test_bounded_saturation_rates_use_exact_strict_thresholds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    bounded = ReconstructionCondition("bounded")
+    coefficients = torch.tensor(
+        [[0.0, 0.5, 1.9999995, 2.0], [1e-6, 0.1, 1.0, 1.5]],
+        dtype=torch.float64,
+    )
+    sparse = _result(
+        torch.tensor([[0, 1, 2, 3]] * 2),
+        coefficients,
+        torch.zeros(2, dtype=torch.float64),
+        diagnostics={
+            "bounded_lower_saturation_count": 1,
+            "bounded_upper_saturation_count": 2,
+            "bounded_failure_count": 0,
+            "bounded_uncertified_count": 0,
+            "bounded_certified_count": 2,
+            "bounded_solver_candidate_count": 2,
+            "bounded_coefficient_bound_violation_count": 0,
+        },
+    )
+    full = _result(
+        torch.arange(8).expand(2, -1),
+        torch.ones((2, 8), dtype=torch.float64),
+        torch.zeros(2, dtype=torch.float64),
+    )
+    monkeypatch.setattr(reconstruction_local, "score_reconstruction", lambda *_args: sparse)
+    monkeypatch.setattr(reconstruction_local, "score_full_reference", lambda *_args: full)
+    accumulator = ReconstructionLocalAccumulator(
+        num_layers=1,
+        num_experts=8,
+        conditions={4: (bounded,)},
+        checkpoint_dir=tmp_path,
+        run_signature="bounded-rates",
+    )
+    target = torch.zeros(2, 1)
+    experts = torch.zeros(2, 8, 1)
+    accumulator.update_layer(0, target, experts)
+    accumulator.mark_batch_completed(0)
+
+    metric = accumulator.finalize().metrics[(4, "bounded")]
+    assert metric.bounded_lower_saturation_count == 1
+    assert metric.bounded_lower_saturation_rate == pytest.approx(1 / 8)
+    assert metric.bounded_upper_saturation_count == 2
+    assert metric.bounded_upper_saturation_rate == pytest.approx(2 / 8)
