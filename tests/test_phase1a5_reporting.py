@@ -100,7 +100,7 @@ def _solver(condition: str, tokens: int, k: int) -> dict[str, object]:
                 "bounded_max_complementarity_residual": 0.0,
                 "bounded_max_iterations": 0,
                 "bounded_face_enumeration_count": tokens,
-                "bounded_max_face_enumeration_count": 0,
+                "bounded_max_face_enumeration_count": 0.0,
             }
         )
     else:
@@ -332,6 +332,27 @@ def _render(root: Path):
     from ppmoe.reporting.phase1a5 import render_phase1a5_report
 
     return render_phase1a5_report(root, CONFIG)
+
+
+def test_pinned_m0_hash_comparison_accepts_hexadecimal_case_only(tmp_path: Path) -> None:
+    from ppmoe.provenance import sha256_file
+    from ppmoe.reporting.phase1a5 import _dense_ppl_from_pinned_m0
+
+    source_root = tmp_path / "phase1-source"
+    path = source_root / "stages" / "m0.json"
+    _write_json(path, {
+        "results": {
+            "wikitext": {"teacher": {"ppl": 2.0}},
+            "fineweb_heldout": {"teacher": {"ppl": 2.5}},
+        }
+    })
+
+    dense = _dense_ppl_from_pinned_m0(
+        {"source_root": str(source_root)},
+        {"stage:m0": sha256_file(path).upper()},
+    )
+
+    assert dense == {"wikitext": 2.0, "fineweb_heldout": 2.5}
 
 
 def test_report_writes_hashed_authoritative_sources_and_conservative_decision(tmp_path: Path) -> None:

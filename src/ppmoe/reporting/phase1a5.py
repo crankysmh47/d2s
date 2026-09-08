@@ -434,9 +434,7 @@ def _validate_solver_record(
                 or float(item) < 0.0
             ):
                 raise ReportValidationError(f"{label} lack {name}")
-        counts = {
-            name: _integer(value[name], f"{label} {name}")
-            for name in (
+        count_names = (
                 "bounded_failure_count",
                 "bounded_uncertified_count",
                 "bounded_certified_count",
@@ -448,7 +446,14 @@ def _validate_solver_record(
                 "bounded_max_face_enumeration_count",
                 "bounded_max_iterations",
             )
-        }
+        counts = {}
+        for name in count_names:
+            item = value[name]
+            if isinstance(item, float):
+                if not isfinite(item) or not item.is_integer():
+                    raise ReportValidationError(f"{label} {name} is invalid")
+                item = int(item)
+            counts[name] = _integer(item, f"{label} {name}")
         if (
             counts["bounded_failure_count"] != counts["bounded_uncertified_count"]
             or counts["bounded_certified_count"]
@@ -687,7 +692,7 @@ def _dense_ppl_from_pinned_m0(source: Mapping[str, Any], source_hashes: Mapping[
     if not isinstance(root, str) or not isinstance(expected, str):
         raise ReportValidationError("pinned M0 dense baseline is missing")
     path = Path(root) / "stages" / "m0.json"
-    if not path.is_file() or sha256_file(path) != expected:
+    if not path.is_file() or sha256_file(path).casefold() != expected.casefold():
         raise ReportValidationError("pinned M0 dense baseline hash drift")
     results = _read_json(path, "pinned M0 stage").get("results")
     if not isinstance(results, Mapping):
