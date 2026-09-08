@@ -84,6 +84,21 @@ def _dependencies():
     from ppmoe.experiments.phase1a5 import Phase1A5Dependencies
 
     calls: list[dict[str, object]] = []
+    source_manifest_writes = 0
+
+    def source_verifier(_source_root, artifact_root, _config):
+        """Model the explicit source stage's durable provenance write."""
+
+        nonlocal source_manifest_writes
+        source_manifest_writes += 1
+        manifest = _source_manifest()
+        path = artifact_root / "source-manifest.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"write_index": source_manifest_writes, **manifest}),
+            encoding="utf-8",
+        )
+        return manifest
 
     def local_runner(
         _teacher,
@@ -121,7 +136,8 @@ def _dependencies():
         return {"practical_conditions": {}, "free_bound_conditions": {4: "free_bound"}}
 
     return Phase1A5Dependencies(
-        source_verifier=lambda *_args, **_kwargs: _source_manifest(),
+        source_verifier=source_verifier,
+        source_collector=lambda *_args, **_kwargs: _source_manifest(),
         calibration_loader=lambda *_args: (
             torch.ones((100, 1_000), dtype=torch.long),
             torch.ones((100, 1_000), dtype=torch.long),
@@ -278,6 +294,10 @@ def test_execution_signature_isolates_checkpoint_paths_for_code_and_microbatch(
             **_source_manifest(),
             "code_revision": {"commit": "2" * 40, "dirty": False},
         },
+        source_collector=lambda *_args, **_kwargs: {
+            **_source_manifest(),
+            "code_revision": {"commit": "2" * 40, "dirty": False},
+        },
     )
     run_phase1a5(config, "source", False, tmp_path, 100, dependencies=changed)
     with pytest.raises(StagePrerequisiteError, match="source"):
@@ -362,6 +382,8 @@ def test_compatible_smoke_evidence_is_immutable_on_resume_and_nonresume(
     )
     smoke_path = tmp_path / "stages" / "smoke.json"
     original_bytes = smoke_path.read_bytes()
+    source_manifest_path = tmp_path / "source-manifest.json"
+    original_manifest_bytes = source_manifest_path.read_bytes()
     calls_after_first = len(calls)
 
     resumed = run_phase1a5(
@@ -369,10 +391,12 @@ def test_compatible_smoke_evidence_is_immutable_on_resume_and_nonresume(
     )
     assert resumed == first
     assert smoke_path.read_bytes() == original_bytes
+    assert source_manifest_path.read_bytes() == original_manifest_bytes
     assert len(calls) == calls_after_first
     with pytest.raises(StageError, match="immutable"):
         run_phase1a5(config, "smoke", False, tmp_path, 100, dependencies=dependencies)
     assert smoke_path.read_bytes() == original_bytes
+    assert source_manifest_path.read_bytes() == original_manifest_bytes
     assert len(calls) == calls_after_first
 
 
@@ -414,14 +438,16 @@ def test_smoke_resume_rejects_any_live_provenance_drift_without_overwriting_evid
     run_phase1a5(config, "smoke", False, tmp_path, 100, dependencies=dependencies)
     smoke_path = tmp_path / "stages" / "smoke.json"
     original = smoke_path.read_bytes()
+    source_manifest_path = tmp_path / "source-manifest.json"
+    original_manifest = source_manifest_path.read_bytes()
     resumed_config, resumed_microbatch = config, 100
     if drift == "source_hash":
-        dependencies.source_verifier = lambda *_args, **_kwargs: {
+        dependencies.source_collector = lambda *_args, **_kwargs: {
             **_source_manifest(),
             "stage_sha256": {"local": "f" * 64, "rollout": "b" * 64, "m0": "c" * 64},
         }
     elif drift == "code_revision":
-        dependencies.source_verifier = lambda *_args, **_kwargs: {
+        dependencies.source_collector = lambda *_args, **_kwargs: {
             **_source_manifest(),
             "code_revision": {"commit": "2" * 40, "dirty": False},
         }
@@ -446,6 +472,7 @@ def test_smoke_resume_rejects_any_live_provenance_drift_without_overwriting_evid
             dependencies=dependencies,
         )
     assert smoke_path.read_bytes() == original
+    assert source_manifest_path.read_bytes() == original_manifest
 
 
 def test_smoke_resume_rejects_malformed_svd_evidence_without_overwriting_it(
@@ -640,6 +667,7 @@ def test_rollout_uses_only_byte_frozen_registered_conditions_and_corpora(
 
     dependencies = Phase1A5Dependencies(
         source_verifier=base.source_verifier,
+        source_collector=base.source_collector,
         calibration_loader=base.calibration_loader,
         converted_pair_loader=base.converted_pair_loader,
         local_runner=base.local_runner,

@@ -885,6 +885,57 @@ def test_checkpoint_loader_explicitly_rejects_legacy_distribution_format(
         )
 
 
+@pytest.mark.parametrize(
+    "extra",
+    ("manifest_only", "bin_only", "orphan_pair", "legacy_file"),
+)
+def test_checkpoint_loader_rejects_unreferenced_distribution_files(
+    tmp_path: Path, extra: str
+) -> None:
+    """Persisted state must name every chunk file retained for a resumed run."""
+
+    accumulator = ReconstructionLocalAccumulator(
+        num_layers=1,
+        num_experts=8,
+        conditions={4: (RIDGE,)},
+        checkpoint_dir=tmp_path,
+        run_signature=f"distribution-audit-{extra}",
+    )
+    key = (4, condition_id(RIDGE))
+    accumulator._pending_distributions[key] = {  # type: ignore[attr-defined]
+        0: {
+            "coefficients": [1.0],
+            "coefficient_abs": [1.0],
+            "relative_error": [1.0],
+            "cosine": [1.0],
+            "gram_condition": [1.0],
+        }
+    }
+    accumulator.mark_batch_completed(0)
+    expected_manifest = accumulator._chunk_path(key, 0)  # type: ignore[attr-defined]
+    expected_data = expected_manifest.with_suffix(".bin")
+    extra_manifest = accumulator._chunk_path(key, 1)  # type: ignore[attr-defined]
+    extra_data = extra_manifest.with_suffix(".bin")
+    if extra == "manifest_only":
+        extra_manifest.write_bytes(expected_manifest.read_bytes())
+    elif extra == "bin_only":
+        extra_data.write_bytes(expected_data.read_bytes())
+    elif extra == "orphan_pair":
+        extra_manifest.write_bytes(expected_manifest.read_bytes())
+        extra_data.write_bytes(expected_data.read_bytes())
+    else:
+        (tmp_path / "coefficients" / "legacy-distribution.npy").write_bytes(b"legacy")
+
+    with pytest.raises(ValueError, match="distribution chunk directory"):
+        ReconstructionLocalAccumulator(
+            num_layers=1,
+            num_experts=8,
+            conditions={4: (RIDGE,)},
+            checkpoint_dir=tmp_path,
+            run_signature=f"distribution-audit-{extra}",
+        )
+
+
 def test_zero_d0_relative_errors_are_undefined_and_resume_without_double_counting(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

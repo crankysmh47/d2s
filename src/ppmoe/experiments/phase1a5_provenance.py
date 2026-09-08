@@ -142,14 +142,13 @@ def _verify_anchored_evidence(
         raise SourceVerificationError("dataset evidence does not match pinned M0 input")
 
 
-def verify_phase1a_sources(
+def collect_phase1a_sources(
     source_root: Path,
-    output_root: Path,
     config: Phase1A5Config,
     *,
     code_revision_provider: CodeRevisionProvider | None = None,
 ) -> Mapping[str, object]:
-    """Verify immutable Phase 1A evidence and atomically persist its manifest."""
+    """Verify immutable Phase 1A evidence without changing any artifact."""
     resolved_source_root = source_root.resolve()
     stage_hashes = _required_hashes(
         resolved_source_root,
@@ -195,6 +194,20 @@ def verify_phase1a_sources(
         "code_revision": revision,
         "solver_version": config.solver_version,
     }
+    return manifest
+
+
+def verify_phase1a_sources(
+    source_root: Path,
+    output_root: Path,
+    config: Phase1A5Config,
+    *,
+    code_revision_provider: CodeRevisionProvider | None = None,
+) -> Mapping[str, object]:
+    """Verify immutable Phase 1A evidence and atomically persist its manifest."""
+    manifest = collect_phase1a_sources(
+        source_root, config, code_revision_provider=code_revision_provider
+    )
     atomic_write_json(output_root / "source-manifest.json", manifest)
     return manifest
 

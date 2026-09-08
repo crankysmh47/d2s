@@ -600,6 +600,28 @@ class ReconstructionLocalAccumulator:
                 "rank_equal": bool(value.get("rank_equal")),
                 "max_relative_objective_error": maximum,
             }
+        self._audit_distribution_chunk_directory()
+
+    def _audit_distribution_chunk_directory(self) -> None:
+        """Require persisted chunk files to exactly match durable completed state."""
+
+        if self.checkpoint_dir is None:
+            return
+        directory = self.checkpoint_dir / "coefficients"
+        expected = {
+            path
+            for batch_index in self.completed_batches
+            for key in self._condition_keys
+            for path in (
+                self._chunk_path(key, batch_index),
+                self._chunk_data_path(key, batch_index),
+            )
+        }
+        actual = set(directory.iterdir()) if directory.exists() else set()
+        if actual != expected:
+            raise ValueError(
+                "reconstruction local distribution chunk directory does not match persisted state"
+            )
 
     def _persist(self) -> None:
         path = self._state_path
@@ -1181,8 +1203,9 @@ class ReconstructionLocalAccumulator:
             raise ValueError("batch is already terminal")
         transaction = self._transaction_snapshot or self.snapshot()
         chunk_paths: list[Path] = []
-        # Chunks are atomically written first.  An interrupted checkpoint leaves only
-        # ignored orphan chunks because the completed-batch state remains unchanged.
+        # Chunks are atomically written before state publication.  This live
+        # transaction cleans its own partial pairs; persisted-state reloads reject
+        # every unreferenced file as an integrity error.
         try:
             if self.checkpoint_dir:
                 for key in self._condition_keys:

@@ -24,6 +24,7 @@ from ppmoe.adapters.qwen35_runtime import iter_text_mlps, load_qwen35_pair
 from ppmoe.data.token_stream import iter_evaluation_batches
 from ppmoe.experiments.phase1a5_config import Phase1A5Config
 from ppmoe.experiments.phase1a5_provenance import (
+    collect_phase1a_sources,
     phase1a5_signature,
     verify_phase1a_sources,
 )
@@ -438,6 +439,7 @@ class Phase1A5Dependencies:
     """Replaceable slow boundaries; defaults perform the frozen experiment."""
 
     source_verifier: Callable[..., Mapping[str, object]] | None = None
+    source_collector: Callable[..., Mapping[str, object]] | None = None
     calibration_loader: Callable[..., tuple[Tensor, Tensor]] | None = None
     converted_pair_loader: Callable[[Phase1A5Config], tuple[Any, Any]] | None = None
     local_runner: Callable[..., ReconstructionLocalResult] | None = None
@@ -454,6 +456,8 @@ def _dependencies(values: Phase1A5Dependencies | None) -> Phase1A5Dependencies:
     values = values or Phase1A5Dependencies()
     if values.source_verifier is None:
         values.source_verifier = verify_phase1a_sources
+    if values.source_collector is None:
+        values.source_collector = collect_phase1a_sources
     if values.calibration_loader is None:
         values.calibration_loader = _load_calibration_tokens
     if values.converted_pair_loader is None:
@@ -542,12 +546,10 @@ def _fresh_smoke_provenance(
     """Reverify the frozen source and smoke token identity without writing a stage."""
 
     assert (
-        dependencies.source_verifier is not None
+        dependencies.source_collector is not None
         and dependencies.calibration_loader is not None
     )
-    manifest = dependencies.source_verifier(
-        config.source_artifact_root.resolve(), artifact_root, config
-    )
+    manifest = dependencies.source_collector(config.source_artifact_root.resolve(), config)
     source_hashes = _source_hashes(manifest)
     input_ids, attention_mask = dependencies.calibration_loader(
         Path(str(manifest["source_root"])), manifest
