@@ -296,8 +296,97 @@ def _validate_svd_verification(value: object, config: Phase1A5Config) -> None:
             raise ReportValidationError("SVD verification evidence is invalid")
 
 
+_SOLVER_ROW_FIELDS = (
+    "scope",
+    "layer",
+    "k",
+    "condition",
+    "token_count",
+    "coefficient_count",
+    "numerical_failure_count",
+    "layer_coverage_count",
+    "solver_source_counts",
+    "effective_rank_counts",
+    "gram_condition_defined_count",
+    "gram_condition_undefined_count",
+    "gram_condition_median",
+    "gram_condition_p90",
+    "gram_condition_p99",
+    "gram_condition_max",
+    "cholesky_fallback_count",
+    "degenerate_ridge_count",
+    "max_relative_system_residual",
+    "tau_g",
+    "pseudoinverse_effective_rank_counts",
+    "bounded_lower_saturation_count",
+    "bounded_upper_saturation_count",
+    "bounded_failure_count",
+    "bounded_uncertified_count",
+    "bounded_certified_count",
+    "bounded_solver_candidate_count",
+    "bounded_coefficient_bound_violation_count",
+    "bounded_max_primal_residual",
+    "bounded_max_stationarity_residual",
+    "bounded_max_complementarity_residual",
+    "bounded_max_iterations",
+    "bounded_face_enumeration_count",
+    "bounded_max_face_enumeration_count",
+    "svd_identity",
+    "svd_sample_count",
+    "svd_sample_count_by_layer",
+    "svd_layer_sample_count",
+    "svd_rank_equal",
+    "svd_max_relative_objective_error",
+)
+
+
+def _histogram(
+    value: object, label: str, *, token_count: int
+) -> dict[str, int]:
+    if not isinstance(value, Mapping):
+        raise ReportValidationError(f"{label} is invalid")
+    parsed: dict[str, int] = {}
+    try:
+        for raw_rank, raw_count in value.items():
+            rank = int(raw_rank)
+            if str(rank) != str(raw_rank) or not 0 <= rank <= 8:
+                raise ValueError
+            count = _integer(raw_count, label)
+            if count < 0:
+                raise ValueError
+            parsed[str(rank)] = count
+    except (TypeError, ValueError) as error:
+        raise ReportValidationError(f"{label} is invalid") from error
+    if not parsed or sum(parsed.values()) != token_count:
+        raise ReportValidationError(f"{label} does not reconcile to coverage")
+    return parsed
+
+
+def _flat_mapping(value: Mapping[str, int] | None) -> str | None:
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":"))
+        if value is not None
+        else None
+    )
+
+
+def _mean_effective_rank(
+    value: object, label: str, *, token_count: int
+) -> tuple[dict[str, int], float]:
+    counts = _histogram(value, label, token_count=token_count)
+    return (
+        counts,
+        sum(int(rank) * count for rank, count in counts.items()) / token_count,
+    )
+
+
 def _validate_solver_record(
-    value: object, label: str, *, identifier: str, token_count: int
+    value: object,
+    label: str,
+    *,
+    identifier: str,
+    token_count: int,
+    expected_tau_g: float,
 ) -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise ReportValidationError(f"{label} are invalid")
@@ -312,31 +401,205 @@ def _validate_solver_record(
         parsed_sources[str(source)] = parsed
     if sum(parsed_sources.values()) != token_count:
         raise ReportValidationError(f"{label} solver counts are incomplete")
-    required = (
-        (
-            "bounded_failure_count",
-            "bounded_uncertified_count",
-            "bounded_certified_count",
-            "bounded_solver_candidate_count",
-            "bounded_coefficient_bound_violation_count",
-        )
-        if identifier == "bounded"
-        else (
-            "cholesky_fallback_count",
-            "degenerate_ridge_count",
-            "max_relative_system_residual",
-        )
+    bounded_fields = (
+        "bounded_lower_saturation_count",
+        "bounded_upper_saturation_count",
+        "bounded_failure_count",
+        "bounded_uncertified_count",
+        "bounded_certified_count",
+        "bounded_solver_candidate_count",
+        "bounded_coefficient_bound_violation_count",
+        "bounded_max_primal_residual",
+        "bounded_max_stationarity_residual",
+        "bounded_max_complementarity_residual",
+        "bounded_max_iterations",
+        "bounded_face_enumeration_count",
+        "bounded_max_face_enumeration_count",
     )
-    for name in required:
-        item = value.get(name)
+    ridge_fields = (
+        "cholesky_fallback_count",
+        "degenerate_ridge_count",
+        "max_relative_system_residual",
+    )
+    free_fields = ("tau_g", "pseudoinverse_effective_rank_counts")
+    if identifier == "bounded":
+        if any(name in value for name in (*ridge_fields, *free_fields)):
+            raise ReportValidationError(f"{label} contain inapplicable bounded evidence")
+        for name in bounded_fields:
+            item = value.get(name)
+            if (
+                not isinstance(item, (int, float))
+                or isinstance(item, bool)
+                or not isfinite(float(item))
+                or float(item) < 0.0
+            ):
+                raise ReportValidationError(f"{label} lack {name}")
+        counts = {
+            name: _integer(value[name], f"{label} {name}")
+            for name in (
+                "bounded_failure_count",
+                "bounded_uncertified_count",
+                "bounded_certified_count",
+                "bounded_solver_candidate_count",
+                "bounded_coefficient_bound_violation_count",
+                "bounded_lower_saturation_count",
+                "bounded_upper_saturation_count",
+                "bounded_face_enumeration_count",
+                "bounded_max_face_enumeration_count",
+                "bounded_max_iterations",
+            )
+        }
         if (
-            not isinstance(item, (int, float))
-            or isinstance(item, bool)
-            or not isfinite(float(item))
-            or float(item) < 0.0
+            counts["bounded_failure_count"] != counts["bounded_uncertified_count"]
+            or counts["bounded_certified_count"]
+            + counts["bounded_uncertified_count"]
+            != counts["bounded_solver_candidate_count"]
         ):
-            raise ReportValidationError(f"{label} lack {name}")
+            raise ReportValidationError(
+                f"{label} bounded KKT evidence has inconsistent bounded certification"
+            )
+    else:
+        if any(name in value for name in bounded_fields):
+            raise ReportValidationError(f"{label} contain inapplicable bounded evidence")
+        for name in ridge_fields:
+            item = value.get(name)
+            if (
+                not isinstance(item, (int, float))
+                or isinstance(item, bool)
+                or not isfinite(float(item))
+                or float(item) < 0.0
+            ):
+                raise ReportValidationError(f"{label} lack {name}")
+        if identifier == "free_bound":
+            tau = value.get("tau_g")
+            if (
+                not isinstance(tau, (int, float))
+                or isinstance(tau, bool)
+                or not isfinite(float(tau))
+                or float(tau) != expected_tau_g
+            ):
+                raise ReportValidationError(f"{label} lack registered tau_g")
+            _histogram(
+                value.get("pseudoinverse_effective_rank_counts"),
+                f"{label} pseudoinverse effective rank",
+                token_count=token_count,
+            )
+        elif any(name in value for name in free_fields):
+            raise ReportValidationError(f"{label} contain inapplicable free-bound evidence")
     return {str(name): item for name, item in value.items()}
+
+
+def _flat_solver_row(
+    *,
+    scope: str,
+    layer: int | None,
+    k: int,
+    condition: str,
+    identifier: str,
+    record: Mapping[str, object],
+    token_count: int,
+    metric: Mapping[str, object] | None,
+    svd: Mapping[str, object] | None,
+) -> dict[str, object]:
+    """Return the single flat evidence schema used by both CSV and JSON sources."""
+
+    metric_ranks: dict[str, int] | None = None
+    if metric is not None:
+        metric_ranks = _histogram(
+            metric["effective_rank_counts"],
+            "solver row effective rank",
+            token_count=token_count,
+        )
+    free_ranks: dict[str, int] | None = None
+    if identifier == "free_bound":
+        free_ranks = _histogram(
+            record.get("pseudoinverse_effective_rank_counts"),
+            "solver row pseudoinverse effective rank",
+            token_count=token_count,
+        )
+        if metric_ranks is not None and metric_ranks != free_ranks:
+            raise ReportValidationError("solver row effective-rank evidence disagrees")
+        if not isinstance(svd, Mapping):
+            raise ReportValidationError("free-bound solver row lacks SVD evidence")
+        identity = svd.get("identity")
+        sample_count = svd.get("sample_count")
+        by_layer = svd.get("sample_count_by_layer")
+        maximum = svd.get("max_relative_objective_error")
+        if (
+            not isinstance(identity, str)
+            or not isinstance(sample_count, int)
+            or not isinstance(by_layer, Mapping)
+            or svd.get("rank_equal") is not True
+            or not isinstance(maximum, (int, float))
+            or isinstance(maximum, bool)
+            or not isfinite(float(maximum))
+        ):
+            raise ReportValidationError("free-bound solver row has malformed SVD evidence")
+        svd_layer_count = (
+            by_layer.get(str(layer)) if layer is not None else None
+        )
+    elif svd is not None:
+        raise ReportValidationError("non-free solver row has inapplicable SVD evidence")
+    else:
+        identity = sample_count = by_layer = maximum = svd_layer_count = None
+    bounded = identifier == "bounded"
+    row = {
+        "scope": scope,
+        "layer": layer,
+        "k": k,
+        "condition": condition,
+        "token_count": token_count,
+        "coefficient_count": metric.get("coefficient_count") if metric else k * token_count,
+        "numerical_failure_count": (
+            metric.get("unresolved_failures")
+            if metric is not None
+            else record.get("bounded_failure_count", 0)
+        ),
+        "layer_coverage_count": 24 if scope == "pooled" else 1,
+        "solver_source_counts": _flat_mapping(
+            {str(name): int(count) for name, count in record["solver_source_counts"].items()}  # type: ignore[union-attr]
+        ),
+        "effective_rank_counts": _flat_mapping(
+            metric_ranks if metric_ranks is not None else free_ranks
+        ),
+        "gram_condition_defined_count": metric.get("gram_condition_defined_count") if metric else None,
+        "gram_condition_undefined_count": metric.get("gram_condition_undefined_count") if metric else None,
+        "gram_condition_median": metric.get("gram_condition_median") if metric else None,
+        "gram_condition_p90": metric.get("gram_condition_p90") if metric else None,
+        "gram_condition_p99": metric.get("gram_condition_p99") if metric else None,
+        "gram_condition_max": metric.get("gram_condition_max") if metric else None,
+        "cholesky_fallback_count": record.get("cholesky_fallback_count") if not bounded else None,
+        "degenerate_ridge_count": record.get("degenerate_ridge_count") if not bounded else None,
+        "max_relative_system_residual": record.get("max_relative_system_residual") if not bounded else None,
+        "tau_g": record.get("tau_g") if identifier == "free_bound" else None,
+        "pseudoinverse_effective_rank_counts": _flat_mapping(free_ranks),
+        "bounded_lower_saturation_count": record.get("bounded_lower_saturation_count") if bounded else None,
+        "bounded_upper_saturation_count": record.get("bounded_upper_saturation_count") if bounded else None,
+        "bounded_failure_count": record.get("bounded_failure_count") if bounded else None,
+        "bounded_uncertified_count": record.get("bounded_uncertified_count") if bounded else None,
+        "bounded_certified_count": record.get("bounded_certified_count") if bounded else None,
+        "bounded_solver_candidate_count": record.get("bounded_solver_candidate_count") if bounded else None,
+        "bounded_coefficient_bound_violation_count": record.get("bounded_coefficient_bound_violation_count") if bounded else None,
+        "bounded_max_primal_residual": record.get("bounded_max_primal_residual") if bounded else None,
+        "bounded_max_stationarity_residual": record.get("bounded_max_stationarity_residual") if bounded else None,
+        "bounded_max_complementarity_residual": record.get("bounded_max_complementarity_residual") if bounded else None,
+        "bounded_max_iterations": record.get("bounded_max_iterations") if bounded else None,
+        "bounded_face_enumeration_count": record.get("bounded_face_enumeration_count") if bounded else None,
+        "bounded_max_face_enumeration_count": record.get("bounded_max_face_enumeration_count") if bounded else None,
+        "svd_identity": identity,
+        "svd_sample_count": sample_count,
+        "svd_sample_count_by_layer": _flat_mapping(
+            {str(name): int(count) for name, count in by_layer.items()}  # type: ignore[union-attr]
+        )
+        if by_layer is not None
+        else None,
+        "svd_layer_sample_count": svd_layer_count,
+        "svd_rank_equal": True if identifier == "free_bound" else None,
+        "svd_max_relative_objective_error": maximum,
+    }
+    if set(row) != set(_SOLVER_ROW_FIELDS):
+        raise AssertionError("solver row schema implementation is incomplete")
+    return row
 
 
 def _selection_conditions(selection: Mapping[str, Any], config: Phase1A5Config) -> dict[int, set[str]]:
@@ -365,11 +628,24 @@ def _write_source(path: Path, value: object) -> None:
     atomic_write_json(path, value)
 
 
-def _write_csv(path: Path, rows: list[Mapping[str, object]]) -> None:
+def _write_csv(
+    path: Path,
+    rows: list[Mapping[str, object]],
+    *,
+    schema: tuple[str, ...] | None = None,
+) -> None:
     if not rows:
         raise ReportValidationError(f"authoritative source {path.name} is empty")
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields = sorted({str(key) for row in rows for key in row})
+    observed = {str(key) for row in rows for key in row}
+    if schema is not None:
+        if len(set(schema)) != len(schema) or observed != set(schema):
+            raise ReportValidationError(
+                f"authoritative source {path.name} does not match its schema"
+            )
+        fields = list(schema)
+    else:
+        fields = sorted(observed)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
@@ -515,7 +791,9 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
     local_result = local.get("result")
     if not isinstance(local_result, Mapping) or local_result.get("complete") is not True or local_result.get("failed_batches") != 0:
         raise ReportValidationError("local failed batches")
-    _validate_svd_verification(local_result.get("svd_verification"), config)
+    local_svd = local_result.get("svd_verification")
+    _validate_svd_verification(local_svd, config)
+    assert isinstance(local_svd, Mapping)
     metrics = local_result.get("metrics")
     staged_metrics = local.get("selection_metrics")
     if not isinstance(metrics, Mapping) or not isinstance(staged_metrics, list):
@@ -669,16 +947,41 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
         ):
             raise ReportValidationError("solver diagnostics are invalid")
         identity = (parsed[0], parsed[1])
+        if identity in observed_solver:
+            raise ReportValidationError("duplicate solver diagnostics")
         metric = persisted_metrics[identity]
         record = _validate_solver_record(
             value,
             "solver diagnostics",
             identifier=parsed[1],
             token_count=int(metric["token_count"]),
+            expected_tau_g=config.tau_g,
         )
         observed_solver.add(identity)
+        if parsed[1] == "bounded" and any(
+            record[name] != metric[name]
+            for name in (
+                "bounded_lower_saturation_count",
+                "bounded_upper_saturation_count",
+            )
+        ):
+            raise ReportValidationError("bounded pooled solver diagnostics disagree with metrics")
         solver_rows.append(
-            {"scope": "pooled", "layer": None, "k": parsed[0], "condition": parsed[1], **record}
+            _flat_solver_row(
+                scope="pooled",
+                layer=None,
+                k=parsed[0],
+                condition=parsed[1],
+                identifier=parsed[1],
+                record=record,
+                token_count=int(metric["token_count"]),
+                metric=metric,
+                svd=(
+                    local_svd[f"sparse:K{parsed[0]}:free_bound"]
+                    if parsed[1] == "free_bound"
+                    else None
+                ),
+            )
         )
         if parsed[1] == "bounded" and (record.get("bounded_failure_count", 0) != 0 or record.get("bounded_uncertified_count", 0) != 0):
             raise ReportValidationError("bounded KKT evidence is invalid")
@@ -700,6 +1003,8 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
         identity = (parsed[0], parsed[1], parsed[2])
         if identity not in observed_layer_keys:
             raise ReportValidationError("layer solver diagnostics are invalid")
+        if identity in observed_layer_solver:
+            raise ReportValidationError("duplicate layer solver diagnostics")
         layer_metric = next(
             row
             for row in layer_rows
@@ -710,10 +1015,33 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
             "layer solver diagnostics",
             identifier=parsed[2],
             token_count=int(layer_metric["token_count"]),
+            expected_tau_g=config.tau_g,
         )
         observed_layer_solver.add(identity)
+        if parsed[2] == "bounded" and any(
+            record[name] != layer_metric[name]
+            for name in (
+                "bounded_lower_saturation_count",
+                "bounded_upper_saturation_count",
+            )
+        ):
+            raise ReportValidationError("bounded layer solver diagnostics disagree with metrics")
         solver_rows.append(
-            {"scope": "layer", "layer": parsed[0], "k": parsed[1], "condition": parsed[2], **record}
+            _flat_solver_row(
+                scope="layer",
+                layer=parsed[0],
+                k=parsed[1],
+                condition=parsed[2],
+                identifier=parsed[2],
+                record=record,
+                token_count=int(layer_metric["token_count"]),
+                metric=layer_metric,
+                svd=(
+                    local_svd[f"sparse:K{parsed[1]}:free_bound"]
+                    if parsed[2] == "free_bound"
+                    else None
+                ),
+            )
         )
     if observed_layer_solver != observed_layer_keys:
         raise ReportValidationError("layer solver diagnostics are incomplete")
@@ -739,30 +1067,68 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
         if parsed[1] != f"R8[{identifier}]":
             raise ReportValidationError("R8 solver diagnostics are invalid")
         record = _validate_solver_record(
-            value, "R8 solver diagnostics", identifier=identifier, token_count=100_000
+            value,
+            "R8 solver diagnostics",
+            identifier=identifier,
+            token_count=100_000,
+            expected_tau_g=config.tau_g,
         )
+        if identifier == "bounded" and (
+            record.get("bounded_failure_count", 0) != 0
+            or record.get("bounded_uncertified_count", 0) != 0
+        ):
+            raise ReportValidationError("bounded KKT evidence is invalid")
+        if (parsed[0], parsed[1]) in observed_reference_solver:
+            raise ReportValidationError("duplicate R8 solver diagnostics")
         observed_reference_solver.add((parsed[0], parsed[1]))
         solver_rows.append(
-            {"scope": "r8", "layer": parsed[0], "k": 8, "condition": parsed[1], **record}
+            _flat_solver_row(
+                scope="r8",
+                layer=parsed[0],
+                k=8,
+                condition=parsed[1],
+                identifier=identifier,
+                record=record,
+                token_count=100_000,
+                metric=None,
+                svd=local_svd["R8[free_bound]"] if identifier == "free_bound" else None,
+            )
         )
     if observed_reference_solver != expected_reference_solver:
         raise ReportValidationError("R8 solver diagnostics are incomplete")
-    rank_condition_rows = [
-        {
-            "scope": "pooled",
-            "k": row["k"],
-            "condition": row["condition"],
-            "effective_rank_counts": row["effective_rank_counts"],
-            "gram_condition_median": row["gram_condition_median"],
-            "gram_condition_p90": row["gram_condition_p90"],
-            "gram_condition_p99": row["gram_condition_p99"],
-            "gram_condition_max": row["gram_condition_max"],
-            "gram_condition_undefined_count": row[
-                "gram_condition_undefined_count"
-            ],
-        }
-        for row in local_rows
-    ]
+    rank_condition_rows: list[dict[str, object]] = []
+    for row in local_rows:
+        token_count = int(row["token_count"])
+        rank_counts, mean_rank = _mean_effective_rank(
+            row["effective_rank_counts"],
+            "effective-rank plot source",
+            token_count=token_count,
+        )
+        unit_squared_error = float(
+            by_condition[(int(row["k"]), "unit")]["total_squared_error"]
+        )
+        if unit_squared_error <= 0.0:
+            raise ReportValidationError("effective-rank gain has no positive unit loss")
+        rank_condition_rows.append(
+            {
+                "scope": "pooled",
+                "k": row["k"],
+                "condition": row["condition"],
+                "effective_rank_counts": rank_counts,
+                "mean_effective_rank": mean_rank,
+                "gram_condition_median": row["gram_condition_median"],
+                "gram_condition_p90": row["gram_condition_p90"],
+                "gram_condition_p99": row["gram_condition_p99"],
+                "gram_condition_max": row["gram_condition_max"],
+                "gram_condition_undefined_count": row[
+                    "gram_condition_undefined_count"
+                ],
+                "reconstruction_gain": (
+                    unit_squared_error - float(row["total_squared_error"])
+                )
+                / unit_squared_error,
+            }
+        )
 
     expected_rollout = set() if selection_stopped else {f"{corpus}:k{k}:{condition}" for corpus in ("wikitext", "fineweb_heldout") for k, conditions in selected.items() for condition in conditions}
     results = {} if rollout is None else rollout.get("results")
@@ -898,18 +1264,16 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
             for row in local_rows
         ],
         "gain-recovery.json": gain_recovery_rows,
-        "rank-conditioning.json": [
-            {
-                **row,
-                "reconstruction_gain": (
-                    float(by_condition[(int(row["k"]), "unit")]["total_squared_error"])
-                    - float(by_condition[(int(row["k"]), str(row["condition"]))]["total_squared_error"])
-                ) / float(by_condition[(int(row["k"]), "unit")]["total_squared_error"]),
-            }
-            for row in rank_condition_rows
-        ],
+        "rank-conditioning.json": rank_condition_rows,
         "effective-rank.json": [
-            {"scope": row["scope"], "k": row["k"], "condition": row["condition"], "effective_rank_counts": row["effective_rank_counts"]}
+            {
+                "scope": row["scope"],
+                "k": row["k"],
+                "condition": row["condition"],
+                "effective_rank_counts": row["effective_rank_counts"],
+                "mean_effective_rank": row["mean_effective_rank"],
+                "reconstruction_gain": row["reconstruction_gain"],
+            }
             for row in rank_condition_rows
         ],
         "solver-diagnostics.json": solver_rows,
@@ -926,7 +1290,11 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
         if isinstance(evidence, Mapping)
     ]
     _write_source(plot_source / "smoke-feasibility.json", feasibility_rows)
-    _write_csv(plot_source / "solver-diagnostics.csv", solver_rows)
+    _write_csv(
+        plot_source / "solver-diagnostics.csv",
+        solver_rows,
+        schema=_SOLVER_ROW_FIELDS,
+    )
     primary_rows: list[dict[str, object]] = []
     for row in local_rows:
         matching = [item for item in evaluation_rows if item["k"] == row["k"] and item["condition"] == row["condition"]]
@@ -951,6 +1319,7 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
         ("07-layer-improvements.png", "Layerwise local NMSE", layer_rows, "layer", "nmse"),
         ("08-reference-distances.png", "D0/E8/R8 reference distances", reference_rows, "token_count", "squared_error_sum"),
         ("09-subset-stability.png", "Cross-condition subset Jaccard", stability_rows, "token_count", "jaccard"),
+        ("10-effective-rank-gain.png", "Effective rank versus reconstruction gain", sources["effective-rank.json"], "mean_effective_rank", "reconstruction_gain"),
     )
     for name, title, rows, x, y in specs:
         _save_plot(plots / name, title, rows, x, y)

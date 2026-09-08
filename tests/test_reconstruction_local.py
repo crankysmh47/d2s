@@ -1,6 +1,8 @@
 from dataclasses import replace
+import json
 from math import sqrt
 from pathlib import Path
+import struct
 from types import SimpleNamespace
 
 import pytest
@@ -301,6 +303,7 @@ def test_persist_failure_rolls_back_the_entire_batch_and_allows_retry(
     assert accumulator.failures == {}
     assert accumulator.finalize().metrics[(4, condition_id(condition))].token_count == 0
     assert not list((tmp_path / "coefficients").glob("*.json"))
+    assert not list((tmp_path / "coefficients").glob("*.bin"))
     accumulator.update_layer(0, target, experts)
     accumulator.mark_batch_completed(0)
     assert accumulator.completed_batches == {0}
@@ -723,6 +726,165 @@ def test_finalization_uses_exact_nearest_rank_k_way_merge_without_materializing_
     assert all(chunk.iterations == 1 for chunk in chunks)
 
 
+def test_production_distribution_chunks_stream_fixed_binary_buffers_and_reject_corruption(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Persisted chunks are a small manifest plus sequential FP64 data, never arrays."""
+
+    accumulator = ReconstructionLocalAccumulator(
+        num_layers=1,
+        num_experts=8,
+        conditions={4: (RIDGE,)},
+        checkpoint_dir=tmp_path,
+        run_signature="binary-chunks",
+    )
+    key = (4, condition_id(RIDGE))
+    distribution_names = (
+        "coefficients",
+        "coefficient_abs",
+        "relative_error",
+        "cosine",
+        "gram_condition",
+    )
+    for batch, values in enumerate(((1.0, 5.0, 9.0), (2.0, 6.0, 10.0), (3.0, 7.0, 11.0))):
+        accumulator._pending_distributions[key] = {  # type: ignore[attr-defined]
+            0: {name: list(values) for name in distribution_names}
+        }
+        accumulator.mark_batch_completed(batch)
+
+    manifest_paths = sorted((tmp_path / "coefficients").glob("*.json"))
+    assert len(manifest_paths) == 3
+    manifest = json.loads(manifest_paths[0].read_text(encoding="utf-8"))
+    assert manifest["format"] == "phase1a5-distribution-fp64-v1"
+    entries = manifest["layers"]["0"]
+    assert set(entries) == set(distribution_names)
+    assert all(isinstance(entry, dict) and not any(isinstance(value, list) for value in entry.values()) for entry in entries.values())
+    data_path = manifest_paths[0].with_suffix(".bin")
+    assert data_path.is_file()
+    original_data = data_path.read_bytes()
+
+    original_open = Path.open
+
+    class FixedReadHandle:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def __enter__(self):
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._handle.__exit__(*args)
+
+        def read(self, size: int = -1):
+            assert 0 < size <= 8 * 1024, "reader attempted to materialize a binary chunk"
+            return self._handle.read(size)
+
+        def __getattr__(self, name: str):
+            return getattr(self._handle, name)
+
+    def guarded_open(path: Path, *args, **kwargs):
+        handle = original_open(path, *args, **kwargs)
+        if Path(path).suffix == ".bin" and args and args[0] == "rb":
+            return FixedReadHandle(handle)
+        return handle
+
+    def fail_array_read(*_args, **_kwargs):
+        raise AssertionError("persisted distributions must not be loaded as JSON arrays")
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    monkeypatch.setattr(Path, "read_text", fail_array_read)
+    monkeypatch.setattr(Path, "read_bytes", fail_array_read)
+    quantiles = accumulator._nearest_from_sorted_chunks(  # type: ignore[attr-defined]
+        accumulator._iter_distribution_chunks(key, "coefficients"),  # type: ignore[attr-defined]
+        total_count=9,
+        percentiles=(0.01, 0.5, 0.9, 0.99),
+    )
+    assert quantiles == {0.01: 1.0, 0.5: 6.0, 0.9: 11.0, 0.99: 11.0}
+
+    monkeypatch.undo()
+    data_path.write_bytes(original_data + b"\x00")
+    with pytest.raises(RuntimeError, match="trailing"):
+        list(accumulator._iter_distribution_chunks(key, "coefficients"))  # type: ignore[attr-defined]
+    data_path.write_bytes(original_data)
+
+    truncated = manifest_paths[1].with_suffix(".bin")
+    original_truncated_data = truncated.read_bytes()
+    truncated.write_bytes(original_truncated_data[:-1])
+    with pytest.raises(RuntimeError, match="truncated"):
+        list(accumulator._iter_distribution_chunks(key, "coefficients"))  # type: ignore[attr-defined]
+    truncated.write_bytes(original_truncated_data)
+    malformed = json.loads(manifest_paths[2].read_text(encoding="utf-8"))
+    malformed["layers"]["0"]["coefficients"]["count"] = "three"
+    manifest_paths[2].write_text(json.dumps(malformed), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="malformed"):
+        list(accumulator._iter_distribution_chunks(key, "coefficients"))  # type: ignore[attr-defined]
+
+
+def test_distribution_reader_rejects_in_range_order_preserving_binary_corruption(
+    tmp_path: Path,
+) -> None:
+    """Manifest metadata must authenticate every streamed distribution value."""
+
+    accumulator = ReconstructionLocalAccumulator(
+        num_layers=1,
+        num_experts=8,
+        conditions={4: (RIDGE,)},
+        checkpoint_dir=tmp_path,
+        run_signature="binary-chunk-authentication",
+    )
+    key = (4, condition_id(RIDGE))
+    accumulator._pending_distributions[key] = {  # type: ignore[attr-defined]
+        0: {
+            "coefficients": [1.0, 5.0, 9.0],
+            "coefficient_abs": [1.0, 5.0, 9.0],
+            "relative_error": [1.0, 5.0, 9.0],
+            "cosine": [1.0, 5.0, 9.0],
+            "gram_condition": [1.0, 5.0, 9.0],
+        }
+    }
+    accumulator.mark_batch_completed(0)
+    data_path = next((tmp_path / "coefficients").glob("*.bin"))
+    data = bytearray(data_path.read_bytes())
+    data[8:16] = struct.pack("<d", 6.0)
+    data_path.write_bytes(data)
+
+    with pytest.raises(RuntimeError, match="malformed"):
+        list(
+            value
+            for chunk in accumulator._iter_distribution_chunks(key, "coefficients")  # type: ignore[attr-defined]
+            for value in chunk
+        )
+
+
+def test_checkpoint_loader_explicitly_rejects_legacy_distribution_format(
+    tmp_path: Path,
+) -> None:
+    """A state written before the binary chunk contract cannot be resumed silently."""
+
+    accumulator = ReconstructionLocalAccumulator(
+        num_layers=1,
+        num_experts=8,
+        conditions={4: (RIDGE,)},
+        checkpoint_dir=tmp_path,
+        run_signature="legacy-chunk-format",
+    )
+    accumulator._persist()  # type: ignore[attr-defined]
+    state_path = tmp_path / "reconstruction_local_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state.pop("distribution_chunk_format", None)
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="distribution checkpoint format"):
+        ReconstructionLocalAccumulator(
+            num_layers=1,
+            num_experts=8,
+            conditions={4: (RIDGE,)},
+            checkpoint_dir=tmp_path,
+            run_signature="legacy-chunk-format",
+        )
+
+
 def test_zero_d0_relative_errors_are_undefined_and_resume_without_double_counting(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -767,3 +929,50 @@ def test_zero_d0_relative_errors_are_undefined_and_resume_without_double_countin
     ).finalize().metrics[(4, "ridge:0.1")]
     assert resumed.relative_error_defined_count == 1
     assert resumed.relative_error_undefined_count == 1
+
+
+def test_rollback_after_zero_d0_discards_defined_and_undefined_relative_error_counts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed microbatch cannot leak a zero-target accounting delta into resume."""
+
+    sparse = _result(
+        torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]]),
+        torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]], dtype=torch.float64),
+        torch.zeros(2, dtype=torch.float64),
+    )
+    full = _result(
+        torch.arange(8).expand(2, -1),
+        torch.ones((2, 8), dtype=torch.float64),
+        torch.zeros(2, dtype=torch.float64),
+    )
+    monkeypatch.setattr(reconstruction_local, "score_reconstruction", lambda *_args: sparse)
+    monkeypatch.setattr(reconstruction_local, "score_full_reference", lambda *_args: full)
+    accumulator = ReconstructionLocalAccumulator(
+        num_layers=1,
+        num_experts=8,
+        conditions={4: (RIDGE,)},
+        checkpoint_dir=tmp_path,
+        run_signature="rollback-zero-relative-error",
+    )
+    snapshot = accumulator.snapshot()
+    target = torch.tensor([[1.0], [0.0]])
+    experts = torch.zeros(2, 8, 1)
+    experts[:, 0, 0] = 1.0
+    accumulator.update_layer(0, target, experts)
+    accumulator.restore(snapshot)
+    accumulator.record_failure(0, "injected after zero-D0")
+
+    result = accumulator.finalize().metrics[(4, "ridge:0.1")]
+    assert result.token_count == 0
+    assert result.relative_error_defined_count == 0
+    assert result.relative_error_undefined_count == 0
+    resumed = ReconstructionLocalAccumulator(
+        num_layers=1,
+        num_experts=8,
+        conditions={4: (RIDGE,)},
+        checkpoint_dir=tmp_path,
+        run_signature="rollback-zero-relative-error",
+    ).finalize().metrics[(4, "ridge:0.1")]
+    assert resumed.relative_error_defined_count == 0
+    assert resumed.relative_error_undefined_count == 0

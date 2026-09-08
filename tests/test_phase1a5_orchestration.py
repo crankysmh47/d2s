@@ -398,6 +398,78 @@ def test_smoke_resume_rejects_pre_svd_evidence_even_when_source_is_compatible(
     assert len(calls) == calls_before_resume
 
 
+@pytest.mark.parametrize(
+    "drift", ("source_hash", "code_revision", "token_identity", "microbatch", "config")
+)
+def test_smoke_resume_rejects_any_live_provenance_drift_without_overwriting_evidence(
+    tmp_path: Path, drift: str
+) -> None:
+    """Resume is an immutable reuse, not permission to replace stale smoke evidence."""
+
+    from ppmoe.experiments.phase1a5 import StageError, run_phase1a5
+
+    config = Phase1A5Config.load(CONFIG_PATH)
+    dependencies, _ = _dependencies()
+    run_phase1a5(config, "source", False, tmp_path, 100, dependencies=dependencies)
+    run_phase1a5(config, "smoke", False, tmp_path, 100, dependencies=dependencies)
+    smoke_path = tmp_path / "stages" / "smoke.json"
+    original = smoke_path.read_bytes()
+    resumed_config, resumed_microbatch = config, 100
+    if drift == "source_hash":
+        dependencies.source_verifier = lambda *_args, **_kwargs: {
+            **_source_manifest(),
+            "stage_sha256": {"local": "f" * 64, "rollout": "b" * 64, "m0": "c" * 64},
+        }
+    elif drift == "code_revision":
+        dependencies.source_verifier = lambda *_args, **_kwargs: {
+            **_source_manifest(),
+            "code_revision": {"commit": "2" * 40, "dirty": False},
+        }
+    elif drift == "token_identity":
+        dependencies.calibration_loader = lambda *_args: (
+            torch.full((100, 1_000), 2, dtype=torch.long),
+            torch.ones((100, 1_000), dtype=torch.long),
+        )
+    elif drift == "microbatch":
+        resumed_microbatch = 50
+    else:
+        object.__setattr__(config, "solver_version", "phase1a5-oracle-v2")
+        resumed_config = config
+
+    with pytest.raises(StageError):
+        run_phase1a5(
+            resumed_config,
+            "smoke",
+            True,
+            tmp_path,
+            resumed_microbatch,
+            dependencies=dependencies,
+        )
+    assert smoke_path.read_bytes() == original
+
+
+def test_smoke_resume_rejects_malformed_svd_evidence_without_overwriting_it(
+    tmp_path: Path,
+) -> None:
+    from ppmoe.experiments.phase1a5 import StageError, run_phase1a5
+
+    config = Phase1A5Config.load(CONFIG_PATH)
+    dependencies, _ = _dependencies()
+    run_phase1a5(config, "source", False, tmp_path, 100, dependencies=dependencies)
+    run_phase1a5(config, "smoke", False, tmp_path, 100, dependencies=dependencies)
+    smoke_path = tmp_path / "stages" / "smoke.json"
+    smoke = json.loads(smoke_path.read_text(encoding="utf-8"))
+    smoke["families"]["free_bound"]["svd_verification"]["sparse:K4:free_bound"][
+        "max_relative_objective_error"
+    ] = "not-a-number"
+    smoke_path.write_text(json.dumps(smoke), encoding="utf-8")
+    malformed = smoke_path.read_bytes()
+
+    with pytest.raises(StageError, match="SVD evidence"):
+        run_phase1a5(config, "smoke", True, tmp_path, 100, dependencies=dependencies)
+    assert smoke_path.read_bytes() == malformed
+
+
 def test_unit_regression_consumes_captured_inference_tensors_inside_inference_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

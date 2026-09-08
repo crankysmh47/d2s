@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+import hashlib
 from heapq import heappop, heappush
 import json
 from math import ceil, isfinite, sqrt
+import os
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+import struct
+import tempfile
+from typing import Iterable, Iterator, Mapping, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -25,6 +29,108 @@ from ppmoe.oracle.reconstruction import (
     verify_pseudoinverse_svd,
 )
 from ppmoe.provenance import atomic_write_json
+
+
+_DISTRIBUTION_CHUNK_FORMAT = "phase1a5-distribution-fp64-v1"
+_DISTRIBUTION_NAMES = (
+    "coefficients",
+    "coefficient_abs",
+    "relative_error",
+    "cosine",
+    "gram_condition",
+)
+_DISTRIBUTION_READER_VALUES = 1024
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    """Durably replace one binary payload without exposing a partial file."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+class _FixedBufferFP64Reader(Iterator[float]):
+    """Sequential little-endian FP64 reader retaining one bounded value buffer."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        offset: int,
+        count: int,
+        finite_minimum: float,
+        finite_maximum: float,
+        sha256: str,
+    ) -> None:
+        self._handle = path.open("rb")
+        self._handle.seek(offset)
+        self._remaining = count
+        self._finite_minimum = finite_minimum
+        self._finite_maximum = finite_maximum
+        self._sha256 = sha256
+        self._digest = hashlib.sha256()
+        self._previous: float | None = None
+        self._buffer: tuple[float, ...] = ()
+        self._buffer_index = 0
+
+    def __iter__(self) -> _FixedBufferFP64Reader:
+        return self
+
+    def __next__(self) -> float:
+        if self._buffer_index == len(self._buffer):
+            if self._remaining == 0:
+                if self._digest.hexdigest() != self._sha256:
+                    self.close()
+                    raise RuntimeError("completed distribution data is malformed")
+                self.close()
+                raise StopIteration
+            value_count = min(_DISTRIBUTION_READER_VALUES, self._remaining)
+            payload = self._handle.read(value_count * 8)
+            if len(payload) != value_count * 8:
+                self.close()
+                raise RuntimeError("completed distribution data is truncated")
+            self._digest.update(payload)
+            self._buffer = struct.unpack(f"<{value_count}d", payload)
+            self._buffer_index = 0
+        value = self._buffer[self._buffer_index]
+        self._buffer_index += 1
+        self._remaining -= 1
+        if (
+            not isfinite(value)
+            or value < self._finite_minimum
+            or value > self._finite_maximum
+            or (self._previous is None and value != self._finite_minimum)
+            or (self._remaining == 0 and value != self._finite_maximum)
+            or (self._previous is not None and value < self._previous)
+        ):
+            self.close()
+            raise RuntimeError("completed distribution data is malformed or unsorted")
+        self._previous = value
+        return value
+
+    def close(self) -> None:
+        if not self._handle.closed:
+            self._handle.close()
+
+    def __del__(self) -> None:
+        self.close()
 
 
 def condition_id(condition: ReconstructionCondition) -> str:
@@ -407,6 +513,8 @@ class ReconstructionLocalAccumulator:
         if path is None or not path.exists():
             return
         state = json.loads(path.read_text(encoding="utf-8"))
+        if state.get("distribution_chunk_format") != _DISTRIBUTION_CHUNK_FORMAT:
+            raise ValueError("reconstruction local distribution checkpoint format is unsupported")
         if state.get("run_signature") != self.run_signature:
             raise ValueError(
                 "reconstruction local checkpoint signature does not match inputs"
@@ -500,6 +608,7 @@ class ReconstructionLocalAccumulator:
         atomic_write_json(
             path,
             {
+                "distribution_chunk_format": _DISTRIBUTION_CHUNK_FORMAT,
                 "run_signature": self.run_signature,
                 "shape": [self.num_layers, self.num_experts],
                 "conditions": [list(key) for key in self._condition_keys],
@@ -1012,34 +1121,72 @@ class ReconstructionLocalAccumulator:
             / f"k{key[0]}-{safe}-batch-{batch_index:09d}.json"
         )
 
+    def _chunk_data_path(self, key: tuple[int, str], batch_index: int) -> Path:
+        return self._chunk_path(key, batch_index).with_suffix(".bin")
+
+    def _write_distribution_chunk(
+        self, key: tuple[int, str], batch_index: int
+    ) -> tuple[Path, Path]:
+        """Commit data first, then its manifest; state publication is the pair commit."""
+
+        manifest_path = self._chunk_path(key, batch_index)
+        data_path = self._chunk_data_path(key, batch_index)
+        payload = bytearray()
+        layers: dict[str, dict[str, dict[str, object]]] = {}
+        for layer, distributions in sorted(self._pending_distributions[key].items()):
+            if set(distributions) != set(_DISTRIBUTION_NAMES):
+                raise RuntimeError("pending distribution chunk has incomplete fields")
+            entries: dict[str, dict[str, object]] = {}
+            for name in _DISTRIBUTION_NAMES:
+                values = sorted(float(value) for value in distributions[name])
+                if not all(isfinite(value) for value in values):
+                    raise FloatingPointError("pending distribution chunk is non-finite")
+                offset = len(payload)
+                if values:
+                    encoded = struct.pack(f"<{len(values)}d", *values)
+                    payload.extend(encoded)
+                    finite_minimum: float | None = values[0]
+                    finite_maximum: float | None = values[-1]
+                    digest = hashlib.sha256(encoded).hexdigest()
+                else:
+                    finite_minimum = None
+                    finite_maximum = None
+                    digest = hashlib.sha256().hexdigest()
+                entries[name] = {
+                    "offset": offset,
+                    "count": len(values),
+                    "sorted": True,
+                    "finite_min": finite_minimum,
+                    "finite_max": finite_maximum,
+                    "sha256": digest,
+                }
+            layers[str(layer)] = entries
+        manifest = {
+            "format": _DISTRIBUTION_CHUNK_FORMAT,
+            "byte_order": "little",
+            "dtype": "float64",
+            "data_file": data_path.name,
+            "layers": layers,
+        }
+        _atomic_write_bytes(data_path, bytes(payload))
+        try:
+            atomic_write_json(manifest_path, manifest)
+        except Exception:
+            data_path.unlink(missing_ok=True)
+            raise
+        return manifest_path, data_path
+
     def mark_batch_completed(self, batch_index: int) -> None:
         if batch_index in self.completed_batches or batch_index in self.failures:
             raise ValueError("batch is already terminal")
         transaction = self._transaction_snapshot or self.snapshot()
-        chunk_paths = (
-            [self._chunk_path(key, batch_index) for key in self._condition_keys]
-            if self.checkpoint_dir
-            else []
-        )
+        chunk_paths: list[Path] = []
         # Chunks are atomically written first.  An interrupted checkpoint leaves only
         # ignored orphan chunks because the completed-batch state remains unchanged.
         try:
             if self.checkpoint_dir:
-                for key, path in zip(self._condition_keys, chunk_paths, strict=True):
-                    atomic_write_json(
-                        path,
-                        {
-                            "layers": {
-                                str(layer): {
-                                    name: sorted(values)
-                                    for name, values in distributions.items()
-                                }
-                                for layer, distributions in sorted(
-                                    self._pending_distributions[key].items()
-                                )
-                            }
-                        },
-                    )
+                for key in self._condition_keys:
+                    chunk_paths.extend(self._write_distribution_chunk(key, batch_index))
             self._pending_distributions = {key: {} for key in self._condition_keys}
             self.completed_batches.add(batch_index)
             self._persist()
@@ -1061,37 +1208,139 @@ class ReconstructionLocalAccumulator:
             self.restore(snapshot)
             raise
 
+    @staticmethod
+    def _load_distribution_manifest(
+        manifest_path: Path, data_path: Path
+    ) -> dict[int, dict[str, dict[str, object]]]:
+        """Validate a compact manifest and every byte range before streaming it."""
+
+        try:
+            with manifest_path.open("r", encoding="utf-8") as handle:
+                manifest = json.load(handle)
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError("completed distribution manifest is malformed") from error
+        if (
+            not isinstance(manifest, Mapping)
+            or manifest.get("format") != _DISTRIBUTION_CHUNK_FORMAT
+            or manifest.get("byte_order") != "little"
+            or manifest.get("dtype") != "float64"
+            or manifest.get("data_file") != data_path.name
+            or not isinstance(manifest.get("layers"), Mapping)
+            or not data_path.is_file()
+        ):
+            raise RuntimeError("completed distribution manifest is malformed")
+        ranges: list[tuple[int, int]] = []
+        parsed: dict[int, dict[str, dict[str, object]]] = {}
+        try:
+            for raw_layer, raw_entries in manifest["layers"].items():
+                layer = int(raw_layer)
+                if str(layer) != str(raw_layer) or layer < 0:
+                    raise ValueError
+                if not isinstance(raw_entries, Mapping) or set(raw_entries) != set(
+                    _DISTRIBUTION_NAMES
+                ):
+                    raise ValueError
+                entries: dict[str, dict[str, object]] = {}
+                for name in _DISTRIBUTION_NAMES:
+                    entry = raw_entries[name]
+                    if not isinstance(entry, Mapping) or set(entry) != {
+                        "offset",
+                        "count",
+                        "sorted",
+                        "finite_min",
+                        "finite_max",
+                        "sha256",
+                    }:
+                        raise ValueError
+                    offset, count = entry["offset"], entry["count"]
+                    if (
+                        not isinstance(offset, int)
+                        or isinstance(offset, bool)
+                        or offset < 0
+                        or not isinstance(count, int)
+                        or isinstance(count, bool)
+                        or count < 0
+                        or entry["sorted"] is not True
+                    ):
+                        raise ValueError
+                    finite_minimum, finite_maximum = (
+                        entry["finite_min"],
+                        entry["finite_max"],
+                    )
+                    digest = entry["sha256"]
+                    if count == 0:
+                        if finite_minimum is not None or finite_maximum is not None:
+                            raise ValueError
+                    elif (
+                        not isinstance(finite_minimum, (int, float))
+                        or isinstance(finite_minimum, bool)
+                        or not isinstance(finite_maximum, (int, float))
+                        or isinstance(finite_maximum, bool)
+                        or not isfinite(float(finite_minimum))
+                        or not isfinite(float(finite_maximum))
+                        or float(finite_minimum) > float(finite_maximum)
+                    ):
+                        raise ValueError
+                    if (
+                        not isinstance(digest, str)
+                        or len(digest) != 64
+                        or any(character not in "0123456789abcdef" for character in digest)
+                    ):
+                        raise ValueError
+                    end = offset + count * 8
+                    ranges.append((offset, end))
+                    entries[name] = {
+                        "offset": offset,
+                        "count": count,
+                        "finite_min": finite_minimum,
+                        "finite_max": finite_maximum,
+                        "sha256": digest,
+                    }
+                if layer in parsed:
+                    raise ValueError
+                parsed[layer] = entries
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError("completed distribution manifest is malformed") from error
+        expected_offset = 0
+        for offset, end in sorted(ranges):
+            if offset != expected_offset or end < offset:
+                raise RuntimeError("completed distribution data has a gap or overlap")
+            expected_offset = end
+        if expected_offset != data_path.stat().st_size:
+            raise RuntimeError("completed distribution data is truncated or trailing")
+        return parsed
+
     def _iter_distribution_chunks(
         self, key: tuple[int, str], name: str, layer: int | None = None
     ) -> Iterable[Iterable[float]]:
         """Yield one already-sorted checkpoint distribution at a time."""
 
+        if name not in _DISTRIBUTION_NAMES:
+            raise ValueError("unknown persisted distribution")
         if self.checkpoint_dir:
             for batch in sorted(self.completed_batches):
-                path = self._chunk_path(key, batch)
-                if not path.exists():
+                manifest_path = self._chunk_path(key, batch)
+                data_path = self._chunk_data_path(key, batch)
+                if not manifest_path.exists() or not data_path.exists():
                     raise RuntimeError("completed batch is missing its coefficient chunk")
-                payload = json.loads(path.read_text(encoding="utf-8"))
-                layers = payload.get("layers")
-                if not isinstance(layers, Mapping):
-                    raise RuntimeError("completed batch has malformed distribution chunk")
-                selected_layers = (
-                    (str(layer), layers.get(str(layer)))
-                    if layer is not None
-                    else None
-                )
-                items = (selected_layers,) if selected_layers is not None else layers.items()
-                for _, distributions in items:
-                    if distributions is None:
+                layers = self._load_distribution_manifest(manifest_path, data_path)
+                selected_layers = (layer,) if layer is not None else tuple(sorted(layers))
+                for selected_layer in selected_layers:
+                    if selected_layer not in layers:
+                        # A completed microbatch can contain only the layers that
+                        # were reached before a later layer failed. Its rollback or
+                        # resume metrics must therefore ignore absent layer chunks.
                         continue
-                    if not isinstance(distributions, Mapping) or not isinstance(
-                        distributions.get(name), list
-                    ):
-                        raise RuntimeError("completed batch has malformed distribution chunk")
-                    values = distributions[name]
-                    if values != sorted(values):
-                        raise RuntimeError("completed batch has unsorted distribution chunk")
-                    yield (float(value) for value in values)
+                    entry = layers[selected_layer][name]
+                    if int(entry["count"]) > 0:
+                        yield _FixedBufferFP64Reader(
+                            data_path,
+                            offset=int(entry["offset"]),
+                            count=int(entry["count"]),
+                            finite_minimum=float(entry["finite_min"]),
+                            finite_maximum=float(entry["finite_max"]),
+                            sha256=str(entry["sha256"]),
+                        )
         pending_layers = self._pending_distributions[key]
         items = (
             ((layer, pending_layers.get(layer)),)

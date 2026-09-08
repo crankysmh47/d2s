@@ -533,6 +533,39 @@ def _matches_current_source(
     )
 
 
+def _fresh_smoke_provenance(
+    config: Phase1A5Config,
+    artifact_root: Path,
+    microbatch_size: int,
+    dependencies: Phase1A5Dependencies,
+) -> tuple[Mapping[str, object], dict[str, str], str, str]:
+    """Reverify the frozen source and smoke token identity without writing a stage."""
+
+    assert (
+        dependencies.source_verifier is not None
+        and dependencies.calibration_loader is not None
+    )
+    manifest = dependencies.source_verifier(
+        config.source_artifact_root.resolve(), artifact_root, config
+    )
+    source_hashes = _source_hashes(manifest)
+    input_ids, attention_mask = dependencies.calibration_loader(
+        Path(str(manifest["source_root"])), manifest
+    )
+    input_ids, attention_mask = _first_valid_tokens(input_ids, attention_mask, 2_048)
+    token_hash = _canonical_hash(
+        {"tokens": input_ids.tolist(), "mask": attention_mask.tolist()}
+    )
+    return (
+        manifest,
+        source_hashes,
+        token_hash,
+        _execution_signature(
+            config, manifest, microbatch_size, stage="smoke", token_hash=token_hash
+        ),
+    )
+
+
 def _read_current_smoke(
     artifact_root: Path,
     config: Phase1A5Config,
@@ -737,6 +770,22 @@ def _smoke_stage(
     existing_path = _stage_path(artifact_root, "smoke")
     if existing_path.exists():
         existing = _read_stage(artifact_root, "smoke", _config_signature(config))
+        if resume:
+            fresh_manifest, fresh_hashes, _token_hash, fresh_signature = (
+                _fresh_smoke_provenance(
+                    config, artifact_root, microbatch_size, dependencies
+                )
+            )
+            if (
+                source_stage.get("input_signature")
+                != _source_signature(config, fresh_manifest, microbatch_size)
+                or source_hashes != fresh_hashes
+                or existing.get("input_signature") != fresh_signature
+            ):
+                raise StageError(
+                    "smoke resume provenance does not match freshly verified source, "
+                    "code, configuration, token identity, and microbatch"
+                )
         compatible = (
             _matches_current_source(existing, source_stage, source_hashes)
             and existing.get("execution_microbatch_size") == microbatch_size

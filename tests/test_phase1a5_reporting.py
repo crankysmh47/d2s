@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 from itertools import combinations
 from pathlib import Path
@@ -82,22 +83,39 @@ def _metric(
     }
 
 
-def _solver(condition: str, tokens: int) -> dict[str, object]:
-    values: dict[str, object] = {
-        "solver_source_counts": {condition: tokens},
-        "cholesky_fallback_count": 0,
-        "degenerate_ridge_count": 0,
-        "max_relative_system_residual": 0.0,
-    }
+def _solver(condition: str, tokens: int, k: int) -> dict[str, object]:
+    values: dict[str, object] = {"solver_source_counts": {condition: tokens}}
     if condition == "bounded":
         values.update(
             {
+                "bounded_lower_saturation_count": 0,
+                "bounded_upper_saturation_count": 0,
                 "bounded_failure_count": 0,
                 "bounded_uncertified_count": 0,
                 "bounded_certified_count": tokens,
                 "bounded_solver_candidate_count": tokens,
                 "bounded_coefficient_bound_violation_count": 0,
+                "bounded_max_primal_residual": 0.0,
+                "bounded_max_stationarity_residual": 0.0,
+                "bounded_max_complementarity_residual": 0.0,
+                "bounded_max_iterations": 0,
                 "bounded_face_enumeration_count": tokens,
+                "bounded_max_face_enumeration_count": 0,
+            }
+        )
+    else:
+        values.update(
+            {
+                "cholesky_fallback_count": 0,
+                "degenerate_ridge_count": 0,
+                "max_relative_system_residual": 0.0,
+            }
+        )
+    if condition == "free_bound":
+        values.update(
+            {
+                "tau_g": 1e-12,
+                "pseudoinverse_effective_rank_counts": {str(k): tokens},
             }
         )
     return values
@@ -156,12 +174,12 @@ def _local_result() -> dict[str, object]:
         },
         "co_selection": {},
         "solver_diagnostics": {
-            str((k, condition)): _solver(condition, 2_400_000)
+            str((k, condition)): _solver(condition, 2_400_000, k)
             for k in (4, 6)
             for condition in ("unit", "free_bound", "ridge:10", "ridge:1", "ridge:0.1", "ridge:0.01", "ridge:0.001", "bounded")
         },
         "layer_solver_diagnostics": {
-            str((layer, k, condition)): _solver(condition, 100_000)
+            str((layer, k, condition)): _solver(condition, 100_000, k)
             for layer in range(24)
             for k in (4, 6)
             for condition in ("unit", "free_bound", "ridge:10", "ridge:1", "ridge:0.1", "ridge:0.01", "ridge:0.001", "bounded")
@@ -176,7 +194,7 @@ def _local_result() -> dict[str, object]:
             for left, right in combinations(sorted(("unit", "free_bound", "ridge:10", "ridge:1", "ridge:0.1", "ridge:0.01", "ridge:0.001", "bounded")), 2)
         },
         "reference_diagnostics": {
-            str((layer, f"R8[{condition}]")): _solver(condition, 100_000)
+            str((layer, f"R8[{condition}]")): _solver(condition, 100_000, 8)
             for layer in range(24)
             for condition in ("unit", "free_bound", "ridge:10", "ridge:1", "ridge:0.1", "ridge:0.01", "ridge:0.001", "bounded")
         },
@@ -348,6 +366,136 @@ def test_report_emits_complete_solver_rows_and_bounded_only_saturation_rows(
     saturation = json.loads((tmp_path / "plot-source" / "bound-saturation.json").read_text(encoding="utf-8"))
     assert saturation and {row["condition"] for row in saturation} == {"bounded"}
     assert "plot-source/solver-diagnostics.json" in manifest.output_hashes
+
+
+def test_solver_rows_use_one_flat_schema_and_embed_svd_and_effective_rank_evidence(
+    tmp_path: Path,
+) -> None:
+    """CSV and JSON must carry the same validated condition-aware evidence rows."""
+
+    from ppmoe.reporting.phase1a5 import _SOLVER_ROW_FIELDS
+
+    _write_complete_artifacts(tmp_path)
+
+    manifest = _render(tmp_path)
+
+    rows = json.loads(
+        (tmp_path / "plot-source" / "solver-diagnostics.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    with (tmp_path / "plot-source" / "solver-diagnostics.csv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        csv_rows = list(csv.DictReader(handle))
+    required = {
+        "scope",
+        "layer",
+        "k",
+        "condition",
+        "token_count",
+        "coefficient_count",
+        "numerical_failure_count",
+        "layer_coverage_count",
+        "solver_source_counts",
+        "effective_rank_counts",
+        "gram_condition_defined_count",
+        "gram_condition_p99",
+        "svd_identity",
+        "svd_sample_count",
+        "svd_sample_count_by_layer",
+        "svd_rank_equal",
+        "svd_max_relative_objective_error",
+    }
+    assert rows and required.issubset(rows[0])
+    assert {tuple(sorted(row)) for row in rows} == {tuple(sorted(rows[0]))}
+    assert all(set(row) == set(rows[0]) for row in csv_rows)
+    assert tuple(csv_rows[0]) == _SOLVER_ROW_FIELDS
+    r8_rows = [row for row in rows if row["scope"] == "r8"]
+    assert r8_rows and all(
+        row["coefficient_count"] == 8 * row["token_count"]
+        and row["numerical_failure_count"] == 0
+        for row in r8_rows
+    )
+    free_rows = [
+        row
+        for row in rows
+        if row["condition"] in {"free_bound", "R8[free_bound]"}
+    ]
+    assert free_rows
+    assert all(row["svd_identity"] and row["svd_sample_count"] == 384 for row in free_rows)
+    assert all(
+        row["svd_sample_count_by_layer"]
+        and row["svd_rank_equal"] is True
+        and row["svd_max_relative_objective_error"] <= 1e-9
+        for row in free_rows
+    )
+    effective_rank = json.loads(
+        (tmp_path / "plot-source" / "effective-rank.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert effective_rank
+    assert all(
+        row["mean_effective_rank"] == pytest.approx(row["k"])
+        and "reconstruction_gain" in row
+        for row in effective_rank
+    )
+    assert "plots/10-effective-rank-gain.png" in manifest.output_hashes
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing_bounded_field", "lack bounded_max_primal_residual"),
+        ("nonfinite_bounded_field", "lack bounded_max_stationarity_residual"),
+        ("inconsistent_bounded_certificate", "bounded certification"),
+        ("inapplicable_ridge_field", "inapplicable bounded"),
+        ("duplicate_solver_identity", "duplicate solver diagnostics"),
+    ],
+)
+def test_report_rejects_incomplete_inconsistent_or_duplicate_solver_schema(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    from ppmoe.reporting.phase1a5 import ReportValidationError
+
+    _write_complete_artifacts(tmp_path)
+    path = tmp_path / "stages" / "local.json"
+    local = _load(path)
+    diagnostics = local["result"]["solver_diagnostics"]
+    bounded = diagnostics["(4, 'bounded')"]
+    if mutation == "missing_bounded_field":
+        bounded.pop("bounded_max_primal_residual")
+    elif mutation == "nonfinite_bounded_field":
+        bounded["bounded_max_stationarity_residual"] = float("nan")
+    elif mutation == "inconsistent_bounded_certificate":
+        bounded["bounded_certified_count"] -= 1
+    elif mutation == "inapplicable_ridge_field":
+        diagnostics["(4, 'ridge:1')"]["bounded_failure_count"] = 0
+    else:
+        diagnostics['(4, "unit")'] = dict(diagnostics["(4, 'unit')"])
+    _write_json(path, local)
+
+    with pytest.raises(ReportValidationError, match=message):
+        _render(tmp_path)
+
+
+def test_report_rejects_uncertified_r8_bounded_solver_evidence(tmp_path: Path) -> None:
+    """The full-reference bounded condition is subject to the same KKT gate."""
+
+    from ppmoe.reporting.phase1a5 import ReportValidationError
+
+    _write_complete_artifacts(tmp_path)
+    path = tmp_path / "stages" / "local.json"
+    local = _load(path)
+    bounded = local["result"]["reference_diagnostics"]["(0, 'R8[bounded]')"]
+    bounded["bounded_failure_count"] = 1
+    bounded["bounded_uncertified_count"] = 1
+    bounded["bounded_certified_count"] -= 1
+    _write_json(path, local)
+
+    with pytest.raises(ReportValidationError, match="bounded KKT evidence is invalid"):
+        _render(tmp_path)
 
 
 @pytest.mark.parametrize(
