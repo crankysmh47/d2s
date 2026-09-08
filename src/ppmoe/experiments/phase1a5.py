@@ -743,6 +743,16 @@ def _smoke_stage(
         )
         if compatible:
             if resume:
+                families = existing.get("families")
+                if not isinstance(families, Mapping) or not _svd_verification_is_complete(
+                    families.get("free_bound", {}).get("svd_verification")
+                    if isinstance(families.get("free_bound"), Mapping)
+                    else None,
+                    config,
+                ):
+                    raise StageError(
+                        "compatible smoke evidence lacks the required complete SVD evidence; cannot resume"
+                    )
                 return existing
             raise StageError(
                 "compatible smoke evidence is immutable; rerun with --resume"

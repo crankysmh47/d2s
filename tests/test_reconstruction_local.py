@@ -604,7 +604,9 @@ def test_condition_metrics_are_exact_known_values_pooled_per_layer_and_resumable
     assert (metric.above_four_count, metric.above_four_rate) == (1, pytest.approx(1 / 12))
     assert metric.mean_absolute_deviation_from_one == pytest.approx(14 / 12)
     assert metric.l2_deviation_from_one == pytest.approx(sqrt(36 / 12))
-    assert metric.relative_error_mean == pytest.approx(sqrt(2) / 3)
+    assert metric.relative_error_defined_count == 2
+    assert metric.relative_error_undefined_count == 1
+    assert metric.relative_error_mean == pytest.approx(sqrt(2) / 2)
     assert metric.relative_error_median == 0.0
     assert metric.relative_error_p90 == pytest.approx(sqrt(2))
     assert metric.relative_error_p95 == pytest.approx(sqrt(2))
@@ -684,3 +686,84 @@ def test_bounded_saturation_rates_use_exact_strict_thresholds(
     assert metric.bounded_lower_saturation_rate == pytest.approx(1 / 8)
     assert metric.bounded_upper_saturation_count == 2
     assert metric.bounded_upper_saturation_rate == pytest.approx(2 / 8)
+
+
+def test_finalization_uses_exact_nearest_rank_k_way_merge_without_materializing_chunks(
+    tmp_path: Path,
+) -> None:
+    """Regression: replacing the merge with concatenation must fail this test."""
+
+    accumulator = ReconstructionLocalAccumulator(
+        num_layers=1,
+        num_experts=8,
+        conditions={4: (RIDGE,)},
+        checkpoint_dir=tmp_path,
+        run_signature="streamed-quantiles",
+    )
+
+    class OnePassChunk:
+        def __init__(self, values: tuple[float, ...]) -> None:
+            self.values = values
+            self.iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            if self.iterations > 1:
+                raise AssertionError("a sorted checkpoint chunk was re-materialized")
+            yield from self.values
+
+    chunks = [OnePassChunk((1.0, 5.0, 9.0)), OnePassChunk((2.0, 6.0, 10.0)), OnePassChunk((3.0, 7.0, 11.0))]
+    quantiles = accumulator._nearest_from_sorted_chunks(  # type: ignore[attr-defined]
+        (iter(chunk) for chunk in chunks),
+        total_count=9,
+        percentiles=(0.01, 0.5, 0.9, 0.99),
+    )
+
+    assert quantiles == {0.01: 1.0, 0.5: 6.0, 0.9: 11.0, 0.99: 11.0}
+    assert all(chunk.iterations == 1 for chunk in chunks)
+
+
+def test_zero_d0_relative_errors_are_undefined_and_resume_without_double_counting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression: zero-norm D0 tokens must be excluded, never coerced to zero error."""
+
+    sparse = _result(
+        torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]]),
+        torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]], dtype=torch.float64),
+        torch.zeros(2, dtype=torch.float64),
+    )
+    full = _result(
+        torch.arange(8).expand(2, -1),
+        torch.ones((2, 8), dtype=torch.float64),
+        torch.zeros(2, dtype=torch.float64),
+    )
+    monkeypatch.setattr(reconstruction_local, "score_reconstruction", lambda *_args: sparse)
+    monkeypatch.setattr(reconstruction_local, "score_full_reference", lambda *_args: full)
+    accumulator = ReconstructionLocalAccumulator(
+        num_layers=1,
+        num_experts=8,
+        conditions={4: (RIDGE,)},
+        checkpoint_dir=tmp_path,
+        run_signature="zero-relative-error",
+    )
+    target = torch.tensor([[1.0], [0.0]])
+    experts = torch.zeros(2, 8, 1)
+    experts[:, 0, 0] = 1.0
+    accumulator.update_layer(0, target, experts)
+    accumulator.mark_batch_completed(0)
+
+    metric = accumulator.finalize().metrics[(4, "ridge:0.1")]
+    assert metric.relative_error_defined_count == 1
+    assert metric.relative_error_undefined_count == 1
+    assert metric.relative_error_mean == 0.0
+    assert metric.relative_error_median == 0.0
+    resumed = ReconstructionLocalAccumulator(
+        num_layers=1,
+        num_experts=8,
+        conditions={4: (RIDGE,)},
+        checkpoint_dir=tmp_path,
+        run_signature="zero-relative-error",
+    ).finalize().metrics[(4, "ridge:0.1")]
+    assert resumed.relative_error_defined_count == 1
+    assert resumed.relative_error_undefined_count == 1

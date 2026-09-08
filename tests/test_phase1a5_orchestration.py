@@ -376,6 +376,28 @@ def test_compatible_smoke_evidence_is_immutable_on_resume_and_nonresume(
     assert len(calls) == calls_after_first
 
 
+def test_smoke_resume_rejects_pre_svd_evidence_even_when_source_is_compatible(
+    tmp_path: Path,
+) -> None:
+    """Regression: source-compatible smoke artifacts without all SVD evidence are stale."""
+
+    from ppmoe.experiments.phase1a5 import StageError, run_phase1a5
+
+    config = Phase1A5Config.load(CONFIG_PATH)
+    dependencies, calls = _dependencies()
+    run_phase1a5(config, "source", False, tmp_path, 100, dependencies=dependencies)
+    run_phase1a5(config, "smoke", False, tmp_path, 100, dependencies=dependencies)
+    smoke_path = tmp_path / "stages" / "smoke.json"
+    smoke = json.loads(smoke_path.read_text(encoding="utf-8"))
+    del smoke["families"]["free_bound"]["svd_verification"]["R8[free_bound]"]
+    smoke_path.write_text(json.dumps(smoke), encoding="utf-8")
+    calls_before_resume = len(calls)
+
+    with pytest.raises(StageError, match="SVD evidence"):
+        run_phase1a5(config, "smoke", True, tmp_path, 100, dependencies=dependencies)
+    assert len(calls) == calls_before_resume
+
+
 def test_unit_regression_consumes_captured_inference_tensors_inside_inference_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

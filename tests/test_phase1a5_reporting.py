@@ -56,6 +56,8 @@ def _metric(
         "l2_deviation_from_one": 0.0,
         "l2_deviation_denominator": coefficients,
         "relative_error_sum": 0.0,
+        "relative_error_defined_count": tokens,
+        "relative_error_undefined_count": 0,
         "relative_error_mean": 0.0,
         "relative_error_median": 0.0,
         "relative_error_p90": 0.0,
@@ -173,7 +175,11 @@ def _local_result() -> dict[str, object]:
             for k in (4, 6)
             for left, right in combinations(sorted(("unit", "free_bound", "ridge:10", "ridge:1", "ridge:0.1", "ridge:0.01", "ridge:0.001", "bounded")), 2)
         },
-        "reference_diagnostics": {},
+        "reference_diagnostics": {
+            str((layer, f"R8[{condition}]")): _solver(condition, 100_000)
+            for layer in range(24)
+            for condition in ("unit", "free_bound", "ridge:10", "ridge:1", "ridge:0.1", "ridge:0.01", "ridge:0.001", "bounded")
+        },
         "coefficient_quantiles": {
             str((k, condition)): {
                 "p01": 1.0,
@@ -319,11 +325,29 @@ def test_report_writes_hashed_authoritative_sources_and_conservative_decision(tm
     assert all((tmp_path / path).is_file() for path in manifest.output_hashes)
     assert "plot-source/local-metrics.json" in manifest.output_hashes
     assert "plot-source/primary-table.csv" in manifest.output_hashes
+    assert "plot-source/solver-diagnostics.csv" in manifest.output_hashes
+    assert "plot-source/solver-diagnostics.json" in manifest.output_hashes
     assert "plots/01-local-nmse-rho.png" in manifest.output_hashes
     report = (tmp_path / "report.md").read_text(encoding="utf-8")
     assert "Registered Free-Reconstruction Candidate Bound" in report
     assert "no claim of an exact-span optimum" in report
     assert "trained router" in report and "inference speedup" in report
+
+
+def test_report_emits_complete_solver_rows_and_bounded_only_saturation_rows(
+    tmp_path: Path,
+) -> None:
+    _write_complete_artifacts(tmp_path)
+
+    manifest = _render(tmp_path)
+
+    rows = json.loads((tmp_path / "plot-source" / "solver-diagnostics.json").read_text(encoding="utf-8"))
+    assert len(rows) == 16 + 24 * 16 + 24 * 8
+    assert {row["scope"] for row in rows} == {"pooled", "layer", "r8"}
+    assert all("solver_source_counts" in row for row in rows)
+    saturation = json.loads((tmp_path / "plot-source" / "bound-saturation.json").read_text(encoding="utf-8"))
+    assert saturation and {row["condition"] for row in saturation} == {"bounded"}
+    assert "plot-source/solver-diagnostics.json" in manifest.output_hashes
 
 
 @pytest.mark.parametrize(
@@ -567,6 +591,11 @@ def _make_bounded_engineering_stop(root: Path) -> None:
     local["result"]["layer_solver_diagnostics"] = {
         key: value
         for key, value in local["result"]["layer_solver_diagnostics"].items()
+        if "bounded" not in key
+    }
+    local["result"]["reference_diagnostics"] = {
+        key: value
+        for key, value in local["result"]["reference_diagnostics"].items()
         if "bounded" not in key
     }
     local["result"]["subset_stability"] = {key: value for key, value in local["result"]["subset_stability"].items() if "bounded" not in key}

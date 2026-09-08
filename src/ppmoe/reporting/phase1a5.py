@@ -134,6 +134,8 @@ def _metric(metric: object, label: str) -> dict[str, object]:
         "above_four_count": _integer(metric.get("above_four_count"), f"{label} local metric schema"),
         "squared_deviation_sum": _finite(metric.get("squared_deviation_sum"), f"{label} local metric schema"),
         "relative_error_sum": _finite(metric.get("relative_error_sum"), f"{label} local metric schema"),
+        "relative_error_defined_count": _integer(metric.get("relative_error_defined_count"), f"{label} local metric schema"),
+        "relative_error_undefined_count": _integer(metric.get("relative_error_undefined_count"), f"{label} local metric schema"),
         "cosine_sum": _finite(metric.get("cosine_sum"), f"{label} local metric schema"),
         "cosine_defined_count": _integer(metric.get("cosine_defined_count"), f"{label} local metric schema"),
         "cosine_undefined_count": _integer(metric.get("cosine_undefined_count"), f"{label} local metric schema"),
@@ -156,12 +158,15 @@ def _metric(metric: object, label: str) -> dict[str, object]:
         "mean_absolute_deviation_from_one": _finite(metric.get("mean_absolute_deviation_from_one"), f"{label} local metric schema"),
         "l2_deviation_from_one": _finite(metric.get("l2_deviation_from_one"), f"{label} local metric schema"),
         "l2_deviation_denominator": _integer(metric.get("l2_deviation_denominator"), f"{label} local metric schema", positive=True),
-        "relative_error_mean": _finite(metric.get("relative_error_mean"), f"{label} local metric schema"),
-        "relative_error_median": _finite(metric.get("relative_error_median"), f"{label} local metric schema"),
-        "relative_error_p90": _finite(metric.get("relative_error_p90"), f"{label} local metric schema"),
-        "relative_error_p95": _finite(metric.get("relative_error_p95"), f"{label} local metric schema"),
-        "relative_error_p99": _finite(metric.get("relative_error_p99"), f"{label} local metric schema"),
     }
+    values.update(
+        _optional_distribution(
+            metric,
+            ("relative_error_mean", "relative_error_median", "relative_error_p90", "relative_error_p95", "relative_error_p99"),
+            label,
+            defined_count=int(values["relative_error_defined_count"]),
+        )
+    )
     values.update(
         _optional_distribution(
             metric,
@@ -205,6 +210,9 @@ def _metric(metric: object, label: str) -> dict[str, object]:
     token_count = int(values["token_count"])
     if (
         int(values["l2_deviation_denominator"]) != coefficient_count
+        or int(values["relative_error_defined_count"])
+        + int(values["relative_error_undefined_count"])
+        != token_count
         or int(values["cosine_defined_count"])
         + int(values["cosine_undefined_count"])
         != token_count
@@ -230,8 +238,9 @@ def _metric(metric: object, label: str) -> dict[str, object]:
         "bounded_upper_saturation_rate": int(values["bounded_upper_saturation_count"]) / coefficient_count,
         "mean_absolute_deviation_from_one": float(values["absolute_deviation_sum"]) / coefficient_count,
         "l2_deviation_from_one": sqrt(float(values["squared_deviation_sum"]) / coefficient_count),
-        "relative_error_mean": float(values["relative_error_sum"]) / token_count,
     }
+    if int(values["relative_error_defined_count"]):
+        expected["relative_error_mean"] = float(values["relative_error_sum"]) / int(values["relative_error_defined_count"])
     if int(values["cosine_defined_count"]):
         expected["cosine_mean"] = float(values["cosine_sum"]) / int(
             values["cosine_defined_count"]
@@ -242,11 +251,11 @@ def _metric(metric: object, label: str) -> dict[str, object]:
     ):
         raise ReportValidationError(f"{label} local metric schema summary mismatch")
     signed = [float(values[name]) for name in ("coefficient_p01", "coefficient_p05", "coefficient_median", "coefficient_p95", "coefficient_p99")]
-    relative = [float(values[name]) for name in ("relative_error_median", "relative_error_p90", "relative_error_p95", "relative_error_p99")]
+    relative = [float(values[name]) for name in ("relative_error_median", "relative_error_p90", "relative_error_p95", "relative_error_p99")] if int(values["relative_error_defined_count"]) else []
     if (
         signed != sorted(signed)
         or relative != sorted(relative)
-        or min(relative) < 0.0
+        or (relative and min(relative) < 0.0)
         or float(values["coefficient_p99_abs"]) < 0.0
         or float(values["coefficient_max_abs"]) < float(values["coefficient_p99_abs"])
     ):
@@ -668,6 +677,9 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
             token_count=int(metric["token_count"]),
         )
         observed_solver.add(identity)
+        solver_rows.append(
+            {"scope": "pooled", "layer": None, "k": parsed[0], "condition": parsed[1], **record}
+        )
         if parsed[1] == "bounded" and (record.get("bounded_failure_count", 0) != 0 or record.get("bounded_uncertified_count", 0) != 0):
             raise ReportValidationError("bounded KKT evidence is invalid")
     if observed_solver != observed:
@@ -693,15 +705,48 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
             for row in layer_rows
             if (row["layer"], row["k"], row["condition"]) == identity
         )
-        _validate_solver_record(
+        record = _validate_solver_record(
             value,
             "layer solver diagnostics",
             identifier=parsed[2],
             token_count=int(layer_metric["token_count"]),
         )
         observed_layer_solver.add(identity)
+        solver_rows.append(
+            {"scope": "layer", "layer": parsed[0], "k": parsed[1], "condition": parsed[2], **record}
+        )
     if observed_layer_solver != observed_layer_keys:
         raise ReportValidationError("layer solver diagnostics are incomplete")
+    reference_solver = local_result.get("reference_diagnostics")
+    if not isinstance(reference_solver, Mapping):
+        raise ReportValidationError("R8 solver diagnostics are missing")
+    expected_reference_solver = {
+        (layer, f"R8[{identifier}]")
+        for layer in range(24)
+        for _, identifier in observed
+    }
+    observed_reference_solver: set[tuple[int, str]] = set()
+    for key, value in reference_solver.items():
+        parsed = _key(key, "R8 solver diagnostic")
+        if (
+            len(parsed) != 2
+            or not isinstance(parsed[0], int)
+            or not isinstance(parsed[1], str)
+            or (parsed[0], parsed[1]) not in expected_reference_solver
+        ):
+            raise ReportValidationError("R8 solver diagnostics are invalid")
+        identifier = parsed[1].removeprefix("R8[").removesuffix("]")
+        if parsed[1] != f"R8[{identifier}]":
+            raise ReportValidationError("R8 solver diagnostics are invalid")
+        record = _validate_solver_record(
+            value, "R8 solver diagnostics", identifier=identifier, token_count=100_000
+        )
+        observed_reference_solver.add((parsed[0], parsed[1]))
+        solver_rows.append(
+            {"scope": "r8", "layer": parsed[0], "k": 8, "condition": parsed[1], **record}
+        )
+    if observed_reference_solver != expected_reference_solver:
+        raise ReportValidationError("R8 solver diagnostics are incomplete")
     rank_condition_rows = [
         {
             "scope": "pooled",
@@ -828,6 +873,7 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
                 )
             }
             for row in local_rows
+            if row["condition"] == "bounded"
         ],
         "coefficient-distortion-gain.json": [
             {
@@ -838,6 +884,10 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
                 ],
                 "l2_deviation_from_one": row["l2_deviation_from_one"],
                 "l2_deviation_denominator": row["l2_deviation_denominator"],
+                "local_relative_improvement": (
+                    float(by_condition[(int(row["k"]), "unit")]["total_squared_error"])
+                    - float(row["total_squared_error"])
+                ) / float(by_condition[(int(row["k"]), "unit")]["total_squared_error"]),
                 "gain_recovery": next(
                     item["gain_recovery"]
                     for item in gain_recovery_rows
@@ -848,7 +898,21 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
             for row in local_rows
         ],
         "gain-recovery.json": gain_recovery_rows,
-        "rank-conditioning.json": rank_condition_rows,
+        "rank-conditioning.json": [
+            {
+                **row,
+                "reconstruction_gain": (
+                    float(by_condition[(int(row["k"]), "unit")]["total_squared_error"])
+                    - float(by_condition[(int(row["k"]), str(row["condition"]))]["total_squared_error"])
+                ) / float(by_condition[(int(row["k"]), "unit")]["total_squared_error"]),
+            }
+            for row in rank_condition_rows
+        ],
+        "effective-rank.json": [
+            {"scope": row["scope"], "k": row["k"], "condition": row["condition"], "effective_rank_counts": row["effective_rank_counts"]}
+            for row in rank_condition_rows
+        ],
+        "solver-diagnostics.json": solver_rows,
         "layer-improvements.json": layer_rows,
         "subset-stability.json": stability_rows,
         "reference-distances.json": reference_rows,
@@ -862,6 +926,7 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
         if isinstance(evidence, Mapping)
     ]
     _write_source(plot_source / "smoke-feasibility.json", feasibility_rows)
+    _write_csv(plot_source / "solver-diagnostics.csv", solver_rows)
     primary_rows: list[dict[str, object]] = []
     for row in local_rows:
         matching = [item for item in evaluation_rows if item["k"] == row["k"] and item["condition"] == row["condition"]]
@@ -880,9 +945,9 @@ def render_phase1a5_report(artifact_root: Path, config: Phase1A5Config) -> Phase
         ("01-local-nmse-rho.png", "Local NMSE versus ridge rho", local_rows, "rho", "nmse"),
         ("02-local-active-fraction.png", "Local NMSE versus active fraction", local_rows, "active_fraction", "nmse"),
         ("03-evaluation-ppl.png", "Evaluation PPL", evaluation_rows, "k", "ppl"),
-        ("04-coefficient-distributions.png", "Coefficient above-two rate", local_rows, "active_fraction", "above_two_count"),
-        ("05-coefficient-distortion-gain.png", "Coefficient distortion versus gain", local_rows, "absolute_deviation_sum", "nmse"),
-        ("06-rank-conditioning-gain.png", "Winning-subset Gram conditioning", rank_condition_rows, "k", "gram_condition_max"),
+        ("04-coefficient-distributions.png", "Coefficient above-two rate", local_rows, "active_fraction", "above_two_rate"),
+        ("05-coefficient-distortion-gain.png", "Coefficient distortion versus gain", sources["coefficient-distortion-gain.json"], "mean_absolute_deviation_from_one", "local_relative_improvement"),
+        ("06-rank-conditioning-gain.png", "Winning-subset Gram conditioning", sources["rank-conditioning.json"], "gram_condition_p99", "reconstruction_gain"),
         ("07-layer-improvements.png", "Layerwise local NMSE", layer_rows, "layer", "nmse"),
         ("08-reference-distances.png", "D0/E8/R8 reference distances", reference_rows, "token_count", "squared_error_sum"),
         ("09-subset-stability.png", "Cross-condition subset Jaccard", stability_rows, "token_count", "jaccard"),

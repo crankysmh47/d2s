@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from heapq import heappop, heappush
 import json
 from math import ceil, isfinite, sqrt
 from pathlib import Path
@@ -50,6 +51,8 @@ class ConditionMetrics:
     above_four_count: int = 0
     squared_deviation_sum: float = 0.0
     relative_error_sum: float = 0.0
+    relative_error_defined_count: int = 0
+    relative_error_undefined_count: int = 0
     cosine_sum: float = 0.0
     cosine_defined_count: int = 0
     cosine_undefined_count: int = 0
@@ -129,9 +132,10 @@ class ConditionMetrics:
             )
             if coefficient_count
             else 0.0,
-            "relative_error_mean": self.relative_error_sum / self.token_count
-            if self.token_count
-            else 0.0,
+            "relative_error_mean": self.relative_error_sum
+            / self.relative_error_defined_count
+            if self.relative_error_defined_count
+            else None,
             "cosine_mean": self.cosine_sum / self.cosine_defined_count
             if self.cosine_defined_count
             else None,
@@ -382,6 +386,8 @@ class ReconstructionLocalAccumulator:
             0,
             0,
             {},
+            0,
+            0,
         ]
 
     @property
@@ -729,8 +735,10 @@ class ReconstructionLocalAccumulator:
         tolerance = self.solver_settings.objective_tolerance * target_norm_by_token.clamp_min(1.0)
         if bool((materialized_error - result.squared_error.double()).abs().gt(tolerance).any()):
             raise FloatingPointError("stored reconstruction loss is not materialized loss")
+        relative_error_defined = target_norm_by_token > 0.0
         relative_error = torch.sqrt(
-            materialized_error / target_norm_by_token.clamp_min(torch.finfo(torch.float64).eps)
+            materialized_error[relative_error_defined]
+            / target_norm_by_token[relative_error_defined]
         )
         reconstruction_norm = reconstruction.square().sum(dim=-1)
         cosine_defined = (target_norm_by_token > 0.0) & (reconstruction_norm > 0.0)
@@ -749,6 +757,8 @@ class ReconstructionLocalAccumulator:
         ):
             raise FloatingPointError("per-token reconstruction metrics are non-finite")
         values[15] += float(relative_error.sum().item())
+        values[22] += int(relative_error.numel())
+        values[23] += int((~relative_error_defined).sum().item())
         values[16] += float(cosine.sum().item())
         values[17] += int(cosine.numel())
         values[18] += int((~cosine_defined).sum().item())
@@ -1051,56 +1061,113 @@ class ReconstructionLocalAccumulator:
             self.restore(snapshot)
             raise
 
-    def _distribution_values(
+    def _iter_distribution_chunks(
         self, key: tuple[int, str], name: str, layer: int | None = None
-    ) -> list[float]:
-        if not self.checkpoint_dir or not self.completed_batches:
-            return []
-        values: list[float] = []
-        for batch in sorted(self.completed_batches):
-            path = self._chunk_path(key, batch)
-            if not path.exists():
-                raise RuntimeError("completed batch is missing its coefficient chunk")
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            layers = payload.get("layers")
-            if not isinstance(layers, Mapping):
-                raise RuntimeError("completed batch has malformed distribution chunk")
-            selected_layers = (
-                (str(layer), layers.get(str(layer)))
-                if layer is not None
-                else None
-            )
-            items = (selected_layers,) if selected_layers is not None else layers.items()
-            for _, distributions in items:
-                if distributions is None:
-                    continue
-                if not isinstance(distributions, Mapping) or not isinstance(
-                    distributions.get(name), list
-                ):
+    ) -> Iterable[Iterable[float]]:
+        """Yield one already-sorted checkpoint distribution at a time."""
+
+        if self.checkpoint_dir:
+            for batch in sorted(self.completed_batches):
+                path = self._chunk_path(key, batch)
+                if not path.exists():
+                    raise RuntimeError("completed batch is missing its coefficient chunk")
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                layers = payload.get("layers")
+                if not isinstance(layers, Mapping):
                     raise RuntimeError("completed batch has malformed distribution chunk")
-                values.extend(float(value) for value in distributions[name])
-        values.sort()
-        return values
+                selected_layers = (
+                    (str(layer), layers.get(str(layer)))
+                    if layer is not None
+                    else None
+                )
+                items = (selected_layers,) if selected_layers is not None else layers.items()
+                for _, distributions in items:
+                    if distributions is None:
+                        continue
+                    if not isinstance(distributions, Mapping) or not isinstance(
+                        distributions.get(name), list
+                    ):
+                        raise RuntimeError("completed batch has malformed distribution chunk")
+                    values = distributions[name]
+                    if values != sorted(values):
+                        raise RuntimeError("completed batch has unsorted distribution chunk")
+                    yield (float(value) for value in values)
+        pending_layers = self._pending_distributions[key]
+        items = (
+            ((layer, pending_layers.get(layer)),)
+            if layer is not None
+            else pending_layers.items()
+        )
+        for _, distributions in items:
+            if distributions is not None:
+                yield iter(sorted(float(value) for value in distributions[name]))
 
     @staticmethod
-    def _nearest(sorted_values: list[float], percentile: float) -> float | None:
-        if not sorted_values:
-            return None
-        return sorted_values[max(0, ceil(percentile * len(sorted_values)) - 1)]
+    def _nearest_from_sorted_chunks(
+        chunks: Iterable[Iterable[float]],
+        *,
+        total_count: int,
+        percentiles: Sequence[float],
+    ) -> dict[float, float]:
+        """Capture exact nearest-rank values with one heap head per sorted chunk."""
+
+        if total_count <= 0:
+            return {}
+        requested = set(percentiles)
+        positions: dict[int, set[float]] = {}
+        for percentile in (*requested, 1.0):
+            positions.setdefault(max(1, ceil(percentile * total_count)), set()).add(percentile)
+        heap: list[tuple[float, int, object]] = []
+        for ordinal, chunk in enumerate(chunks):
+            iterator = iter(chunk)
+            try:
+                heappush(heap, (float(next(iterator)), ordinal, iterator))
+            except StopIteration:
+                continue
+        result: dict[float, float] = {}
+        rank = 0
+        while heap:
+            value, ordinal, iterator = heappop(heap)
+            rank += 1
+            for percentile in positions.get(rank, set()) & requested:
+                result[percentile] = value
+            try:
+                heappush(heap, (float(next(iterator)), ordinal, iterator))
+            except StopIteration:
+                pass
+        if rank != total_count or len(result) != len(requested):
+            raise RuntimeError("completed distribution chunks do not match metric count")
+        return result
+
+    def _distribution_quantiles(
+        self,
+        key: tuple[int, str],
+        name: str,
+        total_count: int,
+        percentiles: Sequence[float],
+        *,
+        layer: int | None = None,
+    ) -> Mapping[float, float]:
+        return self._nearest_from_sorted_chunks(
+            self._iter_distribution_chunks(key, name, layer),
+            total_count=total_count,
+            percentiles=percentiles,
+        )
 
     def _quantiles(self, key: tuple[int, str]) -> Mapping[str, float]:
-        values = self._distribution_values(key, "coefficients")
-        absolute = self._distribution_values(key, "coefficient_abs")
-        if not values or not absolute:
+        count = int(self._metrics[key][3])
+        if not count:
             return {}
+        values = self._distribution_quantiles(
+            key, "coefficients", count, (0.01, 0.05, 0.5, 0.95, 0.99)
+        )
+        absolute = self._distribution_quantiles(
+            key, "coefficient_abs", count, (0.99, 1.0)
+        )
         return {
-            "p01": float(self._nearest(values, 0.01)),
-            "p05": float(self._nearest(values, 0.05)),
-            "median": float(self._nearest(values, 0.5)),
-            "p95": float(self._nearest(values, 0.95)),
-            "p99": float(self._nearest(absolute, 0.99)),
-            "p99_signed": float(self._nearest(values, 0.99)),
-            "max_abs": absolute[-1],
+            "p01": values[0.01], "p05": values[0.05], "median": values[0.5],
+            "p95": values[0.95], "p99": absolute[0.99],
+            "p99_signed": values[0.99], "max_abs": absolute[1.0],
         }
 
     def _public_metric(
@@ -1110,11 +1177,15 @@ class ReconstructionLocalAccumulator:
         *,
         layer: int | None = None,
     ) -> ConditionMetrics:
-        coefficients = self._distribution_values(key, "coefficients", layer)
-        coefficient_abs = self._distribution_values(key, "coefficient_abs", layer)
-        relative_error = self._distribution_values(key, "relative_error", layer)
-        cosine = self._distribution_values(key, "cosine", layer)
-        gram_condition = self._distribution_values(key, "gram_condition", layer)
+        coefficient_count = int(values[3])
+        relative_count = int(values[22])
+        cosine_count = int(values[17])
+        gram_count = int(values[19])
+        coefficients = self._distribution_quantiles(key, "coefficients", coefficient_count, (0.01, 0.05, 0.5, 0.95, 0.99), layer=layer)
+        coefficient_abs = self._distribution_quantiles(key, "coefficient_abs", coefficient_count, (0.99, 1.0), layer=layer)
+        relative_error = self._distribution_quantiles(key, "relative_error", relative_count, (0.5, 0.9, 0.95, 0.99), layer=layer)
+        cosine = self._distribution_quantiles(key, "cosine", cosine_count, (0.5, 0.9, 0.95, 0.99), layer=layer)
+        gram_condition = self._distribution_quantiles(key, "gram_condition", gram_count, (0.5, 0.9, 0.99, 1.0), layer=layer)
         return ConditionMetrics(
             int(values[0]),
             float(values[1]),
@@ -1132,30 +1203,23 @@ class ReconstructionLocalAccumulator:
             above_four_count=int(values[13]),
             squared_deviation_sum=float(values[14]),
             relative_error_sum=float(values[15]),
+            relative_error_defined_count=relative_count,
+            relative_error_undefined_count=int(values[23]),
             cosine_sum=float(values[16]),
             cosine_defined_count=int(values[17]),
             cosine_undefined_count=int(values[18]),
             gram_condition_defined_count=int(values[19]),
             gram_condition_undefined_count=int(values[20]),
-            coefficient_p01=self._nearest(coefficients, 0.01),
-            coefficient_p05=self._nearest(coefficients, 0.05),
-            coefficient_median=self._nearest(coefficients, 0.5),
-            coefficient_p95=self._nearest(coefficients, 0.95),
-            coefficient_p99=self._nearest(coefficients, 0.99),
-            coefficient_p99_abs=self._nearest(coefficient_abs, 0.99),
-            coefficient_max_abs=coefficient_abs[-1] if coefficient_abs else None,
-            relative_error_median=self._nearest(relative_error, 0.5),
-            relative_error_p90=self._nearest(relative_error, 0.9),
-            relative_error_p95=self._nearest(relative_error, 0.95),
-            relative_error_p99=self._nearest(relative_error, 0.99),
-            cosine_median=self._nearest(cosine, 0.5),
-            cosine_p90=self._nearest(cosine, 0.9),
-            cosine_p95=self._nearest(cosine, 0.95),
-            cosine_p99=self._nearest(cosine, 0.99),
-            gram_condition_median=self._nearest(gram_condition, 0.5),
-            gram_condition_p90=self._nearest(gram_condition, 0.9),
-            gram_condition_p99=self._nearest(gram_condition, 0.99),
-            gram_condition_max=gram_condition[-1] if gram_condition else None,
+            coefficient_p01=coefficients.get(0.01), coefficient_p05=coefficients.get(0.05),
+            coefficient_median=coefficients.get(0.5), coefficient_p95=coefficients.get(0.95),
+            coefficient_p99=coefficients.get(0.99), coefficient_p99_abs=coefficient_abs.get(0.99),
+            coefficient_max_abs=coefficient_abs.get(1.0),
+            relative_error_median=relative_error.get(0.5), relative_error_p90=relative_error.get(0.9),
+            relative_error_p95=relative_error.get(0.95), relative_error_p99=relative_error.get(0.99),
+            cosine_median=cosine.get(0.5), cosine_p90=cosine.get(0.9),
+            cosine_p95=cosine.get(0.95), cosine_p99=cosine.get(0.99),
+            gram_condition_median=gram_condition.get(0.5), gram_condition_p90=gram_condition.get(0.9),
+            gram_condition_p99=gram_condition.get(0.99), gram_condition_max=gram_condition.get(1.0),
             effective_rank_counts={
                 str(rank): int(count)
                 for rank, count in dict(values[21]).items()
