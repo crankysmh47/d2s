@@ -447,3 +447,48 @@ Only if selection permits, run rollout for the registered conditions, then repor
 - [ ] **Step 8: Fresh review and final major checkpoint**
 
 Request a read-only correctness/methodology review, resolve blockers, rerun the full verification suite, commit `feat: complete phase 1a5 reconstruction oracle`, push `exp`, and fast-forward `main` only if all required stages and the report pass.
+
+---
+
+### Task 8: Evidence scalability and report-correctness remediation
+
+**Files:**
+- Modify: `src/ppmoe/oracle/reconstruction_local.py`
+- Modify: `src/ppmoe/experiments/phase1a5.py`
+- Modify: `src/ppmoe/reporting/phase1a5.py`
+- Modify: `tests/test_reconstruction_local.py`
+- Modify: `tests/test_phase1a5_orchestration.py`
+- Modify: `tests/test_phase1a5_reporting.py`
+
+**Interfaces:**
+- Preserves all Task 1-7 public result/stage interfaces.
+- Produces exact empirical quantiles by k-way streaming merge of sorted checkpoint chunks with memory bounded by chunk count and execution microbatch size.
+- Produces hashed `solver-diagnostics.csv/json` rows for every pooled/per-layer condition and R8 reference.
+
+- [ ] **Step 1: Add failing scalability and zero-target tests**
+
+Monkeypatch chunk iterators with sentinels that fail if more than one distribution is materialized or if all chunk values are concatenated. Require exact nearest-rank quantiles from a multi-chunk fixture. Add a zero-D0 token fixture asserting `relative_error_undefined_count` increments, the value is excluded from relative-error quantiles, and checkpoint rollback/resume preserves counts.
+
+- [ ] **Step 2: Implement externally streamed exact quantiles**
+
+Read each already-sorted chunk lazily and use a heap-based k-way merge to capture only requested nearest-rank positions. Finalize coefficient, absolute-coefficient, relative-error, cosine, and conditioning distributions sequentially so no five full lists coexist. Memory must be `O(number_of_chunks * execution_microbatch_chunk_size)`, never `O(total_tokens)`.
+
+- [ ] **Step 3: Reject stale smoke resume evidence**
+
+Before any early `smoke --resume` return, verify current source/config/code/microbatch signature and the full SVD evidence contract: exact K4/K6/R8 identities, 384 samples each, 16 samples per 24 layers, literal boolean rank agreement, and finite maximum relative objective error at most `1e-9`. Add a fixture representing the existing pre-SVD smoke and require rejection rather than reuse.
+
+- [ ] **Step 4: Emit complete solver evidence**
+
+Populate one unique solver row for every pooled and per-layer `(K, condition)` plus every R8 condition. Include KKT, certification, solver-source, rank, conditioning, fallback, face-enumeration, numerical-failure, and SVD fields where applicable. Validate rows against local results and write/hash both CSV and JSON sources.
+
+- [ ] **Step 5: Correct report mappings**
+
+Use `above_two_count / coefficient_count` for above-two rate. Plot coefficient mean absolute deviation from one against registered local relative improvement or gain recovery. Plot conditioning p99 against reconstruction gain; emit effective rank in a separate evidence-backed panel/source. Emit bounded saturation rows only for the bounded family. Reject missing inputs instead of substituting zero or synthetic values.
+
+- [ ] **Step 6: Verify Task 8**
+
+Run focused local/orchestration/reporting tests, then `uv run pytest -q`, `uv lock --check`, and `git diff --check`. Expected: all pass with no production command executed.
+
+- [ ] **Step 7: Review and production gate**
+
+Commit `fix: complete phase1a5 evidence contract`, obtain a fresh scoped review, and only then run one new clean source + 2,048-token smoke attempt. Preserve every earlier source/smoke/failure artifact as superseded evidence. Do not run 100K local until the new smoke passes all runtime, unit, bounded, and SVD gates.
