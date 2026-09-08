@@ -323,6 +323,8 @@ class ReconstructionLocalResult:
     svd_verification: Mapping[str, SVDVerificationEvidence] = field(
         default_factory=dict
     )
+    failure_history: Mapping[int, tuple[str, ...]] = field(default_factory=dict)
+    recovered_failure_attempts: int = 0
 
     def relative_improvement(self, k: int, identifier: str) -> float | None:
         """Return pooled SSE improvement over unit; this is never an eligibility rule."""
@@ -392,6 +394,8 @@ class ReconstructionLocalAccumulator:
         self.solver_settings = solver_settings
         self.completed_batches: set[int] = set()
         self.failures: dict[int, str] = {}
+        self.failure_history: dict[int, list[str]] = {}
+        self._retryable_failures: set[int] = set()
         self._metrics = {
             key: self._empty_metric_state()
             for key in self._condition_keys
@@ -529,6 +533,19 @@ class ReconstructionLocalAccumulator:
         self.failures = {
             int(key): str(value) for key, value in state["failures"].items()
         }
+        history = state.get("failure_history", {})
+        if not isinstance(history, Mapping) or any(
+            not isinstance(messages, list) or not messages
+            for messages in history.values()
+        ):
+            raise ValueError("reconstruction local failure history is malformed")
+        self.failure_history = {
+            int(key): [str(message) for message in messages]
+            for key, messages in history.items()
+        }
+        for batch_index, message in self.failures.items():
+            self.failure_history.setdefault(batch_index, [message])
+        self._retryable_failures = set(self.failures)
         self.source_hashes = {
             str(key): str(value)
             for key, value in state.get("source_hashes", {}).items()
@@ -639,6 +656,10 @@ class ReconstructionLocalAccumulator:
                 "failures": {
                     str(key): self.failures[key] for key in sorted(self.failures)
                 },
+                "failure_history": {
+                    str(key): list(self.failure_history[key])
+                    for key in sorted(self.failure_history)
+                },
                 "metrics": {
                     self._key(key): value for key, value in self._metrics.items()
                 },
@@ -693,6 +714,8 @@ class ReconstructionLocalAccumulator:
                 self._svd_verification,
                 self.completed_batches,
                 self.failures,
+                self.failure_history,
+                self._retryable_failures,
             )
         )
 
@@ -711,6 +734,8 @@ class ReconstructionLocalAccumulator:
             self._svd_verification,
             self.completed_batches,
             self.failures,
+            self.failure_history,
+            self._retryable_failures,
         ) = snapshot
         self._transaction_snapshot = None
 
@@ -1199,8 +1224,10 @@ class ReconstructionLocalAccumulator:
         return manifest_path, data_path
 
     def mark_batch_completed(self, batch_index: int) -> None:
-        if batch_index in self.completed_batches or batch_index in self.failures:
+        if batch_index in self.completed_batches:
             raise ValueError("batch is already terminal")
+        if batch_index in self.failures and batch_index not in self._retryable_failures:
+            raise ValueError("failed batch requires a fresh-process reload before retry")
         transaction = self._transaction_snapshot or self.snapshot()
         chunk_paths: list[Path] = []
         # Chunks are atomically written before state publication.  This live
@@ -1212,6 +1239,8 @@ class ReconstructionLocalAccumulator:
                     chunk_paths.extend(self._write_distribution_chunk(key, batch_index))
             self._pending_distributions = {key: {} for key in self._condition_keys}
             self.completed_batches.add(batch_index)
+            self.failures.pop(batch_index, None)
+            self._retryable_failures.discard(batch_index)
             self._persist()
         except Exception:
             self.restore(transaction)
@@ -1225,7 +1254,9 @@ class ReconstructionLocalAccumulator:
             raise ValueError("completed batch cannot become failed")
         snapshot = self.snapshot()
         try:
+            self.failure_history.setdefault(batch_index, []).append(message)
             self.failures[batch_index] = message
+            self._retryable_failures.discard(batch_index)
             self._persist()
         except Exception:
             self.restore(snapshot)
@@ -1563,6 +1594,15 @@ class ReconstructionLocalAccumulator:
                 )
                 for identity, value in self._svd_verification.items()
             },
+            failure_history={
+                batch: tuple(messages)
+                for batch, messages in sorted(self.failure_history.items())
+            },
+            recovered_failure_attempts=sum(
+                len(messages)
+                for batch, messages in self.failure_history.items()
+                if batch in self.completed_batches
+            ),
         )
 
 

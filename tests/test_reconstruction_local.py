@@ -81,6 +81,61 @@ def test_accumulator_commits_only_completed_batches_and_resumes_exactly(
         )
 
 
+def test_failed_batch_recovers_only_after_reload_and_keeps_history(
+    tmp_path: Path,
+) -> None:
+    condition = ReconstructionCondition("unit")
+    kwargs = dict(
+        num_layers=1,
+        num_experts=8,
+        conditions={4: (condition,)},
+        checkpoint_dir=tmp_path,
+        run_signature="recover-failure",
+        source_hashes={"source": "source-hash"},
+    )
+    target = torch.tensor([[1.0, 0.0]])
+    experts = torch.zeros(1, 8, 2)
+    experts[0, 0] = target[0]
+
+    failed = ReconstructionLocalAccumulator(**kwargs)
+    failed.record_failure(3, "AcceleratorError: CUDA error: misaligned address")
+    failed.update_layer(0, target, experts)
+    with pytest.raises(ValueError, match="fresh-process reload"):
+        failed.mark_batch_completed(3)
+
+    resumed = ReconstructionLocalAccumulator(**kwargs)
+    resumed.update_layer(0, target, experts)
+    resumed.mark_batch_completed(3)
+    result = resumed.finalize()
+
+    assert result.complete is True
+    assert result.completed_batches == 1
+    assert result.failed_batches == 0
+    assert result.failure_history == {
+        3: ("AcceleratorError: CUDA error: misaligned address",)
+    }
+    assert result.recovered_failure_attempts == 1
+
+
+def test_repeated_fresh_process_failure_appends_history(tmp_path: Path) -> None:
+    kwargs = dict(
+        num_layers=1,
+        num_experts=8,
+        conditions={4: (ReconstructionCondition("unit"),)},
+        checkpoint_dir=tmp_path,
+        run_signature="repeat-failure",
+    )
+    first = ReconstructionLocalAccumulator(**kwargs)
+    first.record_failure(2, "first")
+    second = ReconstructionLocalAccumulator(**kwargs)
+    second.record_failure(2, "second")
+    third = ReconstructionLocalAccumulator(**kwargs)
+
+    assert third.failures == {2: "second"}
+    assert third.failure_history == {2: ["first", "second"]}
+    assert third.finalize().recovered_failure_attempts == 0
+
+
 def test_restore_discards_reference_coefficient_and_quantile_deltas(
     tmp_path: Path,
 ) -> None:

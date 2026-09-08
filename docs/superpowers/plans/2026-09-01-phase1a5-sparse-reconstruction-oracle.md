@@ -538,3 +538,20 @@ Derive a numeric mean effective rank from each persisted rank histogram with exa
 - [ ] **Step 7: Verify, commit, and review**
 
 Run focused suites, `uv run pytest -q`, `uv lock --check`, and `git diff --check`; run no production stage. Commit once as `fix: stream phase1a5 evidence safely`, then obtain a fresh read-only review. Only a clean review may unlock a new source + 2,048-token smoke.
+
+---
+
+### Task 10: Recoverable transient accelerator failures
+
+**Files:**
+- Modify: `src/ppmoe/oracle/reconstruction_local.py`
+- Modify: `src/ppmoe/experiments/phase1a5.py`
+- Modify: `src/ppmoe/reporting/phase1a5.py`
+- Modify: the corresponding local/orchestration/reporting tests
+- Modify: `PROJECT_LOG.md` only after new production evidence is finalized
+
+- [ ] Preserve every failed attempt in append-only checkpoint `failure_history`, including batch, exception type/message, and attempt ordinal; keep `failures` as unresolved terminal state.
+- [ ] Permit an unresolved batch to be retried only in a fresh invocation loading the checkpoint. A successful atomic chunk/state commit removes that batch from unresolved `failures` while retaining history; an unsuccessful retry appends history and remains unresolved. Never retry inside a CUDA-poisoned process.
+- [ ] Surface recovered-attempt counts/history in local stage and report evidence without weakening the registered requirement that final `failed_batches == 0`.
+- [ ] Add RED/GREEN tests for failure -> reload -> successful completion, repeated failure, rollback during recovery commit, source/signature mismatch, and report reconciliation. Add a resource-lifecycle test proving all fixed-buffer file handles close after successful and exceptional quantile traversal.
+- [ ] Run focused and full verification, commit once, obtain a fresh review, then rerun clean source + smoke. Preserve the failed 37,888-token run and do not reuse its checkpoint across the changed code signature.
