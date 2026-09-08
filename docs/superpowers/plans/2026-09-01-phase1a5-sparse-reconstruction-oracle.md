@@ -492,3 +492,49 @@ Run focused local/orchestration/reporting tests, then `uv run pytest -q`, `uv lo
 - [ ] **Step 7: Review and production gate**
 
 Commit `fix: complete phase1a5 evidence contract`, obtain a fresh scoped review, and only then run one new clean source + 2,048-token smoke attempt. Preserve every earlier source/smoke/failure artifact as superseded evidence. Do not run 100K local until the new smoke passes all runtime, unit, bounded, and SVD gates.
+
+---
+
+### Task 9: Streamable evidence storage and strict provenance/schema closure
+
+**Files:**
+- Modify: `src/ppmoe/oracle/reconstruction_local.py`
+- Modify: `src/ppmoe/experiments/phase1a5.py`
+- Modify: `src/ppmoe/reporting/phase1a5.py`
+- Modify: `tests/test_reconstruction_local.py`
+- Modify: `tests/test_phase1a5_orchestration.py`
+- Modify: `tests/test_phase1a5_reporting.py`
+
+**Interfaces:**
+- Replaces array-valued distribution chunk payloads with an atomically committed manifest plus concatenated little-endian FP64 binary data whose offset/count records permit fixed-buffer sequential readers.
+- Keeps exact nearest-rank quantiles and all frozen scientific semantics unchanged.
+- Makes every resumed smoke depend on freshly verified current source/code/config/token/microbatch provenance.
+- Defines one explicit, condition-aware flat solver-evidence schema shared by validation, JSON, and CSV.
+
+- [ ] **Step 1: Add adversarial RED tests against real persisted chunks**
+
+Create multi-batch checkpoint files through the production writer, instrument reads so loading an array-valued distribution or reading an entire binary payload fails, and prove exact pooled/per-layer nearest-rank quantiles. Add rollback-after-zero-D0 coverage. Add smoke-resume fixtures for code/source/config/token/microbatch drift and malformed SVD evidence. Add solver-row field-completeness tests and a required effective-rank plot assertion.
+
+- [ ] **Step 2: Introduce a streamable atomic chunk format**
+
+For each condition and completed batch, write a small JSON manifest and one concatenated binary FP64 data file. Each `(layer, distribution)` manifest entry records byte offset, count, ordering, and finite min/max; data are sorted and encoded little-endian. Commit both before checkpoint state advances, delete both on rollback, reject missing/malformed/truncated/trailing data, and preserve orphan-chunk safety. Readers retain at most one fixed-size buffer/file handle and heap head per batch chunk; they must never call `read_text`, `read_bytes`, `json.loads` on distribution arrays, or materialize a complete distribution.
+
+- [ ] **Step 3: Preserve exact quantile and checkpoint semantics**
+
+Use the existing k-way heap over fixed-buffer binary iterators, validate manifest counts against accumulated counts, and keep exact nearest-rank `ceil(p*n)` results. Preserve pending in-memory data only for the current execution microbatch. Ensure save/load/resume and transaction rollback cover manifest/data pairs and zero-target defined/undefined counts.
+
+- [ ] **Step 4: Bind smoke resume to live provenance**
+
+Before any immutable-artifact early return, freshly run the same clean-repository/source verification used by the `source` stage and recompute the complete smoke input signature from current source hashes, config, token identity, code revision, and microbatch size. Resume only if it equals the stored signature and the full SVD predicate passes; otherwise reject without overwriting prior evidence.
+
+- [ ] **Step 5: Close the solver-evidence schema**
+
+Define explicit common and condition-specific row fields. Common rows include counts, numerical failures, solver-source counts, effective-rank/conditioning diagnostics, and coverage. Bounded rows additionally require certification/KKT residuals, active-bound/saturation, fallback, and face-enumeration fields. Ridge/free rows require their registered numerical diagnostics; free-bound sparse and R8 rows embed the applicable SVD identity/count/per-layer coverage/rank-agreement/max-error fields. Reject missing, non-finite, inconsistent, duplicate, or inapplicable synthetic evidence. Emit the exact validated flat rows to both hashed JSON and CSV.
+
+- [ ] **Step 6: Add the effective-rank panel**
+
+Derive a numeric mean effective rank from each persisted rank histogram with exact count reconciliation, retain the histogram in source evidence, and add a dedicated effective-rank-versus-reconstruction-gain plot sourced from `effective-rank.json`.
+
+- [ ] **Step 7: Verify, commit, and review**
+
+Run focused suites, `uv run pytest -q`, `uv lock --check`, and `git diff --check`; run no production stage. Commit once as `fix: stream phase1a5 evidence safely`, then obtain a fresh read-only review. Only a clean review may unlock a new source + 2,048-token smoke.
