@@ -1,0 +1,97 @@
+[model]
+repo_id = "Qwen/Qwen3-1.7B"
+model_class = "Qwen3ForCausalLM"
+num_hidden_layers = 28
+hidden_size = 2048
+intermediate_size = 6144
+num_attention_heads = 16
+num_key_value_heads = 8
+head_dim = 128
+sliding_attention = false
+
+[loop]
+layer_start = 12
+layer_stop = 16
+frozen_mode = "single"
+repeat_mode = "repeat"
+damped_mode = "damped"
+
+[precision]
+frozen_dtype = "bfloat16"
+activation_dtype = "bfloat16"
+lora_dtype = "float32"
+optimizer_state_dtype = "float32"
+attention_implementation = "eager"
+torch_compile = false
+quantization = false
+
+[lora]
+rank = 8
+alpha = 16
+dropout = 0.0
+target_modules = ["q_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+[optimizer]
+learning_rate = 0.0001
+beta1 = 0.9
+beta2 = 0.95
+epsilon = 0.00000001
+weight_decay = 0.0
+max_grad_norm = 1.0
+warmup_updates = 20
+updates = 1000
+microbatch_size = 1
+accumulation_steps = 8
+
+[data]
+train_examples = 8000
+dev_examples_per_family = 200
+test_examples_per_family = 800
+train_expression_examples = 2667
+train_list_examples = 2667
+train_graph_examples = 2666
+train_seeds = [101, 102, 103]
+dev_seeds = [201, 202, 203]
+test_seeds = [301, 302, 303]
+max_sequence_tokens = 512
+
+[decoding]
+use_cache = false
+past_key_values = false
+enable_thinking = false
+max_new_tokens = 32
+greedy = true
+system_message = ""
+
+[retention]
+dataset_repo_id = "HuggingFaceFW/fineweb-edu"
+tokens = 20000
+chunk_tokens = 512
+eos_between_documents = true
+
+[statistics]
+accuracy_bootstrap_seed = 9047
+retention_bootstrap_seed = 9157
+bootstrap_replicates = 10000
+family_accuracy_lower = 0.05
+family_accuracy_upper = 0.95
+maximum_family_invalid_rate = 0.10
+minimum_informative_families = 2
+discovery_macro_improvement = 0.02
+maximum_family_regression = 0.02
+maximum_retention_ppl_ratio = 1.02
+
+[resources]
+artifact_root = "artifacts/recurrence-v0"
+maximum_cuda_seconds = 86400.0
+maximum_download_bytes = 8589934592
+maximum_artifact_bytes = 21474836480
+reserved_vram_bytes = 2147483648
+
+[stages]
+discovery_seed = 47
+confirmation_seed = 48
+timing_pilot_updates = 20
+resource_pilot_updates = 25
+checkpoint_interval_updates = 50
+progress_interval_updates = 10
