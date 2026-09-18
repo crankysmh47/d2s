@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import random
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from ppmoe.recurrence.train import (
     load_checkpoint,
     save_checkpoint,
     train_arm,
+    validate_checkpoint_artifact,
     write_completed_training_manifest,
 )
 
@@ -274,6 +276,85 @@ def test_checkpoint_persists_complete_recovery_state_and_preserves_previous(tmp_
         manifest = json.loads(sidecar.read_text(encoding="utf-8"))
         assert manifest["checkpoint_sha256"] == sidecar.stem.removeprefix("checkpoint-")
         assert manifest["signatures"] == signatures
+
+
+def test_parent_checkpoint_artifact_validator_binds_manifest_and_failure_state(tmp_path: Path) -> None:
+    model, optimizer = _make_model_and_optimizer()
+    signatures = _signatures(model)
+    _step(model, optimizer)
+    save_checkpoint(tmp_path, model, optimizer, _state(1), signatures)
+    artifact = validate_checkpoint_artifact(
+        tmp_path, signatures, expected_attempt=1, expected_update=1
+    )
+    assert artifact["attempt"] == 1
+    assert artifact["update"] == 1
+    assert len(artifact["manifest_digest"]) == 64
+    (tmp_path / "latest.pt").write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="sidecar|checkpoint"):
+        validate_checkpoint_artifact(tmp_path, signatures, expected_attempt=1, expected_update=1)
+
+
+@pytest.mark.parametrize("corruption", ["adapter", "optimizer", "step", "group"])
+def test_parent_checkpoint_validator_rejects_manifest_bound_trajectory_corruption(
+    tmp_path: Path, corruption: str
+) -> None:
+    model, optimizer = _make_model_and_optimizer()
+    signatures = _signatures(model)
+    _step(model, optimizer)
+    save_checkpoint(tmp_path, model, optimizer, _state(1), signatures)
+
+    def mutate(payload: dict[str, object]) -> None:
+        if corruption == "adapter":
+            adapters = payload["adapter_state"]
+            assert isinstance(adapters, dict)
+            first = next(iter(adapters))
+            adapters[first] = adapters[first].reshape(-1)
+        elif corruption == "optimizer":
+            payload["optimizer_state"] = {"state": {}, "param_groups": []}
+        elif corruption == "step":
+            states = payload["optimizer_state"]["state"]
+            first = next(iter(states.values()))
+            first["step"] = torch.tensor(0.0)
+        else:
+            payload["optimizer_state"]["param_groups"][0]["lr"] = 0.5
+
+    _rewrite_checkpoint_with_valid_sidecar(tmp_path, signatures, mutate)
+    with pytest.raises(ValueError, match="manifest|optimizer|adapter"):
+        validate_checkpoint_artifact(tmp_path, signatures, expected_attempt=1, expected_update=1)
+
+
+@pytest.mark.parametrize("mutation", ["renamed", "float64"])
+def test_parent_checkpoint_validator_requires_external_registered_adapter_schema(
+    tmp_path: Path, mutation: str
+) -> None:
+    model, optimizer = _make_model_and_optimizer()
+    signatures = _signatures(model)
+    expected_schema = {
+        "parameters": {
+            name: {"shape": [int(dimension) for dimension in value.shape], "dtype": str(value.dtype)}
+            for name, value in adapter_state_dict(model).items()
+        },
+        "initialization_hash": signatures["initialization_hash"],
+    }
+    _step(model, optimizer)
+    save_checkpoint(tmp_path, model, optimizer, _state(1), signatures)
+    payload = torch.load(tmp_path / "latest.pt", weights_only=False)
+    adapters = payload["adapter_state"]
+    if mutation == "renamed":
+        payload["adapter_state"] = {f"evil.{name}": value for name, value in adapters.items()}
+    else:
+        first = next(iter(adapters))
+        adapters[first] = adapters[first].to(dtype=torch.float64)
+    temporary = train._write_torch_temporary(tmp_path, payload)
+    checkpoint_hash = sha256_file(temporary)
+    train._write_checkpoint_sidecar(tmp_path, checkpoint_hash, signatures)
+    train._write_checkpoint_manifest(tmp_path, checkpoint_hash, payload, signatures)
+    os.replace(temporary, tmp_path / "latest.pt")
+    with pytest.raises(ValueError, match="schema|registered"):
+        validate_checkpoint_artifact(
+            tmp_path, signatures, expected_attempt=1, expected_update=1,
+            expected_adapter_schema=expected_schema,
+        )
 
 
 def test_failed_latest_replacement_leaves_complete_checkpoint_loadable(

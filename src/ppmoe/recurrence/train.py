@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 from dataclasses import asdict, dataclass
 from hashlib import sha256
+import io
 import json
 import math
 import os
@@ -21,11 +22,13 @@ from torch import Tensor, nn
 from torch.optim import Optimizer
 
 from .data import RenderedExample
+from .event_identity import task9_failure_event_id
 from .lora import adapter_sha256, adapter_state_dict
-from .provenance import append_event, sha256_file, sha256_payload, write_immutable_json
+from .provenance import append_event, canonical_json, sha256_file, sha256_payload, write_immutable_json
 
 
 _SCHEMA_VERSION = 1
+_CHECKPOINT_MANIFEST_SCHEMA_VERSION = 1
 _REQUIRED_SIGNATURES = (
     "source",
     "data",
@@ -118,6 +121,7 @@ def save_checkpoint(
     try:
         checkpoint_hash = sha256_file(temporary)
         _write_checkpoint_sidecar(root, checkpoint_hash, normalized_signatures)
+        _write_checkpoint_manifest(root, checkpoint_hash, payload, normalized_signatures)
         if latest.exists():
             _retain_previous(latest, root / _PREVIOUS_NAME)
         os.replace(temporary, latest)
@@ -181,6 +185,121 @@ def load_checkpoint(
     optimizer.load_state_dict(dict(optimizer_payload))
     _restore_rng_state(rng_payload)
     return _training_state_from_payload(state_payload)
+
+
+def validate_checkpoint_artifact(
+    directory: Path,
+    signatures: Mapping[str, str],
+    *,
+    expected_attempt: int,
+    expected_update: int,
+    expected_arm: str | None = None,
+    expected_seed: int | None = None,
+    expected_adapter_schema: Mapping[str, object] | None = None,
+    checkpoint_bytes: bytes | None = None,
+) -> dict[str, object]:
+    """Validate the immutable part of a resumable checkpoint before dispatch.
+
+    The stage child still calls :func:`load_checkpoint` with its concrete model
+    and optimizer.  This parent-side validator deliberately performs every
+    model-independent check first: the direct-child pointer, SHA sidecar,
+    complete payload schema, signatures, optimizer/scheduler/RNG containers,
+    and durable update/attempt identity.  It returns the exact bytes digest
+    bound into the retry request.
+    """
+    root = _checkpoint_directory(directory)
+    # The orchestration boundary has the four predecessor/control hashes;
+    # Task-9's concrete arm/seed/initialization hashes are authenticated by
+    # the checkpoint payload and are carried by the child implementation.
+    if set(signatures) == set(_REQUIRED_SIGNATURES):
+        normalized = _normalize_signatures(signatures)
+    elif set(signatures) == {"source", "data", "config", "code"} and all(isinstance(value, str) and value for value in signatures.values()):
+        normalized = dict(sorted(signatures.items()))
+    else:
+        raise ValueError("checkpoint control signatures are incomplete")
+    if isinstance(expected_attempt, bool) or not isinstance(expected_attempt, int) or expected_attempt < 1:
+        raise ValueError("expected checkpoint attempt must be a positive integer")
+    if isinstance(expected_update, bool) or not isinstance(expected_update, int) or expected_update < 0:
+        raise ValueError("expected checkpoint update must be a non-negative integer")
+    path = root / _LATEST_NAME
+    if not path.is_file():
+        path = root / _PREVIOUS_NAME
+    if not path.is_file():
+        raise FileNotFoundError(f"no complete local checkpoint in {root}")
+    _require_direct_child(root, path)
+    if checkpoint_bytes is not None and not isinstance(checkpoint_bytes, bytes):
+        raise TypeError("checkpoint_bytes must be bytes")
+    checkpoint_hash = sha256(checkpoint_bytes).hexdigest() if checkpoint_bytes is not None else sha256_file(path)
+    sidecar = root / f"checkpoint-{checkpoint_hash}.json"
+    _require_direct_child(root, sidecar)
+    try:
+        sidecar_bytes = sidecar.read_bytes()
+        metadata = json.loads(sidecar_bytes.decode("utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("checkpoint SHA-256 sidecar is corrupt") from error
+    if not isinstance(metadata, dict) or canonical_json(metadata) != sidecar_bytes or metadata.get("schema_version") != _SCHEMA_VERSION or metadata.get("checkpoint_sha256") != checkpoint_hash or not isinstance(metadata.get("signatures"), Mapping):
+        raise ValueError("checkpoint SHA-256 sidecar is corrupt")
+    saved_sidecar_signatures = metadata["signatures"]
+    if set(saved_sidecar_signatures) != set(_REQUIRED_SIGNATURES) or any(not isinstance(value, str) or not value for value in saved_sidecar_signatures.values()) or any(saved_sidecar_signatures.get(key) != value for key, value in normalized.items()):
+        raise ValueError("checkpoint signature mismatch")
+    try:
+        payload = torch.load(io.BytesIO(checkpoint_bytes), map_location="cpu", weights_only=False) if checkpoint_bytes is not None else torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as error:
+        raise ValueError("could not load trusted local checkpoint") from error
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema_version", "adapter_state", "optimizer_state", "scheduler_state",
+        "rng_state", "state", "initialization_hash", "signatures",
+    } or payload.get("schema_version") != _SCHEMA_VERSION:
+        raise ValueError("checkpoint payload schema is corrupt")
+    saved_signatures = payload.get("signatures")
+    if not isinstance(saved_signatures, Mapping) or set(saved_signatures) != set(_REQUIRED_SIGNATURES) or any(not isinstance(value, str) or not value for value in saved_signatures.values()) or any(saved_signatures.get(key) != value for key, value in normalized.items()):
+        raise ValueError("checkpoint signature mismatch")
+    _validate_checkpoint_manifest(root, checkpoint_hash, payload, saved_signatures)
+    if not isinstance(payload.get("initialization_hash"), str) or not payload["initialization_hash"] or payload["initialization_hash"] != saved_signatures["initialization_hash"]:
+        raise ValueError("checkpoint initialization_hash mismatch")
+    if expected_arm is not None and saved_signatures.get("arm") != expected_arm:
+        raise ValueError("checkpoint arm does not match durable failure event")
+    if expected_seed is not None and saved_signatures.get("seed") != str(expected_seed):
+        raise ValueError("checkpoint seed does not match durable failure event")
+    state = _training_state_from_payload(payload.get("state"))
+    if state.attempt != expected_attempt or state.update != expected_update:
+        raise ValueError("checkpoint state does not match durable failure event")
+    scheduler = payload.get("scheduler_state")
+    if not isinstance(scheduler, Mapping) or set(scheduler) != {"last_completed_update"} or scheduler.get("last_completed_update") != state.update:
+        raise ValueError("checkpoint scheduler/update state is corrupt")
+    adapters = payload.get("adapter_state")
+    if not isinstance(adapters, Mapping) or not adapters or any(not isinstance(name, str) or not isinstance(value, torch.Tensor) for name, value in adapters.items()):
+        raise ValueError("checkpoint adapter state is corrupt")
+    optimizer_state = payload.get("optimizer_state")
+    if not isinstance(optimizer_state, Mapping) or set(optimizer_state) != {"state", "param_groups"} or not isinstance(optimizer_state.get("param_groups"), list) or not optimizer_state["param_groups"] or not isinstance(optimizer_state.get("state"), Mapping):
+        raise ValueError("checkpoint optimizer state is corrupt")
+    for group in optimizer_state["param_groups"]:
+        if not isinstance(group, Mapping) or not isinstance(group.get("params"), list) or any(isinstance(identifier, bool) or not isinstance(identifier, int) for identifier in group["params"]):
+            raise ValueError("checkpoint optimizer state is corrupt")
+    if expected_adapter_schema is not None:
+        expected_parameters = expected_adapter_schema.get("parameters")
+        actual_parameters = {
+            str(name): {"shape": [int(dimension) for dimension in value.shape], "dtype": str(value.dtype)}
+            for name, value in adapters.items()
+            if isinstance(value, Tensor)
+        }
+        if not isinstance(expected_parameters, Mapping) or actual_parameters != dict(expected_parameters):
+            raise ValueError("checkpoint adapter schema does not match registered model")
+        expected_initialization = expected_adapter_schema.get("initialization_hash")
+        if not isinstance(expected_initialization, str) or expected_initialization != saved_signatures.get("initialization_hash"):
+            raise ValueError("checkpoint initialization identity does not match registered model")
+    _validate_rng_state(payload.get("rng_state"))
+    assert isinstance(payload, Mapping)
+    manifest_digest = _checkpoint_manifest_digest(root, checkpoint_hash, payload)
+    return {
+        "path": str(path),
+        "checkpoint_sha256": checkpoint_hash,
+        "sidecar_sha256": sha256_file(sidecar),
+        "attempt": state.attempt,
+        "update": state.update,
+        "manifest_digest": manifest_digest,
+        "signatures": dict(sorted(saved_signatures.items())),
+    }
 
 
 def write_completed_training_manifest(path: Path, payload: Mapping[str, object]) -> str:
@@ -490,7 +609,7 @@ def _training_manifest(
             for record in records
             if isinstance(record.get("index"), int) and not isinstance(record.get("index"), bool)
         ],
-        "failure_event_indices": [
+                        "failure_event_indices": [
             record["index"]
             for record in records
             if record.get("kind") == "training_failure"
@@ -509,6 +628,7 @@ def train_arm(
     checkpoint_dir: Path,
     event_path: Path,
     signatures: Mapping[str, str],
+    stage: str = "pilot",
 ) -> dict[str, object]:
     """Train one registered arm with atomic complete-update checkpoints.
 
@@ -518,6 +638,8 @@ def train_arm(
     """
     if arm not in _ARMS:
         raise ValueError(f"unknown training arm: {arm}")
+    if stage not in {"smoke", "pilot", "frozen", "discover", "confirm"}:
+        raise ValueError(f"unknown training stage: {stage}")
     if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
         raise ValueError("steps must be a positive integer")
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
@@ -631,6 +753,13 @@ def train_arm(
                 checkpoint = save_checkpoint(
                     checkpoint_root, model, optimizer, committed, normalized_signatures
                 )
+                checkpoint_artifact = validate_checkpoint_artifact(
+                    checkpoint_root,
+                    normalized_signatures,
+                    expected_attempt=committed.attempt,
+                    expected_update=committed.update,
+                )
+                checkpoint_relative = checkpoint.resolve().relative_to(event_path.parent.resolve()).as_posix()
                 append_event(
                     event_path,
                     {
@@ -640,6 +769,8 @@ def train_arm(
                         "attempt": attempt,
                         "update": committed.update,
                         "checkpoint_hash": sha256_file(checkpoint),
+                        "checkpoint_path": checkpoint_relative,
+                        "checkpoint_manifest_digest": checkpoint_artifact["manifest_digest"],
                     },
                 )
             state = committed
@@ -669,27 +800,37 @@ def train_arm(
     except Exception as error:
         if _is_cuda_process_fault(error):
             chargeable_seconds = max(0.0, time.perf_counter() - update_started)
+            failure_payload: dict[str, object] = {
+                "kind": "training_failure",
+                "stage": stage,
+                "arm": arm,
+                "seed": seed,
+                "attempt": attempt,
+                "update": state.update,
+                "message": str(error),
+                "error_type": type(error).__name__,
+                "cuda_process_fault": True,
+                "chargeable_cuda_seconds": chargeable_seconds,
+                "requires_fresh_process": not prior_faults,
+                "retry_status": "fresh_process_required" if not prior_faults else "terminal",
+                "payload": {"message": str(error)},
+            }
+            checkpoint_evidence = _checkpoint_event_evidence(
+                checkpoint_root, event_path, normalized_signatures, state
+            )
+            if checkpoint_evidence is not None:
+                failure_payload.update(checkpoint_evidence)
+            failure_payload["event_id"] = _task9_failure_event_id(failure_payload)
             failure_index = append_event(
                 event_path,
-                {
-                    "kind": "training_failure",
-                    "arm": arm,
-                    "seed": seed,
-                    "attempt": attempt,
-                    "update": state.update,
-                    "message": str(error),
-                    "error_type": type(error).__name__,
-                    "cuda_process_fault": True,
-                    "chargeable_cuda_seconds": chargeable_seconds,
-                    "requires_fresh_process": not prior_faults,
-                    "retry_status": "fresh_process_required" if not prior_faults else "terminal",
-                },
+                failure_payload,
             )
             if prior_faults:
                 append_event(
                     event_path,
-                {
+                    {
                     "kind": "failed_environment",
+                    "stage": stage,
                     "arm": arm,
                     "seed": seed,
                     "attempts": [
@@ -703,9 +844,33 @@ def train_arm(
                         for record in [*prior_faults, {"index": failure_index}]
                         if isinstance(record.get("index"), int)
                         and not isinstance(record.get("index"), bool)
+                        ],
+                    "failure_event_ids": [
+                        str(record["event_id"])
+                        for record in [*prior_faults, failure_payload]
+                        if isinstance(record.get("event_id"), str)
                     ],
                         "completion_status": "failed_environment",
                         "requires_fresh_process": False,
+                        "payload": {
+                            "attempts": [
+                                int(record["attempt"])
+                                for record in [*prior_faults, {"attempt": attempt}]
+                                if isinstance(record.get("attempt"), int)
+                                and not isinstance(record.get("attempt"), bool)
+                            ],
+                        "failure_event_indices": [
+                                int(record["index"])
+                                for record in [*prior_faults, {"index": failure_index}]
+                                if isinstance(record.get("index"), int)
+                                and not isinstance(record.get("index"), bool)
+                            ],
+                            "failure_event_ids": [
+                                str(record["event_id"])
+                                for record in [*prior_faults, failure_payload]
+                                if isinstance(record.get("event_id"), str)
+                            ],
+                        },
                     },
                 )
                 raise FailedEnvironment(
@@ -718,6 +883,7 @@ def train_arm(
             event_path,
             {
                 "kind": "training_failure",
+                "stage": stage,
                 "arm": arm,
                 "seed": seed,
                 "attempt": attempt,
@@ -725,6 +891,11 @@ def train_arm(
                 "message": str(error),
                 "error_type": type(error).__name__,
                 "cuda_process_fault": False,
+                "event_id": _task9_failure_event_id({
+                    "kind": "training_failure", "stage": stage, "arm": arm,
+                    "seed": seed, "attempt": attempt, "update": state.update,
+                }),
+                "payload": {"message": str(error)},
             },
         )
         raise
@@ -746,6 +917,38 @@ def _checkpoint_directory(directory: Path) -> Path:
     if not isinstance(directory, Path):
         raise TypeError("checkpoint directory must be a Path")
     return directory.resolve()
+
+
+def _checkpoint_event_evidence(
+    checkpoint_root: Path,
+    event_path: Path,
+    signatures: Mapping[str, str],
+    state: TrainingState,
+) -> dict[str, object] | None:
+    latest = checkpoint_root / _LATEST_NAME
+    if not latest.is_file():
+        return None
+    try:
+        artifact = validate_checkpoint_artifact(
+            checkpoint_root,
+            signatures,
+            expected_attempt=state.attempt,
+            expected_update=state.update,
+        )
+        relative = latest.resolve().relative_to(event_path.parent.resolve()).as_posix()
+    except (OSError, ValueError):
+        return None
+    if not relative.startswith("checkpoints/"):
+        return None
+    return {
+        "checkpoint_path": relative,
+        "checkpoint_sha256": artifact["checkpoint_sha256"],
+        "checkpoint_manifest_digest": artifact["manifest_digest"],
+    }
+
+
+def _task9_failure_event_id(event: Mapping[str, object]) -> str:
+    return task9_failure_event_id(event)
 
 
 def _normalize_signatures(signatures: Mapping[str, str]) -> dict[str, str]:
@@ -771,6 +974,21 @@ def _adapter_payload(model: nn.Module) -> dict[str, Tensor]:
     return {
         name: tensor.detach().to(device="cpu").contiguous().clone()
         for name, tensor in adapter_state_dict(model).items()
+    }
+
+
+def registered_adapter_schema(model: nn.Module, initialization_hash: str) -> dict[str, object]:
+    """Return the concrete LoRA schema a retry is authorized to load."""
+    if not isinstance(model, nn.Module):
+        raise TypeError("model must be an nn.Module")
+    if not isinstance(initialization_hash, str) or not initialization_hash:
+        raise ValueError("initialization_hash must be a non-empty string")
+    return {
+        "parameters": {
+            name: {"shape": [int(dimension) for dimension in parameter.shape], "dtype": str(parameter.dtype)}
+            for name, parameter in adapter_state_dict(model).items()
+        },
+        "initialization_hash": initialization_hash,
     }
 
 
@@ -873,6 +1091,113 @@ def _write_checkpoint_sidecar(
             "signatures": dict(signatures),
         },
     )
+
+
+def _tensor_manifest(value: Tensor) -> dict[str, object]:
+    if not isinstance(value, Tensor):
+        raise ValueError("checkpoint tensor manifest is corrupt")
+    finite = bool(torch.isfinite(value).all())
+    return {"shape": [int(dimension) for dimension in value.shape], "dtype": str(value.dtype), "finite": finite}
+
+
+def _manifest_value(value: object) -> object:
+    if isinstance(value, Tensor):
+        descriptor = _tensor_manifest(value)
+        if value.numel() == 1:
+            descriptor["value"] = value.detach().to(device="cpu").item()
+        return descriptor
+    if isinstance(value, Mapping):
+        return {str(key): _manifest_value(item) for key, item in sorted(value.items(), key=lambda item: str(item[0]))}
+    if isinstance(value, tuple):
+        return [_manifest_value(item) for item in value]
+    if isinstance(value, list):
+        return [_manifest_value(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    raise ValueError("checkpoint manifest contains an unsupported value")
+
+
+def _checkpoint_manifest_payload(
+    checkpoint_hash: str, payload: Mapping[str, object], signatures: Mapping[str, str]
+) -> dict[str, object]:
+    adapters = payload.get("adapter_state")
+    optimizer_state = payload.get("optimizer_state")
+    state = payload.get("state")
+    if not isinstance(adapters, Mapping) or not isinstance(optimizer_state, Mapping) or not isinstance(state, Mapping):
+        raise ValueError("checkpoint manifest cannot describe malformed payload")
+    return {
+        "schema_version": _CHECKPOINT_MANIFEST_SCHEMA_VERSION,
+        "checkpoint_sha256": checkpoint_hash,
+        "signatures": dict(sorted(signatures.items())),
+        "state": dict(state),
+        "scheduler_state": _manifest_value(payload.get("scheduler_state")),
+        "adapter_schema": {
+            str(name): {"shape": [int(dimension) for dimension in value.shape], "dtype": str(value.dtype)}
+            for name, value in adapters.items() if isinstance(value, Tensor)
+        },
+        "adapter_manifest": {
+            str(name): _tensor_manifest(value) for name, value in adapters.items()
+        },
+        "optimizer_manifest": _manifest_value(optimizer_state),
+    }
+
+
+def _write_checkpoint_manifest(
+    root: Path, checkpoint_hash: str, payload: Mapping[str, object], signatures: Mapping[str, str]
+) -> None:
+    write_immutable_json(
+        root / f"manifest-{checkpoint_hash}.json",
+        _checkpoint_manifest_payload(checkpoint_hash, payload, signatures),
+    )
+
+
+def _checkpoint_manifest_digest(
+    root: Path, checkpoint_hash: str, payload: Mapping[str, object]
+) -> str:
+    manifest = root / f"manifest-{checkpoint_hash}.json"
+    return sha256_payload({
+        "checkpoint_sha256": checkpoint_hash,
+        "manifest_sha256": sha256_file(manifest),
+        "payload_signatures": dict(sorted(payload["signatures"].items())),
+        "state": dict(payload["state"]),
+    })
+
+
+def _validate_checkpoint_manifest(
+    root: Path, checkpoint_hash: str, payload: object, signatures: Mapping[str, str]
+) -> None:
+    if not isinstance(payload, Mapping):
+        raise ValueError("checkpoint payload is corrupt")
+    path = root / f"manifest-{checkpoint_hash}.json"
+    _require_direct_child(root, path)
+    try:
+        raw = path.read_bytes()
+        metadata = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("checkpoint manifest is corrupt") from error
+    if not isinstance(metadata, dict) or canonical_json(metadata) != raw:
+        raise ValueError("checkpoint manifest is corrupt")
+    expected = _checkpoint_manifest_payload(checkpoint_hash, payload, signatures)
+    if metadata != expected:
+        raise ValueError("checkpoint manifest does not match payload")
+    adapters = payload.get("adapter_state")
+    if not isinstance(adapters, Mapping) or not adapters or any(not isinstance(name, str) for name in adapters):
+        raise ValueError("checkpoint adapter state is corrupt")
+    for tensor in adapters.values():
+        if not isinstance(tensor, Tensor) or not bool(torch.isfinite(tensor).all()):
+            raise ValueError("checkpoint adapter state is corrupt")
+    state = payload.get("state")
+    if not isinstance(state, Mapping):
+        raise ValueError("checkpoint training state is corrupt")
+    update = state.get("update")
+    if isinstance(update, bool) or not isinstance(update, int) or update < 0:
+        raise ValueError("checkpoint training state is corrupt")
+    optimizer_state = payload.get("optimizer_state")
+    if not isinstance(optimizer_state, Mapping):
+        raise ValueError("checkpoint optimizer state is corrupt")
+    params = [nn.Parameter(tensor.detach().to(device="cpu").clone()) for tensor in adapters.values()]
+    trial = torch.optim.AdamW(params, lr=_BASE_LEARNING_RATE, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0)
+    _validate_optimizer_state(optimizer_state, trial, update)
 
 
 def _validate_checkpoint_sidecar(
