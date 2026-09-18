@@ -258,15 +258,16 @@ def render_example(tokenizer: object, example: Example) -> RenderedExample:
     renderer = getattr(tokenizer, "apply_chat_template", None)
     if not callable(renderer):
         raise TypeError("tokenizer must provide apply_chat_template")
+    rendered_prompt = renderer(
+        [{"role": "user", "content": example.prompt}],
+        tokenize=True,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    # Transformers tokenizers may return a BatchEncoding mapping for chat
+    # templates, while the focused fixtures return the bare ID sequence.
     prompt_ids = tuple(
-        _token_ids(
-            renderer(
-                [{"role": "user", "content": example.prompt}],
-                tokenize=True,
-                add_generation_prompt=True,
-                enable_thinking=False,
-            )
-        )
+        _token_ids(rendered_prompt.get("input_ids") if isinstance(rendered_prompt, Mapping) else rendered_prompt)
     )
     if len(prompt_ids) > 480:
         raise ValueError("rendered prompt exceeds 480-token generation budget")

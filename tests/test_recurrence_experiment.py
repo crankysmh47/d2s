@@ -15,6 +15,7 @@ from ppmoe.recurrence.experiment import (
     STAGE_DEPENDENCIES,
     StageError,
     StagePrerequisiteError,
+    default_dependencies,
     run_stage,
 )
 from ppmoe.recurrence.provenance import sha256_payload, write_immutable_json
@@ -64,6 +65,27 @@ def _dependencies(*, stages=None, read_path=None, spawn_child=None) -> Recurrenc
         test_only=True,
         checkpoint_validator=checkpoint_validator,
     )
+
+
+def test_default_production_dependencies_bind_only_g0_workers() -> None:
+    """G0 must have real source/data dispatchers before production execution."""
+    dependencies = default_dependencies()
+    assert dependencies.stage_functions["source"].__name__ != "unavailable"
+    assert dependencies.stage_functions["data"].__name__ != "unavailable"
+    assert dependencies.stage_functions["smoke"].__name__ == "unavailable"
+
+
+def test_source_snapshot_path_survives_staging_finalization(tmp_path: Path) -> None:
+    from ppmoe.recurrence.experiment import _source_snapshot_path
+
+    staging = tmp_path / "staging"
+    snapshot = staging / "source" / ("a" * 40)
+    snapshot.mkdir(parents=True)
+    payload = {"snapshot_relative_path": f"source/{'a' * 40}"}
+    assert _source_snapshot_path(staging, payload) == snapshot.resolve()
+    finalized = tmp_path / "final"
+    staging.rename(finalized)
+    assert _source_snapshot_path(finalized, payload) == (finalized / "source" / ("a" * 40)).resolve()
 
 
 @pytest.mark.parametrize(

@@ -7,7 +7,9 @@ import pytest
 
 from ppmoe.recurrence.config import RecurrenceConfig
 from ppmoe.recurrence.provenance import (
+    PROTOCOL_REVISION,
     _runtime_code_files,
+    _git_revision,
     build_source_manifest,
     compute_run_id,
     resolve_model_revision,
@@ -113,6 +115,12 @@ def test_qwen3_config_accepts_the_registered_architecture() -> None:
     validate_qwen3_config(official_qwen3_config())
 
 
+def test_source_manifest_uses_the_frozen_protocol_revision() -> None:
+    """Production provenance must cite Task 0, not the mutable implementation HEAD."""
+    assert PROTOCOL_REVISION == "0615d0d9eac985c7ab5b0e019ab1afcea1cbe979"
+    assert _git_revision() == PROTOCOL_REVISION
+
+
 def test_source_manifest_hashes_sorted_snapshot_and_writes_immutable_record(
     tmp_path: Path,
 ) -> None:
@@ -142,6 +150,32 @@ def test_source_manifest_hashes_sorted_snapshot_and_writes_immutable_record(
     assert manifest["license_relative_path"] == "LICENSE"
     assert len(manifest["config_sha256"]) == len(manifest["code_sha256"]) == 64
     assert json.loads(output.read_text(encoding="utf-8")) == manifest
+
+
+def test_source_manifest_excludes_only_transient_local_download_metadata(
+    tmp_path: Path,
+) -> None:
+    """Local-dir Hugging Face metadata must not change authoritative source identity."""
+    snapshot = write_snapshot(tmp_path)
+    metadata = snapshot / ".cache" / "huggingface" / "download" / "config.json.metadata"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text("etag=first\n", encoding="utf-8")
+    retained = snapshot / ".cache" / "huggingface" / "trees" / "tree.json"
+    retained.parent.mkdir(parents=True)
+    retained.write_text("tree-control\n", encoding="utf-8")
+
+    first = build_source_manifest(
+        RecurrenceConfig.load(REGISTERED_CONFIG), snapshot, tmp_path / "first.json"
+    )
+    metadata.write_text("etag=second\n", encoding="utf-8")
+    second = build_source_manifest(
+        RecurrenceConfig.load(REGISTERED_CONFIG), snapshot, tmp_path / "second.json"
+    )
+
+    assert first == second
+    paths = {entry["relative_path"] for entry in first["files"]}
+    assert ".cache/huggingface/download/config.json.metadata" not in paths
+    assert ".cache/huggingface/trees/tree.json" in paths
 
 
 def test_source_manifest_rejects_snapshot_path_without_resolved_revision(

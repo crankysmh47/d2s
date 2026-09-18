@@ -167,9 +167,25 @@ class RecurrenceDependencies:
 
 
 def default_dependencies() -> RecurrenceDependencies:
-    """Production defaults stay lazy; Task 15 supplies real source/data workers."""
+    """Production defaults stay lazy; G0 binds only its source/data workers."""
     def unavailable(context: StageContext) -> Mapping[str, object]:
         raise EnvironmentStop(f"production {context.stage} worker is unavailable before Task 15")
+
+    def source(context: StageContext) -> Mapping[str, object]:
+        return _production_source_stage(
+            context,
+            metadata_resolver=_lazy_hf_api(),
+            snapshot_downloader=_lazy_snapshot_download(),
+            tokenizer_model_loader=_lazy_transformers_loader(),
+        )
+
+    def data(context: StageContext) -> Mapping[str, object]:
+        return _production_data_stage(
+            context,
+            tokenizer_model_loader=_lazy_transformers_loader(),
+            dataset_loader=_lazy_datasets_loader(),
+        )
+
     return RecurrenceDependencies(
         metadata_resolver=lambda *_args, **_kwargs: _lazy_hf_api(),
         snapshot_loader=lambda *_args, **_kwargs: _lazy_snapshot_download(),
@@ -179,8 +195,159 @@ def default_dependencies() -> RecurrenceDependencies:
         synchronizer=lambda: _lazy_torch_synchronize(),
         disk_probe=directory_size,
         vram_probe=_default_vram_probe,
-        stage_functions={stage: unavailable for stage in STAGE_DEPENDENCIES},
+        stage_functions={
+            "source": source,
+            "data": data,
+            **{stage: unavailable for stage in STAGE_DEPENDENCIES if stage not in {"source", "data"}},
+        },
     )
+
+
+def _production_source_stage(
+    context: StageContext,
+    *,
+    metadata_resolver: object,
+    snapshot_downloader: Callable[..., object],
+    tokenizer_model_loader: object,
+) -> Mapping[str, object]:
+    """Resolve and materialize the pinned Qwen3 source for G0."""
+    from .provenance import build_source_manifest, resolve_model_revision, validate_qwen3_config
+
+    if not callable(getattr(metadata_resolver, "model_info", None)):
+        raise StageError("source metadata resolver does not provide model_info")
+    revision = resolve_model_revision(context.config.model.repo_id, "main", api=metadata_resolver)
+    snapshot_root = context.run_root / "source" / revision
+    returned = snapshot_downloader(
+        context.config.model.repo_id,
+        revision=revision,
+        local_dir=str(snapshot_root),
+    )
+    snapshot_path = Path(str(returned)).resolve()
+    if snapshot_path != snapshot_root.resolve():
+        raise StageError("source downloader did not return the requested local snapshot")
+
+    # Validate architecture from the pinned local config before data generation.
+    from transformers import AutoConfig
+
+    loaded_config = AutoConfig.from_pretrained(
+        str(snapshot_path), revision=revision, local_files_only=True
+    )
+    config_dict = loaded_config.to_dict()
+    validate_qwen3_config(config_dict)
+
+    source_path = context.run_root / "source.json"
+    manifest = build_source_manifest(context.config, snapshot_path, source_path)
+    files = manifest["files"]
+    if not isinstance(files, list):
+        raise StageError("source manifest file inventory is malformed")
+    download_bytes = sum(int(entry["bytes"]) for entry in files if isinstance(entry, Mapping))
+    if download_bytes > context.config.resources.maximum_download_bytes:
+        raise BudgetStop("registered source download bound exceeded")
+    tokenizer_entries = [
+        entry for entry in files
+        if isinstance(entry, Mapping) and str(entry.get("relative_path", "")).startswith("tokenizer")
+    ]
+    if not tokenizer_entries:
+        raise StageError("source manifest has no tokenizer file")
+    tokenizer_entry = next(
+        (entry for entry in tokenizer_entries if entry["relative_path"] == "tokenizer.json"),
+        tokenizer_entries[0],
+    )
+    source_hash = sha256_file(source_path)
+    snapshot_relative_path = (Path("source") / revision).as_posix()
+    payload = {
+        "source_hash": source_hash,
+        "revision": revision,
+        "snapshot_relative_path": snapshot_relative_path,
+        "download_bytes": download_bytes,
+        "tokenizer_revision": revision,
+        "tokenizer_sha256": str(tokenizer_entry["sha256"]),
+        "source_manifest_sha256": source_hash,
+    }
+    append_event(context.run_root / "events.jsonl", {
+        "kind": "stage_complete", "stage": "source", "attempt": context.attempt,
+        "outcome": "passed", "payload": payload,
+    })
+    return payload
+
+
+def _production_data_stage(
+    context: StageContext,
+    *,
+    tokenizer_model_loader: object,
+    dataset_loader: Callable[..., object],
+) -> Mapping[str, object]:
+    """Freeze exact-answer and recovered FineWeb data under the source root."""
+    from .data import freeze_examples, make_examples, materialize_retention, recover_retention_documents
+
+    source_record = _read_json(_stage_path(context.run_root, "source"))
+    source_payload = source_record.get("payload")
+    if not isinstance(source_payload, Mapping):
+        raise StagePrerequisiteError("source record has no production payload")
+    snapshot_path = _source_snapshot_path(context.run_root, source_payload)
+    revision = source_payload.get("revision")
+    tokenizer_sha256 = source_payload.get("tokenizer_sha256")
+    if not snapshot_path.is_dir() or not isinstance(revision, str) or not isinstance(tokenizer_sha256, str):
+        raise StagePrerequisiteError("source record has incomplete tokenizer provenance")
+    if not isinstance(tokenizer_model_loader, tuple) or len(tokenizer_model_loader) != 2:
+        raise StageError("transformers loader must provide tokenizer and model classes")
+    tokenizer_cls = tokenizer_model_loader[0]
+    tokenizer = tokenizer_cls.from_pretrained(
+        str(snapshot_path), revision=revision, local_files_only=True
+    )
+    examples = make_examples(context.config)
+    manifest = freeze_examples(
+        context.run_root,
+        examples,
+        tokenizer=tokenizer,
+        tokenizer_revision=revision,
+        tokenizer_sha256=tokenizer_sha256,
+    )
+
+    project_root = Path(__file__).resolve().parents[3]
+    old_retention_root = project_root / "artifacts" / "phase1-v0" / "tokens" / "fineweb-heldout"
+    documents = recover_retention_documents(old_retention_root, dataset_loader)
+    retention_manifest = materialize_retention(tokenizer, documents, context.run_root / "retention")
+
+    evidence: dict[str, str] = {}
+    for path in (
+        context.run_root / "data" / "train.jsonl",
+        context.run_root / "data" / "dev.jsonl",
+        context.run_root / "data" / "test.jsonl",
+        context.run_root / "data" / "manifest.json",
+        context.run_root / "retention" / "retention-chunks.jsonl",
+        context.run_root / "retention" / "retention-manifest.json",
+    ):
+        evidence[path.relative_to(context.run_root).as_posix()] = sha256_file(path)
+    data_hash = sha256_payload(evidence)
+    payload = {
+        "data_hash": data_hash,
+        "manifest_sha256": sha256_file(context.run_root / "data" / "manifest.json"),
+        "retention_manifest_sha256": sha256_file(context.run_root / "retention" / "retention-manifest.json"),
+        "retention_chunks_sha256": sha256_file(context.run_root / "retention" / "retention-chunks.jsonl"),
+        "exact_answer_counts": manifest["counts"],
+        "retention_valid_source_tokens": retention_manifest["valid_source_tokens"],
+        "retention_chunk_count": retention_manifest["chunk_count"],
+        "download_bytes": 0,
+    }
+    append_event(context.run_root / "events.jsonl", {
+        "kind": "stage_complete", "stage": "data", "attempt": context.attempt,
+        "outcome": "passed", "payload": payload,
+    })
+    return payload
+
+
+def _source_snapshot_path(run_root: Path, source_payload: Mapping[str, object]) -> Path:
+    """Resolve the pinned snapshot below the current (possibly finalized) run root."""
+    relative = source_payload.get("snapshot_relative_path")
+    if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+        raise StagePrerequisiteError("source record has no relative snapshot path")
+    candidate = (run_root / Path(relative)).resolve()
+    try:
+        candidate.relative_to(run_root.resolve())
+    except ValueError as error:
+        raise StagePrerequisiteError("source snapshot escapes the run root") from error
+    return candidate
 
 
 def run_stage(

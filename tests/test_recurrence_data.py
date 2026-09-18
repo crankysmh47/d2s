@@ -189,6 +189,15 @@ def test_rendering_uses_a_single_user_turn_and_shifted_answer_only_labels() -> N
     assert len(rendered.train_input_ids) - len(rendered.prompt_input_ids) <= 32
 
 
+def test_rendering_accepts_transformers_batch_encoding_chat_output() -> None:
+    class BatchEncodingTokenizer(FakeTokenizer):
+        def apply_chat_template(self, messages: list[dict[str, str]], **kwargs: object) -> dict[str, list[int]]:
+            return {"input_ids": [10, 11]}
+
+    rendered = render_example(BatchEncodingTokenizer(), example_for("expressions", "12"))
+    assert rendered.prompt_input_ids == (10, 11)
+
+
 def test_rendering_rejects_any_length_violation_without_truncation() -> None:
     """Would fail if overlong prompts or answers were silently truncated."""
     class LongTokenizer(FakeTokenizer):

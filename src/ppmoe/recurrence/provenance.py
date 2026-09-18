@@ -16,6 +16,8 @@ from typing import Mapping
 from .config import RecurrenceConfig
 
 
+PROTOCOL_REVISION = "0615d0d9eac985c7ab5b0e019ab1afcea1cbe979"
+
 _PATH_LOCKS_GUARD = Lock()
 _PATH_LOCKS: dict[Path, Lock] = {}
 _FULL_SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
@@ -236,6 +238,8 @@ def _snapshot_files(snapshot_root: Path) -> tuple[SourceFile, ...]:
         if not path.is_file():
             continue
         relative_path = path.relative_to(snapshot_root)
+        if _is_transient_local_download_metadata(relative_path):
+            continue
         records.append(
             SourceFile(
                 relative_path=relative_path.as_posix(),
@@ -247,6 +251,14 @@ def _snapshot_files(snapshot_root: Path) -> tuple[SourceFile, ...]:
     if len({entry.relative_path for entry in records}) != len(records):
         raise ValueError("source snapshot contains duplicate relative file paths")
     return tuple(records)
+
+
+def _is_transient_local_download_metadata(relative_path: Path) -> bool:
+    """Exclude only Hugging Face local-dir download metadata, never model files."""
+    return (
+        relative_path.parts[:3] == (".cache", "huggingface", "download")
+        and relative_path.name.endswith(".metadata")
+    )
 
 
 def _validate_snapshot_inventory(files: tuple[SourceFile, ...]) -> None:
@@ -339,21 +351,9 @@ def _nvidia_driver_version() -> str:
 
 
 def _git_revision() -> str:
-    root = Path(__file__).resolve().parents[3]
-    try:
-        completed = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=root,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        raise RuntimeError("could not resolve protocol Git revision") from error
-    revision = completed.stdout.strip()
-    validate_revision(revision)
-    return revision.lower()
+    """Return the immutable Task 0 protocol freeze revision."""
+    validate_revision(PROTOCOL_REVISION)
+    return PROTOCOL_REVISION
 
 
 def write_immutable_json(path: Path, payload: Mapping[str, object]) -> str:
