@@ -167,7 +167,7 @@ class RecurrenceDependencies:
 
 
 def default_dependencies() -> RecurrenceDependencies:
-    """Production defaults stay lazy; G0 binds only its source/data workers."""
+    """Production defaults stay lazy; G0 and G1 bind their real workers."""
     def unavailable(context: StageContext) -> Mapping[str, object]:
         raise EnvironmentStop(f"production {context.stage} worker is unavailable before Task 15")
 
@@ -186,6 +186,10 @@ def default_dependencies() -> RecurrenceDependencies:
             dataset_loader=_lazy_datasets_loader(),
         )
 
+    def smoke(context: StageContext) -> Mapping[str, object]:
+        from .smoke import run_production_smoke
+        return run_production_smoke(context)
+
     return RecurrenceDependencies(
         metadata_resolver=lambda *_args, **_kwargs: _lazy_hf_api(),
         snapshot_loader=lambda *_args, **_kwargs: _lazy_snapshot_download(),
@@ -198,7 +202,8 @@ def default_dependencies() -> RecurrenceDependencies:
         stage_functions={
             "source": source,
             "data": data,
-            **{stage: unavailable for stage in STAGE_DEPENDENCIES if stage not in {"source", "data"}},
+            "smoke": smoke,
+            **{stage: unavailable for stage in STAGE_DEPENDENCIES if stage not in {"source", "data", "smoke"}},
         },
     )
 
@@ -470,7 +475,9 @@ def run_stage(
             payload["fresh_process_pid"] = child.pid
             pilot_payload = payload
             retry_context = StageContext(stage, config, config_path.resolve(), root, active_root, signatures, 2, deps.read_path)
-            _postflight_resources(retry_context, payload, deps)
+            _postflight_resources(
+                retry_context, payload, deps, require_payload_vram=stage == "smoke"
+            )
             record = _record(stage, "passed", _completed_signatures(stage, signatures, payload), payload, 2)
             _persist_stage(active_root, record)
             return record
@@ -858,11 +865,30 @@ def _preflight_resources(context: StageContext, deps: RecurrenceDependencies) ->
         raise BudgetStop("registered resource gate stopped this stage")
 
 
-def _postflight_resources(context: StageContext, payload: Mapping[str, object], deps: RecurrenceDependencies) -> None:
+def _postflight_resources(
+    context: StageContext,
+    payload: Mapping[str, object],
+    deps: RecurrenceDependencies,
+    *,
+    require_payload_vram: bool = False,
+) -> None:
     root = context.run_root
     ledger_path = root / "cuda-cost.jsonl"
     projection = _projection(context, deps)
-    vram = deps.vram_probe()
+    payload_total = payload.get("total_vram_bytes")
+    payload_reserved = payload.get("peak_reserved_bytes")
+    payload_vram_valid = (
+        isinstance(payload_total, int) and not isinstance(payload_total, bool)
+        and isinstance(payload_reserved, int) and not isinstance(payload_reserved, bool)
+        and payload_total > 0 and payload_reserved >= 0
+    )
+    if require_payload_vram and not payload_vram_valid:
+        raise StageError("retry payload is missing authenticated VRAM measurements")
+    vram = (
+        {"total_vram_bytes": payload_total, "peak_reserved_bytes": payload_reserved}
+        if payload_vram_valid
+        else deps.vram_probe()
+    )
     measurements = {
         "peak_reserved_bytes": int(vram.get("peak_reserved_bytes", 0)),
         "total_vram_bytes": int(vram.get("total_vram_bytes", 1)),
@@ -935,6 +961,26 @@ def _checkpoint_proof(request: Mapping[str, object]) -> str:
     })
 
 
+def _checkpoint_proof_for_artifact(worker_identity: str, artifact: Mapping[str, object]) -> str:
+    """Build the authenticated proof for real or disposable retry evidence."""
+    raw_path = str(artifact.get("path", ""))
+    checkpoint_path = str(Path(raw_path).resolve()) if raw_path else ""
+    return _checkpoint_proof({
+        "worker_identity": worker_identity,
+        "checkpoint_path": checkpoint_path,
+        "checkpoint_digest": artifact.get("manifest_digest", artifact.get("checkpoint_sha256", "")),
+        "checkpoint_sha256": artifact.get("checkpoint_sha256", ""),
+        "checkpoint_attempt": artifact.get("attempt", 0),
+        "checkpoint_update": artifact.get("update", 0),
+        "checkpoint_event_id": artifact.get("event_id", ""),
+        "checkpoint_event_index": artifact.get("event_index", 0),
+        "checkpoint_arm": artifact.get("arm", ""),
+        "checkpoint_seed": artifact.get("seed", 0),
+        "checkpoint_relative_path": artifact.get("relative_path", ""),
+        "adapter_schema": artifact.get("adapter_schema"),
+    })
+
+
 def _callable_identity(reference: str) -> str:
     import inspect
     module_name, separator, attribute = reference.partition(":")
@@ -954,7 +1000,14 @@ def _callable_identity(reference: str) -> str:
     })
 
 
-_PRODUCTION_CHILD_ALLOWLIST: Final[tuple[tuple[str, str, str], ...]] = ()
+_PRODUCTION_CHILD_ALLOWLIST: Final[tuple[tuple[str, str, str], ...]] = (
+    ("smoke", "ppmoe.recurrence.smoke:run_child_smoke", "6d16e6aa7480b62edb7d829155415fe04fbbd9032011280ad59686380d462877"),
+)
+
+
+def _production_child_allowlist() -> tuple[tuple[str, str, str], ...]:
+    """Return the reviewed, non-empty dispatcher registration unchanged."""
+    return _PRODUCTION_CHILD_ALLOWLIST
 
 
 def _child_worker_ref(stage: str, deps: RecurrenceDependencies) -> tuple[str, str]:
@@ -970,7 +1023,7 @@ def _child_worker_ref(stage: str, deps: RecurrenceDependencies) -> tuple[str, st
         return reference, _callable_identity(reference)
     if deps.child_worker_refs is not None or deps.child_worker_ref is not None:
         raise EnvironmentStop("production child dispatchers must use frozen stage registration")
-    binding = next((item for item in _PRODUCTION_CHILD_ALLOWLIST if item[0] == stage), None)
+    binding = next((item for item in _production_child_allowlist() if item[0] == stage), None)
     if binding is None:
         raise EnvironmentStop(f"no production child dispatcher is registered for stage {stage}")
     _stage, reference, identity = binding
@@ -1105,8 +1158,12 @@ def _run_child_retry(stage: str, config_path: Path, artifact_root: Path, run_roo
     retry_root.mkdir(parents=True, exist_ok=True)
     _reject_retry_reparse(retry_root)
     nonce = sha256(os.urandom(32)).hexdigest()
-    checkpoint = _derive_checkpoint_artifact(run_root, stage, signatures, deps)
-    checkpoint_path = str(Path(str(checkpoint["path"])).resolve())
+    if stage == "smoke" and not deps.test_only:
+        from .smoke import _smoke_retry_artifact
+        checkpoint = _smoke_retry_artifact(run_root)
+    else:
+        checkpoint = _derive_checkpoint_artifact(run_root, stage, signatures, deps)
+    checkpoint_path = str(Path(str(checkpoint["path"])).resolve()) if checkpoint.get("path") else ""
     checkpoint_digest = str(checkpoint.get("manifest_digest", checkpoint["checkpoint_sha256"]))
     checkpoint_sha256 = str(checkpoint["checkpoint_sha256"])
     checkpoint_attempt = int(checkpoint["attempt"])
@@ -1129,16 +1186,7 @@ def _run_child_retry(stage: str, config_path: Path, artifact_root: Path, run_roo
         checkpoint_signature=_checkpoint_signature(stage, 2, checkpoint_path, checkpoint_digest, checkpoint_sha256, checkpoint_update, checkpoint_event_id, checkpoint_event_index, checkpoint_arm, checkpoint_seed, checkpoint_relative_path, signatures),
         attempt=2, signatures=dict(signatures), worker_ref=dispatcher_ref,
         worker_identity=dispatcher_identity,
-        checkpoint_proof=_checkpoint_proof({
-            "worker_identity": dispatcher_identity, "checkpoint_path": checkpoint_path,
-            "checkpoint_digest": checkpoint_digest, "checkpoint_sha256": checkpoint_sha256,
-            "checkpoint_attempt": checkpoint_attempt,
-            "checkpoint_update": checkpoint_update,
-            "checkpoint_event_id": checkpoint_event_id, "checkpoint_event_index": checkpoint_event_index,
-            "checkpoint_arm": checkpoint_arm, "checkpoint_seed": checkpoint_seed,
-            "checkpoint_relative_path": checkpoint_relative_path,
-            "adapter_schema": checkpoint.get("adapter_schema"),
-        }),
+        checkpoint_proof=_checkpoint_proof_for_artifact(dispatcher_identity, checkpoint),
         adapter_schema=checkpoint.get("adapter_schema"),
         test_only=deps.test_only, nonce=nonce,
     )
@@ -1154,9 +1202,10 @@ def _run_child_retry(stage: str, config_path: Path, artifact_root: Path, run_roo
     environment["PYTHONPATH"] = source_root + os.pathsep + environment.get("PYTHONPATH", "")
     process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment)
     _stdout, stderr = process.communicate()
+    _reject_retry_reparse(result_path, required=True)
     if not result_path.exists():
         raise EnvironmentStop(f"fresh child produced no result: {stderr.strip()}")
-    raw = _read_json(result_path)
+    raw = _json_canonical(result_path, _read_test_bytes_once(result_path, trusted_root=retry_root))
     required = {"request_sha256", "nonce", "stage", "run_root", "attempt", "pid", "status", "payload"}
     if set(raw) != required or raw.get("request_sha256") != request_hash or raw.get("nonce") != nonce or raw.get("stage") != stage or raw.get("run_root") != str(run_root) or raw.get("attempt") != 2 or raw.get("status") != "passed":
         raise EnvironmentStop("fresh child result does not authenticate the retry request")
@@ -1185,31 +1234,43 @@ def _run_child_retry(stage: str, config_path: Path, artifact_root: Path, run_roo
         or payload.get("checkpoint_proof") != request.checkpoint_proof
     ):
         raise EnvironmentStop("fresh child worker PID is spoofed")
+    if not deps.test_only and (stage != "smoke" or (isinstance(payload, dict) and "schema_version" in payload)):
+        payload_digest = payload.get("payload_sha256") if isinstance(payload, dict) else None
+        if not isinstance(payload_digest, str) or payload_digest != _child_payload_digest(payload):
+            raise EnvironmentStop("fresh child payload digest is invalid")
+        if stage == "smoke":
+            from .smoke import _validate_smoke_payload
+            core = {key: value for key, value in payload.items() if key not in _CHILD_TRANSPORT_KEYS}
+            _validate_smoke_payload(core)
     if process.returncode != 0:
         raise EnvironmentStop(f"fresh child failed: {stderr.strip()}")
     # Re-open and revalidate after the child exits. Any child-side mutation of
     # the checkpoint or manifest invalidates the retry before sealing success.
-    post_checkpoint = _derive_checkpoint_artifact(run_root, stage, signatures, deps)
+    if stage == "smoke" and not deps.test_only:
+        from .smoke import _smoke_retry_artifact
+        post_checkpoint = _smoke_retry_artifact(run_root)
+    else:
+        post_checkpoint = _derive_checkpoint_artifact(run_root, stage, signatures, deps)
     for key in ("path", "checkpoint_sha256", "manifest_digest", "attempt", "update", "event_id", "event_index", "arm", "seed", "relative_path"):
         if post_checkpoint.get(key) != checkpoint.get(key):
             raise EnvironmentStop("checkpoint changed after child validation")
-    post_proof = _checkpoint_proof({
-        "worker_identity": request.worker_identity,
-        "checkpoint_path": str(Path(str(post_checkpoint["path"])).resolve()),
-        "checkpoint_digest": post_checkpoint.get("manifest_digest", post_checkpoint["checkpoint_sha256"]),
-        "checkpoint_sha256": post_checkpoint["checkpoint_sha256"],
-        "checkpoint_attempt": post_checkpoint["attempt"],
-        "checkpoint_update": post_checkpoint["update"],
-        "checkpoint_event_id": post_checkpoint["event_id"],
-        "checkpoint_event_index": post_checkpoint["event_index"],
-        "checkpoint_arm": post_checkpoint["arm"],
-        "checkpoint_seed": post_checkpoint["seed"],
-        "checkpoint_relative_path": post_checkpoint["relative_path"],
-        "adapter_schema": post_checkpoint.get("adapter_schema"),
-    })
+    post_proof = _checkpoint_proof_for_artifact(request.worker_identity, post_checkpoint)
     if post_proof != request.checkpoint_proof:
         raise EnvironmentStop("checkpoint proof changed after child validation")
     return ChildResult(request_hash, nonce, stage, str(run_root), 2, pid, "passed", payload)
+
+
+_CHILD_TRANSPORT_KEYS = frozenset({
+    "worker_pid", "attempt", "checkpoint_path", "checkpoint_digest", "checkpoint_sha256",
+    "checkpoint_attempt", "checkpoint_update", "checkpoint_event_id", "checkpoint_event_index",
+    "checkpoint_arm", "checkpoint_seed", "checkpoint_relative_path", "checkpoint_signature",
+    "dispatcher_stage", "dispatcher_ref", "dispatcher_identity", "checkpoint_proof",
+    "payload_sha256",
+})
+
+
+def _child_payload_digest(payload: Mapping[str, object]) -> str:
+    return sha256_payload({key: value for key, value in payload.items() if key != "payload_sha256"})
 
 
 def _child_echo_worker(request: Mapping[str, object]) -> Mapping[str, object]:
@@ -1232,6 +1293,8 @@ def _child_echo_worker(request: Mapping[str, object]) -> Mapping[str, object]:
         "dispatcher_ref": request["worker_ref"],
         "dispatcher_identity": request["worker_identity"],
         "checkpoint_proof": request["checkpoint_proof"],
+        "total_vram_bytes": 32 << 30,
+        "peak_reserved_bytes": 0,
     }
 
 
@@ -1253,7 +1316,9 @@ def _child_execute(request_path: Path, result_path: Path) -> int:
         if not separator or not module_name or not attribute: raise ValueError("invalid worker reference")
         if _callable_identity(str(request["worker_ref"])) != request["worker_identity"]:
             raise ValueError("dispatcher implementation identity mismatch")
-        if not request["test_only"]:
+        if not request["test_only"] and not (
+            request["stage"] == "smoke" and request["checkpoint_path"] == ""
+        ):
             checkpoint_path = Path(str(request["checkpoint_path"]))
             _validate_trusted_path(checkpoint_path, Path(str(request["run_root"])))
             checkpoint_bytes = _read_test_bytes_once(checkpoint_path, trusted_root=Path(str(request["run_root"])))
@@ -1294,6 +1359,7 @@ def _child_execute(request_path: Path, result_path: Path) -> int:
         if payload.get("checkpoint_proof") != request["checkpoint_proof"]:
             raise ValueError("child worker did not prove checkpoint validation")
         payload.setdefault("worker_pid", os.getpid())
+        payload["payload_sha256"] = _child_payload_digest(payload)
         result = {"request_sha256": request_hash, "nonce": request["nonce"], "stage": request["stage"], "run_root": request["run_root"], "attempt": 2, "pid": os.getpid(), "status": "passed", "payload": payload}
         write_immutable_json(result_path, result)
         return 0
@@ -1309,13 +1375,14 @@ def _reconcile_chargeable_cuda(root: Path, config: RecurrenceConfig, stage: str,
     if not events.exists():
         return
     ledger = CudaCostLedger.load(root / "cuda-cost.jsonl", config.resources.maximum_cuda_seconds)
-    for line_index, line in enumerate(events.read_text(encoding="utf-8").splitlines()):
+    for line_index, line in enumerate(_read_test_bytes_once(events, trusted_root=root).decode("utf-8").splitlines()):
         event = json.loads(line)
         if (event.get("stage") or stage) != stage or event.get("attempt") != attempt:
             continue
-        if event.get("cuda_process_fault") is not True or "chargeable_cuda_seconds" not in event:
+        diagnostics = event.get("payload") if event.get("kind") == "stage_attempt" and isinstance(event.get("payload"), Mapping) else event
+        if diagnostics.get("cuda_process_fault") is not True or "chargeable_cuda_seconds" not in diagnostics:
             continue
-        elapsed = event["chargeable_cuda_seconds"]
+        elapsed = diagnostics["chargeable_cuda_seconds"]
         if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)) or not math.isfinite(float(elapsed)) or float(elapsed) < 0:
             raise StageError("chargeable CUDA interval is invalid")
         attempt_id = f"{stage}:attempt:{attempt}:task9-fault:{event.get('index', line_index)}:{event.get('arm', '')}:{event.get('seed', '')}"
@@ -1328,7 +1395,7 @@ def _reconcile_all_chargeable_cuda(root: Path, config: RecurrenceConfig, current
     events = root / "events.jsonl"
     if not events.exists():
         return
-    for line in events.read_text(encoding="utf-8").splitlines():
+    for line in _read_test_bytes_once(events, trusted_root=root).decode("utf-8").splitlines():
         event = json.loads(line)
         stage, attempt = event.get("stage") or current_stage, event.get("attempt")
         if isinstance(stage, str) and isinstance(attempt, int) and not isinstance(attempt, bool):

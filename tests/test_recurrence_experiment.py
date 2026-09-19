@@ -67,12 +67,12 @@ def _dependencies(*, stages=None, read_path=None, spawn_child=None) -> Recurrenc
     )
 
 
-def test_default_production_dependencies_bind_only_g0_workers() -> None:
-    """G0 must have real source/data dispatchers before production execution."""
+def test_default_production_dependencies_bind_g0_and_g1_workers() -> None:
+    """G0/G1 must have real source, data, and smoke dispatchers."""
     dependencies = default_dependencies()
     assert dependencies.stage_functions["source"].__name__ != "unavailable"
     assert dependencies.stage_functions["data"].__name__ != "unavailable"
-    assert dependencies.stage_functions["smoke"].__name__ == "unavailable"
+    assert dependencies.stage_functions["smoke"].__name__ == "smoke"
 
 
 def test_source_snapshot_path_survives_staging_finalization(tmp_path: Path) -> None:
@@ -227,6 +227,24 @@ def test_preflight_resource_stop_is_persisted_before_worker(tmp_path: Path, conf
     assert calls == []
     staging = next((tmp_path / "staging").iterdir())
     assert json.loads((staging / "stages" / "source.json").read_text())["status"] == "stopped_budget"
+
+
+def test_postflight_uses_authenticated_child_vram_measurement(tmp_path: Path, config_path: Path) -> None:
+    from ppmoe.recurrence.experiment import BudgetStop, StageContext, _postflight_resources
+    from ppmoe.recurrence.config import RecurrenceConfig
+
+    config = RecurrenceConfig.load(config_path)
+    context = StageContext(
+        "smoke", config, config_path.resolve(), tmp_path, tmp_path,
+        _signatures(), 2, lambda path: path.read_bytes(),
+    )
+    deps = __import__("dataclasses").replace(
+        _dependencies(),
+        vram_probe=lambda: {"total_vram_bytes": 32 << 30, "peak_reserved_bytes": 0},
+    )
+    payload = {"total_vram_bytes": 32 << 30, "peak_reserved_bytes": 31 << 30}
+    with pytest.raises(BudgetStop, match="resource"):
+        _postflight_resources(context, payload, deps, require_payload_vram=True)
 
 
 def test_replayed_terminal_record_raises_typed_stop(tmp_path: Path, config_path: Path) -> None:

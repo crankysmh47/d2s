@@ -31,7 +31,7 @@ _STAGE_STATUSES = {"passed", "stopped_scientific", "stopped_budget", "failed_env
 _REPORT_OUTPUTS = {"report.json", "report.md", "report-sources.json"}
 _STAGE_ORDER = ("source", "data", "smoke", "pilot", "frozen", "discover", "confirm", "report")
 _ARMS = {"F0", "A1", "A2", "A3"}
-_EVENT_KINDS = {"stage_attempt", "training_started", "training_progress", "training_checkpoint", "training_completed", "training_failure", "failed_environment"}
+_EVENT_KINDS = {"stage_attempt", "stage_complete", "training_started", "training_progress", "training_checkpoint", "training_completed", "training_failure", "failed_environment"}
 _EVENT_OUTCOMES = {"fresh_process_required", "failed_environment", "pilot_cleanup_failure", "passed", "completed", "protocol_deviation", "error", "failure"}
 
 
@@ -1281,6 +1281,7 @@ def _load_events(root: Path, inventory: Mapping[str, Mapping[str, object]]) -> l
         kind = row["kind"]
         allowed_by_kind = {
             "stage_attempt": {"index", "timestamp", "kind", "stage", "attempt", "payload", "outcome"},
+            "stage_complete": {"index", "timestamp", "kind", "stage", "attempt", "payload", "outcome"},
             "training_started": {"index", "timestamp", "kind", "arm", "seed", "attempt", "update"},
             "training_progress": {"index", "timestamp", "kind", "arm", "seed", "attempt", "update", "cursor"},
             "training_checkpoint": {"index", "timestamp", "kind", "arm", "seed", "attempt", "update", "checkpoint_hash", "checkpoint_path", "checkpoint_manifest_digest"},
@@ -1292,6 +1293,7 @@ def _load_events(root: Path, inventory: Mapping[str, Mapping[str, object]]) -> l
             raise ValueError(f"event {kind} contains fields outside its registered schema")
         required_by_kind = {
             "stage_attempt": {"stage", "attempt", "payload", "outcome"},
+            "stage_complete": {"stage", "attempt", "payload", "outcome"},
             "training_started": {"arm", "seed", "attempt", "update"},
             "training_progress": {"arm", "seed", "attempt", "update", "cursor"},
             "training_checkpoint": {"arm", "seed", "attempt", "update", "checkpoint_hash", "checkpoint_path", "checkpoint_manifest_digest"},

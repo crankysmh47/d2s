@@ -140,6 +140,42 @@ def test_event_timestamp_is_parsed_not_suffix_checked(tmp_path: Path) -> None:
         _load_events(root, inventory)
 
 
+@pytest.mark.parametrize("stage", ["source", "data", "smoke"])
+def test_registered_stage_complete_event_loads_and_builds_report(tmp_path: Path, stage: str) -> None:
+    root = _root(tmp_path)
+    event = {"index": 0, "timestamp": "2026-01-01T00:00:00+00:00", "kind": "stage_complete", "stage": stage, "attempt": 1, "outcome": "passed", "payload": {"schema_version": 1}}
+    (root / "events.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
+    inventory = {str(item["path"]): item for item in _read_inputs(root)}
+    assert _load_events(root, inventory)[0]["kind"] == "stage_complete"
+    report = build_report(root)
+    assert report["event_history"][0]["stage"] == stage
+
+
+@pytest.mark.parametrize("outcome", ["fresh_process_required", "failure"])
+def test_smoke_stage_attempt_diagnostics_load_and_build_report(tmp_path: Path, outcome: str) -> None:
+    root = _root(tmp_path)
+    payload = {
+        "event_id": "a" * 64, "cuda_process_fault": outcome == "fresh_process_required",
+        "chargeable_cuda_seconds": 1.5, "peak_allocated_bytes": 10,
+        "peak_reserved_bytes": 20, "total_vram_bytes": 30,
+        "message": "smoke fault", "error_type": "RuntimeError",
+    }
+    event = {"index": 0, "timestamp": "2026-01-01T00:00:00+00:00", "kind": "stage_attempt", "stage": "smoke", "attempt": 1, "outcome": outcome, "payload": payload}
+    (root / "events.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
+    inventory = {str(item["path"]): item for item in _read_inputs(root)}
+    assert _load_events(root, inventory)[0]["payload"]["total_vram_bytes"] == 30
+    assert build_report(root)["failure_history"]
+
+
+def test_stage_complete_and_stage_attempt_reject_malformed_extra_fields(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    event = {"index": 0, "timestamp": "2026-01-01T00:00:00+00:00", "kind": "stage_complete", "stage": "smoke", "attempt": 1, "outcome": "passed", "payload": {}, "unexpected": True}
+    (root / "events.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
+    inventory = {str(item["path"]): item for item in _read_inputs(root)}
+    with pytest.raises(ValueError, match="event"):
+        _load_events(root, inventory)
+
+
 def test_training_failure_requires_full_identity_and_failed_environment_linkage(tmp_path: Path) -> None:
     root = _root(tmp_path)
     malformed = {"index": 0, "timestamp": "2026-01-01T00:00:00+00:00", "kind": "training_failure", "attempt": 1, "message": "x", "error_type": "E", "cuda_process_fault": False}
