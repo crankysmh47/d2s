@@ -14,7 +14,7 @@ from ppmoe.recurrence.data import RetentionChunk
 from ppmoe.recurrence.evaluate import evaluate_retention
 from ppmoe.recurrence.event_identity import task9_failure_event_id
 from ppmoe.recurrence.gates import paired_accuracy_bootstrap, paired_retention_bootstrap
-from ppmoe.recurrence.report import _decision, _derive_bootstrap_comparisons, _derive_observed_comparison_points, _has_registered_bootstrap, _has_timing_gate, _load_events, _read_bootstrap_matrix, _read_bootstrap_vector, _read_inputs, build_report
+from ppmoe.recurrence.report import _decision, _derive_bootstrap_comparisons, _derive_observed_comparison_points, _has_registered_bootstrap, _has_timing_gate, _load_events, _read_bootstrap_matrix, _read_bootstrap_vector, _read_inputs, _validate_summary_schema, build_report
 
 
 def _write(path: Path, value: object) -> None:
@@ -65,13 +65,66 @@ def test_report_marks_missing_downstream_evaluation_not_evaluated(tmp_path: Path
 
 
 def test_bare_a3_valid_flag_is_not_timing_evidence(tmp_path: Path) -> None:
-    root = _root(tmp_path)
+    _root(tmp_path)
     assert not _has_timing_gate({"pilot": {"payload": {"a3_valid": True}}})
 
 
-def test_one_sample_timing_control_is_not_registered(tmp_path: Path) -> None:
+def test_f0_test_summary_is_authorized_only_by_confirm_producer() -> None:
+    signatures = {"source": "a" * 64, "data": "b" * 64, "config": "c" * 64, "code": "d" * 64}
+    summary = {
+        "schema_version": 1, "kind": "exact_scores", "record_count": 1,
+        "expected_count": 1, "complete": True, "records_path": "scores/f0-test.jsonl",
+        "records_sha256": "e" * 64, "arm": "F0", "seed": 47, "failures": 0,
+        "signatures": signatures, "families": ["expressions", "lists", "graphs"],
+        "split": "test",
+    }
+    with pytest.raises(ValueError, match="confirm"):
+        _validate_summary_schema(
+            summary, "exact_scores",
+            {"frozen": {"status": "passed", "signatures": signatures}},
+            "scores/f0-test.summary.json",
+        )
+    _validate_summary_schema(
+        summary, "exact_scores",
+        {"confirm": {"status": "passed", "signatures": signatures}},
+        "scores/f0-test.summary.json",
+    )
+
+
+def test_terminal_g3_report_accepts_frozen_f1_f2_dev_summaries(tmp_path: Path) -> None:
     root = _root(tmp_path)
-    timing = lambda seed: {"seed": seed, "sample_count": 1, "metadata": {"units": "seconds", "synchronized": True}, "a2_training_times": [1.0], "a3_training_times": [1.0]}
+    _stage(root, "frozen", status="stopped_scientific", payload={
+        "decision": {"status": "stopped_scientific", "reason": "uninformative_benchmark"},
+    })
+    signatures = {"source": "a" * 64, "data": "b" * 64, "config": "c" * 64, "code": "d" * 64}
+    for arm in ("F1", "F2"):
+        raw = root / "scores" / f"{arm.lower()}-47.jsonl"
+        raw.parent.mkdir(parents=True, exist_ok=True)
+        rows = [
+            {"example_id": f"{family}-0", "family": family, "correct": True,
+             "reason_code": "correct", "arm": arm, "seed": 47, "split": "dev",
+             "signatures": signatures}
+            for family in ("expressions", "lists", "graphs")
+        ]
+        raw.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        _write(raw.with_name(f"{raw.stem}.summary.json"), {
+            "schema_version": 1, "kind": "exact_scores", "complete": True,
+            "record_count": 3, "expected_count": 3, "records_path": raw.relative_to(root).as_posix(),
+            "records_sha256": hashlib.sha256(raw.read_bytes()).hexdigest(),
+            "arm": arm, "seed": 47, "failures": 0,
+            "families": ["expressions", "lists", "graphs"], "signatures": signatures,
+            "split": "dev",
+        })
+
+    report = build_report(root)
+    assert report["decision"]["status"] == "stopped_scientific"
+    assert {item["arm"] for item in report["evaluations"]["exact_scores"]["aggregates"]} == {"F1", "F2"}
+
+
+def test_one_sample_timing_control_is_not_registered(tmp_path: Path) -> None:
+    _root(tmp_path)
+    def timing(seed: int) -> dict[str, object]:
+        return {"seed": seed, "sample_count": 1, "metadata": {"units": "seconds", "synchronized": True}, "a2_training_times": [1.0], "a3_training_times": [1.0]}
     assert not _has_timing_gate({"discover": {"payload": timing(47)}, "confirm": {"payload": timing(48)}})
 
 
@@ -218,7 +271,7 @@ def test_observed_points_are_not_bootstrap_means_for_nonconstant_producers(tmp_p
             {"example_id": "graphs-0", "family": "graphs", "correct": arm == "A2"},
         ]
         for arm in ("F0", "A1", "A2", "A3")
-        for seed in (47, 48)
+        for seed in ((47,) if arm == "F0" else (47, 48))
     }
     accuracy = paired_accuracy_bootstrap(accuracy_records, replicates=10000, seed=9047)
     observed = float(accuracy["comparisons"]["A2-F0"]["point"])
@@ -249,7 +302,7 @@ def test_registered_bootstrap_reconciles_accuracy_point_to_raw_producer_semantic
     families = {family: [f"{family}-0", f"{family}-1"] for family in ("expressions", "lists", "graphs")}
     aggregates = {}
     for arm in ("F0", "A1", "A2", "A3"):
-        for seed in (47, 48):
+        for seed in ((47,) if arm == "F0" else (47, 48)):
             rows = []
             for family, identifiers in families.items():
                 for identifier in identifiers:
@@ -325,7 +378,7 @@ def test_retention_bootstrap_rejects_full_data_ratio_despite_favorable_matrix(tm
     root = _root(tmp_path)
     aggregates = {}
     for arm in ("F0", "A2"):
-        for seed in (47, 48):
+        for seed in ((47,) if arm == "F0" else (47, 48)):
             path = root / "retention" / f"{arm}-{seed}.jsonl"
             path.parent.mkdir(parents=True, exist_ok=True)
             nll = 0.0 if arm == "F0" else 1.0
@@ -340,7 +393,7 @@ def test_retention_bootstrap_derives_distinct_seed_vectors(tmp_path: Path) -> No
     root = _root(tmp_path)
     aggregates = {}
     for arm in ("F0", "A2"):
-        for seed in (47, 48):
+        for seed in ((47,) if arm == "F0" else (47, 48)):
             path = root / "retention" / f"{arm}-{seed}.jsonl"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("".join(json.dumps({"chunk_index": index, "scored_tokens": 1, "nll_sum": 0.0}) + "\n" for index in range(2)), encoding="utf-8")
@@ -410,6 +463,7 @@ def test_report_rejects_record_count_expected_count_disagreement(tmp_path: Path)
         "schema_version": 1, "kind": "exact_scores", "complete": True, "record_count": 999,
         "expected_count": 1, "records_path": "scores/a2-47.jsonl", "records_sha256": digest,
         "arm": "A2", "seed": 47, "failures": 0, "families": ["expressions", "lists", "graphs"], "signatures": {"source": "a" * 64, "data": "b" * 64, "config": "c" * 64, "code": "d" * 64},
+        "split": "dev",
     })
     with pytest.raises(ValueError, match="count"):
         build_report(root)
@@ -422,32 +476,49 @@ def test_source_manifest_reconciles_current_file_bytes(tmp_path: Path) -> None:
         build_report(root)
 
 
+def test_splitless_exact_summary_cannot_bind_to_a_sealed_producer() -> None:
+    from ppmoe.recurrence.report import _validate_summary_schema
+
+    signatures = {"source": "a" * 64, "data": "b" * 64, "config": "c" * 64, "code": "d" * 64}
+    summary = {
+        "schema_version": 1, "kind": "exact_scores", "record_count": 6,
+        "expected_count": 6, "complete": True, "records_path": "scores/a1-47.jsonl",
+        "records_sha256": "e" * 64, "arm": "A1", "seed": 47,
+        "failures": 0, "signatures": signatures,
+        "families": ["expressions", "lists", "graphs"], "split": None,
+    }
+    stages = {"discover": {"status": "passed", "signatures": signatures}}
+    with pytest.raises(ValueError, match="invalid split"):
+        _validate_summary_schema(summary, "exact_scores", stages, "scores/a1-47.summary.json")
+
+
 def test_complete_registered_success_fixture_requires_and_accepts_full_matrix(tmp_path: Path) -> None:
     root = _root(tmp_path, decision="passed")
     signatures = {"source": "a" * 64, "data": "b" * 64, "config": "c" * 64, "code": "d" * 64}
     families = ("expressions", "lists", "graphs")
     ids = [f"{family}-{index}" for family in families for index in range(2)]
     for arm in ("F0", "A1", "A2", "A3"):
-        for seed in (47, 48):
+        for seed in ((47,) if arm == "F0" else (47, 48)):
             raw = root / "scores" / f"{arm.lower()}-{seed}.jsonl"
             raw.parent.mkdir(parents=True, exist_ok=True)
-            raw.write_text("".join(json.dumps({"example_id": identifier, "family": identifier.rsplit("-", 1)[0], "correct": arm == "A2"}) + "\n" for identifier in ids), encoding="utf-8")
+            raw.write_text("".join(json.dumps({"example_id": identifier, "family": identifier.rsplit("-", 1)[0], "correct": arm == "A2", "split": "test"}) + "\n" for identifier in ids), encoding="utf-8")
             digest = hashlib.sha256(raw.read_bytes()).hexdigest()
             _write(root / "scores" / f"{arm.lower()}-{seed}.summary.json", {
                 "schema_version": 1, "kind": "exact_scores", "complete": True, "record_count": 6, "expected_count": 6,
                 "records_path": raw.relative_to(root).as_posix(), "records_sha256": digest,
-                "arm": arm, "seed": seed, "failures": 0, "families": ["expressions", "lists", "graphs"], "signatures": signatures,
+                "arm": arm, "seed": seed, "failures": 0, "families": ["expressions", "lists", "graphs"], "signatures": signatures, "split": "test",
             })
-    for arm in ("F0", "A2"):
-        for seed in (47, 48):
+    for arm in ("F0", "A1", "A2", "A3"):
+        for seed in ((47,) if arm == "F0" else (47, 48)):
             raw = root / "retention" / f"{arm.lower()}-{seed}.jsonl"
             raw.parent.mkdir(parents=True, exist_ok=True)
-            raw.write_text("".join(json.dumps({"chunk_index": index, "scored_tokens": 2, "nll_sum": 1.0}) + "\n" for index in range(2)), encoding="utf-8")
+            split = "dev" if seed == 47 else "test"
+            raw.write_text("".join(json.dumps({"chunk_index": index, "scored_tokens": 2, "nll_sum": 1.0, "split": split}) + "\n" for index in range(2)), encoding="utf-8")
             digest = hashlib.sha256(raw.read_bytes()).hexdigest()
             _write(root / "retention" / f"{arm.lower()}-{seed}.summary.json", {
                 "schema_version": 1, "kind": "retention_scores", "complete": True, "record_count": 2, "expected_count": 2,
                 "records_path": raw.relative_to(root).as_posix(), "records_sha256": digest,
-                "arm": arm, "seed": seed, "failures": 0, "families": ["retention"], "signatures": signatures, "nll_sum": 2.0, "scored_tokens": 4,
+                "arm": arm, "seed": seed, "failures": 0, "families": ["retention"], "signatures": signatures, "nll_sum": 2.0, "scored_tokens": 4, "split": split,
             })
     bootstrap = root / "bootstrap"
     vector = json.dumps({"values": [1.0] * 10000}, separators=(",", ":")).encode()
@@ -529,6 +600,7 @@ def test_summary_signature_must_match_registered_stage(tmp_path: Path) -> None:
         "schema_version": 1, "kind": "exact_scores", "complete": True, "record_count": 1,
         "expected_count": 1, "records_path": "scores/a2-47.jsonl", "records_sha256": hashlib.sha256(raw.read_bytes()).hexdigest(),
             "arm": "A2", "seed": 47, "failures": 0, "families": ["expressions", "lists", "graphs"], "signatures": {"source": "0" * 64, "data": "0" * 64, "config": "0" * 64, "code": "0" * 64},
+        "split": "dev",
     })
     with pytest.raises(ValueError, match="signature"):
         build_report(root)
@@ -543,6 +615,7 @@ def test_negative_retention_nll_is_rejected(tmp_path: Path) -> None:
         "schema_version": 1, "kind": "retention_scores", "complete": True, "record_count": 1, "families": ["retention"], "signatures": {"source": "a" * 64, "data": "b" * 64, "config": "c" * 64, "code": "d" * 64},
         "expected_count": 1, "records_path": "retention/f0-47.jsonl", "records_sha256": hashlib.sha256(raw.read_bytes()).hexdigest(),
         "arm": "F0", "seed": 47, "failures": 0, "nll_sum": -1.0, "scored_tokens": 1,
+        "split": "dev",
     })
     with pytest.raises(ValueError, match="non-negative"):
         build_report(root)

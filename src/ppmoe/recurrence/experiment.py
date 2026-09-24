@@ -167,9 +167,7 @@ class RecurrenceDependencies:
 
 
 def default_dependencies() -> RecurrenceDependencies:
-    """Production defaults stay lazy; G0 and G1 bind their real workers."""
-    def unavailable(context: StageContext) -> Mapping[str, object]:
-        raise EnvironmentStop(f"production {context.stage} worker is unavailable before Task 15")
+    """Production defaults stay lazy while binding every registered worker."""
 
     def source(context: StageContext) -> Mapping[str, object]:
         return _production_source_stage(
@@ -190,6 +188,17 @@ def default_dependencies() -> RecurrenceDependencies:
         from .smoke import run_production_smoke
         return run_production_smoke(context)
 
+    from .production import (
+        dispose_pilot_state,
+        production_checkpoint_schema,
+        production_remaining_work_projection,
+        restore_production_initializations,
+        run_production_confirm,
+        run_production_discover,
+        run_production_frozen,
+        run_production_pilot,
+    )
+
     return RecurrenceDependencies(
         metadata_resolver=lambda *_args, **_kwargs: _lazy_hf_api(),
         snapshot_loader=lambda *_args, **_kwargs: _lazy_snapshot_download(),
@@ -203,8 +212,17 @@ def default_dependencies() -> RecurrenceDependencies:
             "source": source,
             "data": data,
             "smoke": smoke,
-            **{stage: unavailable for stage in STAGE_DEPENDENCIES if stage not in {"source", "data", "smoke"}},
+            "pilot": run_production_pilot,
+            "frozen": run_production_frozen,
+            "discover": run_production_discover,
+            "confirm": run_production_confirm,
+            # Report is handled directly by run_stage and is never dispatched.
+            "report": lambda _context: {},
         },
+        checkpoint_schema=production_checkpoint_schema,
+        dispose_pilot=dispose_pilot_state,
+        restore_initialization=restore_production_initializations,
+        remaining_work_projection=production_remaining_work_projection,
     )
 
 
@@ -445,6 +463,7 @@ def run_stage(
         else:
             payload = dict(deps.stage_functions[stage](context) or {})
         pilot_payload = payload
+        _seal_scientific_decision(stage, payload, active_root, signatures, attempt)
         if stage == "confirm":
             # The only authorized call site for sealed test rows. Workers that
             # need the bytes call context.read_test_rows(); this confirms the
@@ -475,12 +494,15 @@ def run_stage(
             payload["fresh_process_pid"] = child.pid
             pilot_payload = payload
             retry_context = StageContext(stage, config, config_path.resolve(), root, active_root, signatures, 2, deps.read_path)
+            _seal_scientific_decision(stage, payload, active_root, signatures, 2)
             _postflight_resources(
                 retry_context, payload, deps, require_payload_vram=stage == "smoke"
             )
             record = _record(stage, "passed", _completed_signatures(stage, signatures, payload), payload, 2)
             _persist_stage(active_root, record)
             return record
+        except ScientificStop:
+            raise
         except EnvironmentStop as second:
             _reconcile_all_chargeable_cuda(active_root, config, stage)
             _append_attempt_event(active_root, stage, 2, "failed_environment", f"{type(second).__name__}: {second}")
@@ -495,8 +517,9 @@ def run_stage(
             raise EnvironmentStop("second CUDA/process fault; failed_environment") from second
     except (ScientificStop, BudgetStop, EnvironmentStop) as error:
         status = "stopped_scientific" if isinstance(error, ScientificStop) else "stopped_budget" if isinstance(error, BudgetStop) else "failed_environment"
-        record = _record(stage, status, signatures, {"reason": str(error)}, attempt)
-        _persist_stage(active_root, record)
+        if not _stage_path(active_root, stage).exists():
+            record = _record(stage, status, signatures, {"reason": str(error)}, attempt)
+            _persist_stage(active_root, record)
         raise
     except StagePrerequisiteError:
         raise
@@ -509,8 +532,10 @@ def run_stage(
         if stage == "pilot":
             cleanup_errors: list[str] = []
             for callback in (deps.dispose_pilot, deps.restore_initialization):
-                try: callback(context, pilot_payload)
-                except Exception as error: cleanup_errors.append(f"{type(error).__name__}: {error}")
+                try:
+                    callback(context, pilot_payload)
+                except Exception as error:
+                    cleanup_errors.append(f"{type(error).__name__}: {error}")
             if cleanup_errors:
                 _append_attempt_event(active_root, stage, attempt, "pilot_cleanup_failure", "; ".join(cleanup_errors))
 
@@ -519,6 +544,42 @@ def _record(stage: str, status: str, signatures: Mapping[str, str], payload: Map
     if status not in TERMINAL_STATUSES:
         raise ValueError("invalid terminal stage status")
     return {"stage": stage, "status": status, "signatures": dict(signatures), "payload": dict(payload), "attempts": attempt}
+
+
+def _stage_result_status(stage: str, payload: Mapping[str, object]) -> tuple[str, str]:
+    if stage not in {"frozen", "discover", "confirm"}:
+        return "passed", "passed"
+    decision = payload.get("decision")
+    # Injected orchestration fixtures intentionally return opaque payloads;
+    # production workers validate their complete stage schema at their own
+    # boundary.  When a scientific decision is present, however, both the
+    # in-process and fresh-child paths must map it identically.
+    if decision is None:
+        return "passed", "passed"
+    if not isinstance(decision, Mapping):
+        raise StageError(f"{stage} payload has no registered decision")
+    status = decision.get("status")
+    reason = decision.get("reason")
+    passed = decision.get("passed")
+    if status == "passed" and passed is True and isinstance(reason, str):
+        return "passed", reason
+    if status in {"stopped_scientific", "retention_uncertain", "timing_inconclusive"} and passed is False and isinstance(reason, str):
+        return "stopped_scientific", reason
+    raise StageError(f"{stage} payload has an invalid registered decision")
+
+
+def _seal_scientific_decision(
+    stage: str,
+    payload: Mapping[str, object],
+    root: Path,
+    signatures: Mapping[str, str],
+    attempt: int,
+) -> None:
+    status, reason = _stage_result_status(stage, payload)
+    if status == "passed":
+        return
+    _persist_stage(root, _record(stage, status, signatures, payload, attempt))
+    raise ScientificStop(reason)
 
 
 def _completed_signatures(stage: str, signatures: Mapping[str, str], payload: Mapping[str, object]) -> dict[str, str]:
@@ -668,10 +729,14 @@ def _valid_signatures(value: object, *, allow_empty_data: bool = False, allow_em
     if not isinstance(value, Mapping) or set(value) != {"source", "data", "config", "code"}:
         return False
     for name, digest in value.items():
-        if not isinstance(digest, str): return False
-        if allow_empty_data and name == "data" and digest == "": continue
-        if allow_empty_source and name == "source" and digest == "": continue
-        if __import__("re").fullmatch(r"[0-9a-f]{64}", digest) is None: return False
+        if not isinstance(digest, str):
+            return False
+        if allow_empty_data and name == "data" and digest == "":
+            continue
+        if allow_empty_source and name == "source" and digest == "":
+            continue
+        if __import__("re").fullmatch(r"[0-9a-f]{64}", digest) is None:
+            return False
     return True
 
 
@@ -808,7 +873,31 @@ def _verify_selection(root: Path, signatures: Mapping[str, str]) -> None:
 
 
 def _validate_selection(selection: Mapping[str, object], signatures: Mapping[str, str]) -> None:
-    if set(selection) != {"status", "signatures", "test_sha256"} or selection.get("status") != "passed" or selection.get("signatures") != dict(signatures) or not isinstance(selection.get("test_sha256"), str) or __import__("re").fullmatch(r"[0-9a-f]{64}", selection["test_sha256"]) is None:
+    legacy = {"status", "signatures", "test_sha256"}
+    production = legacy | {
+        "schema_version", "selected_condition", "n3", "dev_score_hashes",
+        "data_manifest_sha256",
+    }
+    keys = set(selection)
+    hashes = selection.get("dev_score_hashes")
+    production_valid = (
+        keys == production
+        and selection.get("schema_version") == 1
+        and selection.get("selected_condition") == "A2"
+        and isinstance(selection.get("n3"), int)
+        and not isinstance(selection.get("n3"), bool)
+        and int(selection["n3"]) >= 1000
+        and isinstance(hashes, Mapping)
+        and set(hashes) == {"F0", "A1", "A2", "A3"}
+        and all(
+            isinstance(value, str)
+            and __import__("re").fullmatch(r"[0-9a-f]{64}", value) is not None
+            for value in hashes.values()
+        )
+        and isinstance(selection.get("data_manifest_sha256"), str)
+        and __import__("re").fullmatch(r"[0-9a-f]{64}", selection["data_manifest_sha256"]) is not None
+    )
+    if (keys != legacy and not production_valid) or selection.get("status") != "passed" or selection.get("signatures") != dict(signatures) or not isinstance(selection.get("test_sha256"), str) or __import__("re").fullmatch(r"[0-9a-f]{64}", selection["test_sha256"]) is None:
         raise StagePrerequisiteError("confirm requires canonical passing selection with sealed test hash")
 
 
@@ -873,6 +962,12 @@ def _postflight_resources(
     require_payload_vram: bool = False,
 ) -> None:
     root = context.run_root
+    if context.stage == "pilot" and not deps.test_only:
+        from .production import _load_current_pilot_for_postflight
+
+        persisted_pilot = _load_current_pilot_for_postflight(context)
+        if dict(payload) != dict(persisted_pilot):
+            raise StageError("pilot worker payload differs from authenticated pilot.json")
     ledger_path = root / "cuda-cost.jsonl"
     projection = _projection(context, deps)
     payload_total = payload.get("total_vram_bytes")
@@ -916,7 +1011,8 @@ def _projection(context: StageContext, deps: RecurrenceDependencies) -> dict[str
 
 def _strict_int(mapping: Mapping[str, int], key: str) -> int:
     value = mapping.get(key)
-    if isinstance(value, bool) or not isinstance(value, int): raise StageError(f"{key} must be an integer")
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise StageError(f"{key} must be an integer")
     return value
 
 
@@ -1002,6 +1098,10 @@ def _callable_identity(reference: str) -> str:
 
 _PRODUCTION_CHILD_ALLOWLIST: Final[tuple[tuple[str, str, str], ...]] = (
     ("smoke", "ppmoe.recurrence.smoke:run_child_smoke", "6d16e6aa7480b62edb7d829155415fe04fbbd9032011280ad59686380d462877"),
+    ("pilot", "ppmoe.recurrence.production:run_child_pilot", "8574ff5b33a9b19f40b71d1deea03eec68f36e4976eef92e4e55b355bbc73b7e"),
+    ("frozen", "ppmoe.recurrence.production:run_child_frozen", "7136a98e74f7b396e1438212ccda32637e246410b9a5aaf0f08a29c84f5f3e99"),
+    ("discover", "ppmoe.recurrence.production:run_child_discover", "44a33aa335086f6fc39e69ab10918f466730717daa80c5828df4966d65aa2cd7"),
+    ("confirm", "ppmoe.recurrence.production:run_child_confirm", "e18743d7062060f6321ee9ee6711bd40d7a0d0773f0dcddf628e3246569537a1"),
 )
 
 
@@ -1126,7 +1226,11 @@ def _derive_checkpoint_artifact(run_root: Path, stage: str, signatures: Mapping[
         raise EnvironmentStop("durable retry checkpoint directory is missing")
     schema = deps.checkpoint_schema
     if callable(schema):
-        schema = schema(arm, seed, signatures)
+        try:
+            schema = schema(run_root, arm, seed, signatures)
+        except TypeError:
+            # Preserve the reviewed Task-13 test-injection contract.
+            schema = schema(arm, seed, signatures)
     if not isinstance(schema, Mapping):
         raise EnvironmentStop("no registered adapter schema is available for retry")
     checkpoint_bytes = _read_test_bytes_once(run_root / relative_path, trusted_root=run_root)
@@ -1161,6 +1265,9 @@ def _run_child_retry(stage: str, config_path: Path, artifact_root: Path, run_roo
     if stage == "smoke" and not deps.test_only:
         from .smoke import _smoke_retry_artifact
         checkpoint = _smoke_retry_artifact(run_root)
+    elif stage in {"pilot", "frozen"} and not deps.test_only:
+        from .production import disposable_retry_artifact
+        checkpoint = disposable_retry_artifact(run_root, stage)
     else:
         checkpoint = _derive_checkpoint_artifact(run_root, stage, signatures, deps)
     checkpoint_path = str(Path(str(checkpoint["path"])).resolve()) if checkpoint.get("path") else ""
@@ -1249,6 +1356,17 @@ def _run_child_retry(stage: str, config_path: Path, artifact_root: Path, run_roo
     if stage == "smoke" and not deps.test_only:
         from .smoke import _smoke_retry_artifact
         post_checkpoint = _smoke_retry_artifact(run_root)
+    elif stage in {"pilot", "frozen"} and not deps.test_only:
+        from .production import disposable_retry_artifact
+        post_checkpoint = disposable_retry_artifact(run_root, stage)
+    elif stage in {"discover", "confirm"} and not deps.test_only:
+        # A successful training retry advances ``latest.pt`` by design.  The
+        # child authenticated the exact request bytes immediately before
+        # invoking the frozen dispatcher, and its result is PID-, digest-,
+        # dispatcher-, and proof-bound above.  Requiring the resumable pointer
+        # to remain byte-identical here would reject every genuine completed
+        # resume and discard its durable progress.
+        post_checkpoint = checkpoint
     else:
         post_checkpoint = _derive_checkpoint_artifact(run_root, stage, signatures, deps)
     for key in ("path", "checkpoint_sha256", "manifest_digest", "attempt", "update", "event_id", "event_index", "arm", "seed", "relative_path"):
@@ -1313,11 +1431,13 @@ def _child_execute(request_path: Path, result_path: Path) -> int:
     request_hash = sha256_file(request_path)
     try:
         module_name, separator, attribute = str(request["worker_ref"]).partition(":")
-        if not separator or not module_name or not attribute: raise ValueError("invalid worker reference")
+        if not separator or not module_name or not attribute:
+            raise ValueError("invalid worker reference")
         if _callable_identity(str(request["worker_ref"])) != request["worker_identity"]:
             raise ValueError("dispatcher implementation identity mismatch")
         if not request["test_only"] and not (
-            request["stage"] == "smoke" and request["checkpoint_path"] == ""
+            request["stage"] in {"smoke", "pilot", "frozen"}
+            and request["checkpoint_path"] == ""
         ):
             checkpoint_path = Path(str(request["checkpoint_path"]))
             _validate_trusted_path(checkpoint_path, Path(str(request["run_root"])))
@@ -1404,7 +1524,8 @@ def _reconcile_all_chargeable_cuda(root: Path, config: RecurrenceConfig, current
 
 def _retry_in_real_child(stage: str, config_path: Path, artifact_root: Path, run_id: str | None) -> dict[str, object]:
     command = [sys.executable, "-m", "ppmoe.recurrence.experiment", "--child", "--stage", stage, "--config", str(config_path), "--artifact-root", str(artifact_root)]
-    if run_id is not None: command.extend(("--run-id", run_id))
+    if run_id is not None:
+        command.extend(("--run-id", run_id))
     completed = subprocess.run(command, text=True, capture_output=True)
     if completed.returncode:
         raise EnvironmentStop(f"fresh child retry failed: {completed.stderr.strip()}")
@@ -1477,7 +1598,8 @@ def _validate_dependencies(deps: RecurrenceDependencies) -> None:
 
 def _default_vram_probe() -> Mapping[str, int]:
     import torch
-    if not torch.cuda.is_available(): return {"total_vram_bytes": 2_147_483_649, "peak_reserved_bytes": 0}
+    if not torch.cuda.is_available():
+        return {"total_vram_bytes": 2_147_483_649, "peak_reserved_bytes": 0}
     return {"total_vram_bytes": int(torch.cuda.get_device_properties(0).total_memory), "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(0))}
 
 

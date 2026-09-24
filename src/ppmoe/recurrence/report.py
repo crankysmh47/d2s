@@ -16,7 +16,6 @@ import math
 import os
 from pathlib import Path
 import re
-from typing import Any
 
 import numpy as np
 
@@ -30,7 +29,9 @@ _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _STAGE_STATUSES = {"passed", "stopped_scientific", "stopped_budget", "failed_environment"}
 _REPORT_OUTPUTS = {"report.json", "report.md", "report-sources.json"}
 _STAGE_ORDER = ("source", "data", "smoke", "pilot", "frozen", "discover", "confirm", "report")
-_ARMS = {"F0", "A1", "A2", "A3"}
+# F1/F2 are valid frozen-stage dev arms. Test-sealed summaries remain bound
+# separately to the fixed F0/A1/A2/A3 matrix below.
+_ARMS = {"F0", "F1", "F2", "A1", "A2", "A3"}
 _EVENT_KINDS = {"stage_attempt", "stage_complete", "training_started", "training_progress", "training_checkpoint", "training_completed", "training_failure", "failed_environment"}
 _EVENT_OUTCOMES = {"fresh_process_required", "failed_environment", "pilot_cleanup_failure", "passed", "completed", "protocol_deviation", "error", "failure"}
 
@@ -491,9 +492,21 @@ def _collect_summaries(root: Path, inputs: list[dict[str, object]], *, kind: str
                 aggregate["transitions"] = derived.get("transitions", {})
                 aggregate["record_ids"] = [str(row["example_id"]) for row in raw_rows]
                 aggregate["record_families"] = {str(row["example_id"]): str(row["family"]) for row in raw_rows}
+                splits = {row.get("split") for row in raw_rows}
+                if len(splits) != 1 or next(iter(splits)) not in {"train", "dev", "test"}:
+                    raise ValueError(f"aggregate {relative} has an invalid evaluation split")
+                aggregate["split"] = next(iter(splits))
+                if summary["split"] != aggregate["split"]:
+                    raise ValueError(f"aggregate {relative} split does not match raw rows")
                 if "ordered_ids_sha256" in summary and summary["ordered_ids_sha256"] != sha256_payload({"ids": aggregate["record_ids"]}):
                     raise ValueError(f"aggregate {relative} ordered ID hash mismatch")
             if kind == "retention_scores" and complete:
+                splits = {row.get("split") for row in raw_rows}
+                if len(splits) != 1 or next(iter(splits)) not in {"pilot", "dev", "test", "retention"}:
+                    raise ValueError(f"aggregate {relative} has an invalid retention split")
+                aggregate["split"] = next(iter(splits))
+                if summary["split"] != aggregate["split"]:
+                    raise ValueError(f"aggregate {relative} split does not match raw rows")
                 raw_nll = sum(float(row["nll_sum"]) for row in raw_rows)
                 raw_tokens = sum(int(row["scored_tokens"]) for row in raw_rows)
                 declared_nll = _finite_number(summary.get("nll_sum"), "nll_sum")
@@ -516,11 +529,11 @@ def _collect_summaries(root: Path, inputs: list[dict[str, object]], *, kind: str
 
 
 def _validate_summary_schema(summary: Mapping[str, object], kind: str, stages: Mapping[str, Mapping[str, object]], relative: str) -> None:
-    required = {"schema_version", "kind", "record_count", "expected_count", "complete", "records_path", "records_sha256", "arm", "seed", "failures", "signatures", "families"}
+    required = {"schema_version", "kind", "record_count", "expected_count", "complete", "records_path", "records_sha256", "arm", "seed", "failures", "signatures", "families", "split"}
     if not required.issubset(summary) or summary.get("schema_version") != 1 or summary.get("kind") != kind or summary.get("complete") is not True:
         raise ValueError(f"summary {relative} has an invalid schema")
     common = required | {"mode", "correct", "incorrect", "ordered_ids_sha256", "failure_reason"}
-    allowed = common | ({"nll_sum", "mean_nll", "scored_tokens", "perplexity", "ordered_indices_sha256"} if kind == "retention_scores" else set())
+    allowed = common | {"split"} | ({"nll_sum", "mean_nll", "scored_tokens", "perplexity", "ordered_indices_sha256"} if kind == "retention_scores" else set())
     if set(summary) - allowed:
         raise ValueError(f"summary {relative} contains unknown fields")
     arm = summary.get("arm")
@@ -534,9 +547,22 @@ def _validate_summary_schema(summary: Mapping[str, object], kind: str, stages: M
         raise ValueError(f"summary {relative} has invalid retention families")
     signatures = summary.get("signatures")
     _validate_signatures(signatures, allow_empty=False)
-    producer = "frozen" if arm.upper() == "F0" else "discover" if seed == 47 else "confirm"
+    split = summary.get("split")
+    if split not in {"train", "dev", "test", "pilot", "retention"}:
+        raise ValueError(f"summary {relative} has an invalid split")
+    upper_arm = arm.upper()
+    producer = (
+        "confirm" if split == "test"
+        else "frozen" if upper_arm in {"F0", "F1", "F2"}
+        else "discover" if upper_arm in {"A1", "A2", "A3"} and seed == 47
+        else "confirm"
+    )
     stage = stages.get(producer)
-    if not stage or stage.get("status") != "passed" or stage.get("signatures") != signatures:
+    if (
+        not stage
+        or stage.get("status") not in {"passed", "stopped_scientific"}
+        or stage.get("signatures") != signatures
+    ):
         raise ValueError(f"summary {relative} signature is not bound to authorized {producer} stage")
 
 
@@ -660,7 +686,7 @@ def _decision(stages: Mapping[str, Mapping[str, object]], inputs: list[dict[str,
 
 
 def _require_success_evidence(exact: Mapping[str, object], retention: Mapping[str, object], stages: Mapping[str, Mapping[str, object]], root: Path, inventory: Mapping[str, Mapping[str, object]]) -> None:
-    aggregates = [item for item in exact.get("aggregates", []) if isinstance(item, Mapping) and item.get("complete") is True]
+    aggregates = [item for item in exact.get("aggregates", []) if isinstance(item, Mapping) and item.get("complete") is True and item.get("split") == "test"]
     by_key: dict[tuple[str, int], Mapping[str, object]] = {}
     for item in aggregates:
         arm = str(item.get("arm", "")).upper()
@@ -668,7 +694,7 @@ def _require_success_evidence(exact: Mapping[str, object], retention: Mapping[st
         if arm not in _ARMS or isinstance(seed, bool) or not isinstance(seed, int) or (arm, seed) in by_key:
             raise ValueError("success report has duplicate or unknown arm/seed evidence")
         by_key[(arm, seed)] = item
-    required = {(arm, seed) for arm in _ARMS for seed in (47, 48)}
+    required = {(arm, seed) for arm in ("A1", "A2", "A3") for seed in (47, 48)} | {("F0", 47)}
     if set(by_key) != required:
         raise ValueError("success report is missing a registered arm/seed/control")
     family_sets = []
@@ -687,13 +713,33 @@ def _require_success_evidence(exact: Mapping[str, object], retention: Mapping[st
         id_sets.append(tuple(ids))
     if any(value != family_sets[0] for value in family_sets) or any(value != id_sets[0] for value in id_sets):
         raise ValueError("success report arm/seed ID or family universes do not match")
-    retention_rows = [item for item in retention.get("aggregates", []) if isinstance(item, Mapping) and item.get("complete") is True]
+    retention_rows = [
+        item for item in retention.get("aggregates", [])
+        if isinstance(item, Mapping)
+        and item.get("complete") is True
+        and (
+            (item.get("split") == "dev" and item.get("seed") == 47)
+            or (item.get("split") == "test" and item.get("seed") == 48)
+            or (str(item.get("arm", "")).upper() == "F0" and item.get("split") in {"dev", "retention"})
+        )
+    ]
     retention_map = {(str(item.get("arm", "")).upper(), item.get("seed")): item for item in retention_rows}
+    if len(retention_map) != len(retention_rows):
+        raise ValueError("success report has duplicate retention arm/seed evidence")
+    required_retention = {
+        (arm, seed) for arm in ("A1", "A2", "A3") for seed in (47, 48)
+    } | {("F0", 47)}
+    if set(retention_map) != required_retention:
+        raise ValueError("success report is missing the registered retention matrix")
     for seed in (47, 48):
         candidate = retention_map.get(("A2", seed))
-        baseline = retention_map.get(("F0", seed))
+        baseline = retention_map.get(("F0", 47))
         if candidate is None or baseline is None or candidate.get("chunk_indices") != baseline.get("chunk_indices") or candidate.get("chunk_tokens") != baseline.get("chunk_tokens"):
             raise ValueError("success report is missing paired retention F0/candidate universes")
+        for arm in ("A1", "A2", "A3"):
+            item = retention_map[(arm, seed)]
+            if item.get("chunk_indices") != baseline.get("chunk_indices") or item.get("chunk_tokens") != baseline.get("chunk_tokens"):
+                raise ValueError("success report retention universes do not match")
         accuracy_universe = _family_universe(by_key)
         retention_universe = _retention_universe(retention_map)
         if not _has_registered_bootstrap(root, inventory, stages, 9047, "accuracy", accuracy_universe, by_key) or not _has_registered_bootstrap(root, inventory, stages, 9157, "retention", retention_universe, retention_map):
@@ -721,9 +767,9 @@ def _retention_universe(aggregates: Mapping[tuple[str, object], Mapping[str, obj
 
 
 def _has_registered_bootstrap(root: Path, inventory: Mapping[str, Mapping[str, object]], stages: Mapping[str, Mapping[str, object]], seed: int, label: str, expected_universe: Mapping[str, list[str]], aggregates: Mapping[tuple[object, object], Mapping[str, object]]) -> bool:
-    producer = "discover" if seed == 9047 else "confirm" if seed == 9157 else None
+    producers = {"discover", "confirm"} if seed == 9047 else {"confirm"} if seed == 9157 else set()
     for stage_name, record in stages.items():
-        if producer is not None and stage_name != producer:
+        if producers and stage_name not in producers:
             continue
         if record.get("status") != "passed":
             continue
@@ -908,7 +954,8 @@ def _derive_observed_comparison_points(
                     return None
                 keyed[identifier] = item
             rows[(arm, int(seed))] = keyed
-        if set(rows) != {(arm, seed) for arm in _ARMS for seed in seeds}:
+        required = {(arm, seed) for arm in ("A1", "A2", "A3") for seed in seeds} | {("F0", 47)}
+        if set(rows) != required:
             return None
         points: dict[str, float] = {}
         for name, reference in (("A2-F0", "F0"), ("A2-A1", "A1"), ("A2-A3", "A3")):
@@ -919,7 +966,7 @@ def _derive_observed_comparison_points(
                     paired: list[float] = []
                     for seed in seeds:
                         candidate = rows[("A2", seed)].get(identifier)
-                        baseline = rows[(reference, seed)].get(identifier)
+                        baseline = rows[(reference, 47 if reference == "F0" else seed)].get(identifier)
                         if (
                             not isinstance(candidate, Mapping)
                             or not isinstance(baseline, Mapping)
@@ -952,7 +999,7 @@ def _derive_observed_comparison_points(
                     return None
                 keyed[index] = item
             rows[(arm, int(seed))] = keyed
-        if set(rows) != {(arm, seed) for arm in ("F0", "A2") for seed in seeds}:
+        if set(rows) != {("F0", 47), ("A2", 47), ("A2", 48)}:
             return None
         identifiers = expected_universe.get("retention")
         if not identifiers:
@@ -960,7 +1007,7 @@ def _derive_observed_comparison_points(
         points: dict[str, float] = {}
         for seed in seeds:
             candidate = [rows[("A2", seed)].get(int(index)) for index in identifiers]
-            baseline = [rows[("F0", seed)].get(int(index)) for index in identifiers]
+            baseline = [rows[("F0", 47)].get(int(index)) for index in identifiers]
             if any(not isinstance(item, Mapping) for item in candidate + baseline):
                 return None
             candidate_tokens = sum(int(item["scored_tokens"]) for item in candidate)
@@ -991,7 +1038,7 @@ def _derive_bootstrap_comparisons(root: Path, inventory: Mapping[str, Mapping[st
             if raw is None:
                 return None
             rows[(arm, int(seed))] = {str(item["example_id"]): item for item in raw}
-        required = {(arm, seed) for arm in _ARMS for seed in seeds}
+        required = {(arm, seed) for arm in ("A1", "A2", "A3") for seed in seeds} | {("F0", 47)}
         if set(rows) != required:
             return None
         vectors: dict[str, list[float]] = {}
@@ -1003,14 +1050,14 @@ def _derive_bootstrap_comparisons(root: Path, inventory: Mapping[str, Mapping[st
                     differences = []
                     for seed in seeds:
                         candidate = rows[("A2", seed)].get(identifier)
-                        baseline = rows[(reference, seed)].get(identifier)
+                        baseline = rows[(reference, 47 if reference == "F0" else seed)].get(identifier)
                         if not isinstance(candidate, Mapping) or not isinstance(baseline, Mapping) or not isinstance(candidate.get("correct"), bool) or not isinstance(baseline.get("correct"), bool):
                             return None
                         differences.append(float(candidate["correct"]) - float(baseline["correct"]))
                     values.append(float(np.mean(differences)))
                 family_values[family] = np.asarray(values, dtype=np.float64)
             for seed in seeds:
-                seed_family_means = [float(np.mean([float(rows[("A2", seed)][identifier]["correct"]) - float(rows[(reference, seed)][identifier]["correct"]) for identifier in identifiers])) for identifiers in expected_universe.values()]
+                seed_family_means = [float(np.mean([float(rows[("A2", seed)][identifier]["correct"]) - float(rows[(reference, 47 if reference == "F0" else seed)][identifier]["correct"]) for identifier in identifiers])) for identifiers in expected_universe.values()]
                 if float(np.mean(seed_family_means)) <= 0.0:
                     return None
             if any(float(values.mean()) < -0.02 for values in family_values.values()):
@@ -1027,11 +1074,11 @@ def _derive_bootstrap_comparisons(root: Path, inventory: Mapping[str, Mapping[st
             if raw is None:
                 return None
             rows[(arm, int(seed))] = {int(item["chunk_index"]): item for item in raw}
-        if set(rows) != {(arm, seed) for arm in ("F0", "A2") for seed in seeds}:
+        if set(rows) != {("F0", 47), ("A2", 47), ("A2", 48)}:
             return None
         for seed in seeds:
             candidate_all = [rows[("A2", seed)][int(identifier)] for identifier in expected_universe["retention"]]
-            baseline_all = [rows[("F0", seed)][int(identifier)] for identifier in expected_universe["retention"]]
+            baseline_all = [rows[("F0", 47)][int(identifier)] for identifier in expected_universe["retention"]]
             candidate_tokens = sum(int(item["scored_tokens"]) for item in candidate_all)
             baseline_tokens = sum(int(item["scored_tokens"]) for item in baseline_all)
             if candidate_tokens <= 0 or baseline_tokens <= 0:
@@ -1045,7 +1092,7 @@ def _derive_bootstrap_comparisons(root: Path, inventory: Mapping[str, Mapping[st
             for row_number in range(10000):
                 indices = matrix["retention"][row_number]
                 candidate = [rows[("A2", seed)][int(expected_universe["retention"][index])] for index in indices]
-                baseline = [rows[("F0", seed)][int(expected_universe["retention"][index])] for index in indices]
+                baseline = [rows[("F0", 47)][int(expected_universe["retention"][index])] for index in indices]
                 candidate_tokens = sum(int(item["scored_tokens"]) for item in candidate)
                 baseline_tokens = sum(int(item["scored_tokens"]) for item in baseline)
                 if candidate_tokens <= 0 or baseline_tokens <= 0:
@@ -1087,9 +1134,21 @@ def _has_timing_gate(stages: Mapping[str, Mapping[str, object]]) -> bool:
             a2_values = _positive_samples(a2)
             a3_values = _positive_samples(a3)
             metadata = value.get("metadata")
-            if (len(a2_values) != 20 or len(a3_values) != 20 or value.get("sample_count") != 20
-                    or not isinstance(metadata, Mapping) or metadata.get("units") != "seconds" or metadata.get("synchronized") is not True
-                    or metadata.get("warmup_samples") != 5 or metadata.get("arms") != ["A2", "A3"]):
+            pilot_shape = (
+                len(a2_values) == 20 and len(a3_values) == 20
+                and value.get("sample_count") == 20
+                and isinstance(metadata, Mapping)
+                and metadata.get("warmup_samples") == 5
+            )
+            production_shape = (
+                len(a2_values) == 1 and len(a3_values) == 1
+                and value.get("sample_count") == 1
+                and isinstance(metadata, Mapping)
+                and metadata.get("measurement") == "complete_production_training"
+            )
+            if (not (pilot_shape or production_shape)
+                    or metadata.get("units") != "seconds" or metadata.get("synchronized") is not True
+                    or metadata.get("arms") != ["A2", "A3"]):
                 continue
             ratio = float(np.median(a3_values)) / float(np.median(a2_values))
             if math.isfinite(ratio) and 0.90 <= ratio <= 1.10:

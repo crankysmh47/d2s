@@ -69,6 +69,17 @@ def test_generation_length_cap() -> None:
     assert result["stop_reason"] == "length"
 
 
+def test_generation_can_force_full_token_budget_for_pessimistic_timing() -> None:
+    """Catches the G2 timing bound ending early when the model emits EOS."""
+    model = ScriptedModel([EOS])
+    result = generate_answer(
+        model, torch.tensor([[1]]), "single", EOS, 4, stop_on_eos=False
+    )
+    assert len(model.calls) == 4
+    assert result["generated_token_count"] == 4
+    assert result["stop_reason"] == "length"
+
+
 def test_example_evaluation_persists_record_and_summary(tmp_path: Path) -> None:
     path = tmp_path / "scores.jsonl"
     result = evaluate_examples(ScriptedModel([7, EOS]), [_example()], "single", path)

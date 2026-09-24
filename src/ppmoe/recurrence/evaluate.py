@@ -12,7 +12,6 @@ from collections.abc import Mapping, Sequence
 import json
 import math
 import numbers
-import os
 from pathlib import Path
 import time
 
@@ -80,6 +79,8 @@ def generate_answer(
     mode: str,
     eos_token_id: int,
     max_new_tokens: int = 32,
+    *,
+    stop_on_eos: bool = True,
 ) -> dict[str, object]:
     """Greedily decode by recomputing the entire prefix at every step.
 
@@ -97,6 +98,8 @@ def generate_answer(
         raise ValueError("eos_token_id must be a non-negative integer")
     if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) or max_new_tokens < 1:
         raise ValueError("max_new_tokens must be a positive integer")
+    if not isinstance(stop_on_eos, bool):
+        raise TypeError("stop_on_eos must be a boolean")
     if input_ids.shape[1] + max_new_tokens > 512:
         raise ValueError("generation would exceed the 512-token sequence limit")
 
@@ -122,14 +125,14 @@ def generate_answer(
                     (prefix, torch.tensor([[next_token]], dtype=torch.long, device=prefix.device)),
                     dim=1,
                 )
-                if next_token == eos_token_id:
+                if stop_on_eos and next_token == eos_token_id:
                     stop_reason = "eos"
                     break
     finally:
         _synchronize_cuda()
     return {
         "token_ids": generated,
-        "completion_token_ids": generated[:-1] if generated and generated[-1] == eos_token_id else generated,
+        "completion_token_ids": generated[:-1] if stop_on_eos and generated and generated[-1] == eos_token_id else generated,
         "stop_reason": stop_reason,
         "generated_token_count": len(generated),
         "latency_seconds": max(0.0, time.perf_counter() - started),
@@ -214,6 +217,7 @@ def evaluate_retention(
     arm: str | None = None,
     seed: int | None = None,
     signatures: Mapping[str, str] | None = None,
+    split: str = "retention",
 ) -> dict[str, object]:
     """Score each frozen retention chunk independently with shifted causal NLL."""
     frozen_chunks = _validate_chunks(chunks)
@@ -229,8 +233,10 @@ def evaluate_retention(
     reconciliation_error = _reconcile_ids(existing, expected_indices, "chunk_index")
     if reconciliation_error is not None:
         return _incomplete_result(record_path, reconciliation_error)
+    if split not in {"pilot", "dev", "test", "retention"}:
+        raise ValueError("retention evaluation split is invalid")
     reconciliation_error = _validate_retention_records(
-        existing, expected_chunks, mode, arm_value, seed_value, signature_value
+        existing, expected_chunks, mode, arm_value, seed_value, signature_value, split
     )
     if reconciliation_error is not None:
         return _incomplete_result(record_path, reconciliation_error)
@@ -239,12 +245,12 @@ def evaluate_retention(
     for chunk in frozen_chunks:
         if chunk.index in known:
             continue
-        record = _score_chunk(model, chunk, mode, arm_value, seed_value, signature_value)
+        record = _score_chunk(model, chunk, mode, arm_value, seed_value, signature_value, split)
         _append_jsonl(record_path, record)
         existing.append(record)
         known.add(chunk.index)
 
-    return _finalize_retention(record_path, existing, expected_indices, frozen_chunks, mode, arm_value, seed_value, signature_value)
+    return _finalize_retention(record_path, existing, expected_indices, frozen_chunks, mode, arm_value, seed_value, signature_value, split)
 
 
 def _score_example(
@@ -323,6 +329,7 @@ def _score_chunk(
     arm: object,
     seed: object,
     signatures: object,
+    split: str = "retention",
 ) -> dict[str, object]:
     started = time.perf_counter()
     base: dict[str, object] = {
@@ -337,6 +344,7 @@ def _score_chunk(
         "seed": seed,
         "mode": mode,
         "signatures": signatures,
+        "split": split,
         "families": ["retention"],
         "failure": None,
     }
@@ -408,6 +416,7 @@ def _finalize_examples(
         "seed": seed,
         "signatures": signatures,
         "families": sorted({row["family"] for row in records}),
+        "split": next(iter({str(row["split"]) for row in records})),
     }
     if failures:
         summary["complete"] = False
@@ -429,10 +438,11 @@ def _finalize_retention(
     arm: object,
     seed: object,
     signatures: object,
+    split: str = "retention",
 ) -> dict[str, object]:
     expected_chunks = {chunk.index: chunk for chunk in chunks}
     error = _reconcile_ids(records, expected_indices, "chunk_index") or _validate_retention_records(
-        records, expected_chunks, mode, arm, seed, signatures
+        records, expected_chunks, mode, arm, seed, signatures, split
     )
     if error is not None:
         return _incomplete_result(path, error)
@@ -459,6 +469,7 @@ def _finalize_retention(
         "seed": seed,
         "signatures": signatures,
         "families": ["retention"],
+        "split": split,
     }
     summary_path = _summary_path(path)
     summary["records_path"] = str(path)
@@ -666,6 +677,7 @@ def _validate_retention_records(
     arm: object,
     seed: object,
     signatures: Mapping[str, str],
+    split: str = "retention",
 ) -> str | None:
     for record in records:
         index = record.get("chunk_index")
@@ -689,6 +701,8 @@ def _validate_retention_records(
             return f"seed mismatch for chunk {index}"
         if record.get("signatures") != dict(signatures):
             return f"signatures mismatch for chunk {index}"
+        if record.get("split", "retention") != split:
+            return f"split mismatch for chunk {index}"
         if not _finite_nonnegative(record.get("latency_seconds")):
             return f"latency is invalid for chunk {index}"
         failure = record.get("failure")

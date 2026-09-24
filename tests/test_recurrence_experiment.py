@@ -485,6 +485,58 @@ def test_pilot_cleanup_receives_payload_and_preserves_primary_outcome(
     assert "pilot_cleanup_failure" in events
 
 
+@pytest.mark.parametrize("mismatch", [False, True])
+def test_run_stage_pilot_postflight_binds_returned_payload_to_authenticated_file(
+    tmp_path: Path, config_path: Path, mismatch: bool
+) -> None:
+    """G2 postflight must not require the stage record it persists afterward."""
+    from ppmoe.recurrence.production import production_remaining_work_projection
+
+    root = tmp_path / _run_id()
+    root.mkdir()
+    write_immutable_json(root / "stages" / "smoke.json", {
+        "stage": "smoke", "status": "passed", "signatures": _signatures(),
+        "payload": {"cuda_seconds": 1.0}, "attempts": 1,
+    })
+    init_hashes: dict[str, str] = {}
+    identities = {"47": "7" * 64, "48": "8" * 64}
+    for seed in (47, 48):
+        path = root / "initializations" / f"{seed}.pt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"init-{seed}".encode())
+        init_hashes[str(seed)] = __import__("hashlib").sha256(path.read_bytes()).hexdigest()
+
+    payload = {
+        "schema_version": 1, "n3": 1000,
+        "training_samples": {"a1": [1.0] * 20, "a2": [1.0] * 20},
+        "seconds_per_training_update": {"a1": 1.0, "a2": 1.0},
+        "seconds_per_generation_example": 1.0, "seconds_per_retention_chunk": 1.0,
+        "longest_prompt_tokens": 1, "generation_record_count": 36,
+        "retention_measurement_count": 4, "disposable_relative_path": "pilot-disposable",
+        "initialization_hash": identities["47"], "initialization_sha256": init_hashes,
+        "initialization_hashes": identities, "forced_generation_seconds": 1.0,
+        "peak_allocated_bytes": 1, "peak_reserved_bytes": 2, "total_vram_bytes": 32 << 30,
+    }
+
+    def pilot(_context):
+        write_immutable_json(root / "pilot.json", payload)
+        return {**payload, "n3": payload["n3"] + 1} if mismatch else payload
+
+    deps = __import__("dataclasses").replace(
+        _dependencies(stages={**_dependencies().stage_functions, "pilot": pilot}),
+        remaining_work_projection=production_remaining_work_projection,
+        test_only=False,
+    )
+    if mismatch:
+        with pytest.raises(EnvironmentStop, match="payload differs"):
+            run_stage("pilot", config_path, tmp_path, _run_id(), deps)
+        assert json.loads((root / "stages" / "pilot.json").read_text())["status"] == "failed_environment"
+    else:
+        record = run_stage("pilot", config_path, tmp_path, _run_id(), deps)
+        assert record["status"] == "passed"
+        assert json.loads((root / "stages" / "pilot.json").read_text())["payload"] == payload
+
+
 @pytest.mark.parametrize("wrong_field", ["attempt", "checkpoint_path", "checkpoint_digest", "checkpoint_signature"])
 def test_retry_rejects_authenticated_but_wrong_checkpoint_state(
     tmp_path: Path, config_path: Path, wrong_field: str

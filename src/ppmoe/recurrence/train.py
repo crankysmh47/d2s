@@ -554,10 +554,18 @@ def _training_manifest(
     records: Sequence[Mapping[str, object]],
     synchronized_cuda_seconds: float,
 ) -> dict[str, object]:
+    task_events = [
+        record for record in records
+        if record.get("arm") == arm
+        and record.get("seed") == seed
+        and record.get("kind") in {
+            "training_checkpoint", "training_progress", "training_completed", "training_failure"
+        }
+    ]
     checkpoint_hashes = list(
         dict.fromkeys(
             str(record["checkpoint_hash"])
-            for record in records
+            for record in task_events
             if record.get("kind") == "training_checkpoint"
             and isinstance(record.get("checkpoint_hash"), str)
         )
@@ -571,14 +579,14 @@ def _training_manifest(
     attempts = sorted(
         {
             int(record["attempt"])
-            for record in records
+            for record in task_events
             if isinstance(record.get("attempt"), int)
             and not isinstance(record.get("attempt"), bool)
         }
     )
     if not attempts:
         attempts = [state.attempt]
-    failures = [dict(record) for record in records if record.get("kind") == "training_failure"]
+    failures = [dict(record) for record in task_events if record.get("kind") == "training_failure"]
     if torch.cuda.is_available():
         peak_allocated = max(torch.cuda.max_memory_allocated(index) for index in range(torch.cuda.device_count()))
         peak_reserved = max(torch.cuda.max_memory_reserved(index) for index in range(torch.cuda.device_count()))
@@ -606,12 +614,12 @@ def _training_manifest(
         "determinism_notes": [],
         "event_indices": [
             record["index"]
-            for record in records
+            for record in task_events
             if isinstance(record.get("index"), int) and not isinstance(record.get("index"), bool)
         ],
                         "failure_event_indices": [
             record["index"]
-            for record in records
+            for record in task_events
             if record.get("kind") == "training_failure"
             and isinstance(record.get("index"), int)
             and not isinstance(record.get("index"), bool)
