@@ -191,7 +191,10 @@ def _validate_smoke_payload(payload: Mapping[str, object]) -> None:
     ):
         raise RuntimeError("smoke payload projection invocation reuse is invalid")
     observations = payload["cache_observations"]
-    if not isinstance(observations, list) or len(observations) != 224 or any(not isinstance(item, Mapping) or set(item) != {"past_key_values", "use_cache"} or item["past_key_values"] is not None or item["use_cache"] is not False for item in observations):
+    # One F0 and one F1 pass, then two causality passes in each of the
+    # single, repeat, and damped modes. Damped traverses the block twice.
+    expected_cache_calls = 3 * counts["single_total"] + 5 * counts["repeat_total"]
+    if not isinstance(observations, list) or len(observations) != expected_cache_calls or any(not isinstance(item, Mapping) or set(item) != {"past_key_values", "use_cache"} or item["past_key_values"] is not None or item["use_cache"] is not False for item in observations):
         raise RuntimeError("smoke payload cache evidence is invalid")
     causal_by_mode = payload["causality_max_abs_diff_by_mode"]
     if not isinstance(causal_by_mode, Mapping) or set(causal_by_mode) != {"single", "repeat", "damped"} or any(not finite(value) or float(value) != 0.0 for value in causal_by_mode.values()) or float(payload["causality_max_abs_diff"]) != 0.0:
@@ -680,7 +683,9 @@ def _semantic_checks(context: "StageContext", wrapper: RecurrentQwen3, ids: Tens
         with torch.no_grad():
             f0 = wrapper(ids, mode=context.config.loop.frozen_mode)
             f1 = wrapper(ids, mode=context.config.loop.repeat_mode)
-            left = ids.clone(); right = ids.clone(); right[:, -1] = (right[:, -1] + 1) % wrapper.stock_model.config.vocab_size
+            left = ids.clone()
+            right = ids.clone()
+            right[:, -1] = (right[:, -1] + 1) % wrapper.stock_model.config.vocab_size
             causal_diffs = [
                 float((wrapper(left, mode)[:, :5].float() - wrapper(right, mode)[:, :5].float()).abs().max().item())
                 for mode in ("single", "repeat", "damped")

@@ -153,7 +153,7 @@ def test_smoke_payload_validator_accepts_complete_structural_evidence() -> None:
         "selected_layer_ids": [12, 13, 14, 15], "selected_base_projection_ids": invocation_records, "selected_projection_ids": projections, "selected_parameter_ids": parameters,
         "selected_projection_invocation_ids": {"single": single, "repeat": repeat}, "selected_projection_objects_shared": True,
         "layer_call_counts": {"single": {str(i): 1 for i in range(28)}, "single_expected": {str(i): 1 for i in range(28)}, "repeat": {str(i): (2 if 12 <= i < 16 else 1) for i in range(28)}, "repeat_expected": {str(i): (2 if 12 <= i < 16 else 1) for i in range(28)}, "single_total": 28, "repeat_total": 32},
-        "cache_observations": [{"past_key_values": None, "use_cache": False} for _ in range(224)], "layer_call_counts_passed": True, "cache_disabled": True,
+        "cache_observations": [{"past_key_values": None, "use_cache": False} for _ in range(244)], "layer_call_counts_passed": True, "cache_disabled": True,
         "causality_passed": True, "causality_max_abs_diff": 0.0, "causality_max_abs_diff_by_mode": {"single": 0.0, "repeat": 0.0, "damped": 0.0}, "shared_layer_objects": True,
         "adapter_off_f0_finite": True, "adapter_off_f1_finite": True, "adapter_off_f0_nonfinite_count": 0, "adapter_off_f1_nonfinite_count": 0, "adapter_off_a1_matches_f0": True, "adapter_off_a2_matches_f1": True, "adapter_off_a1_max_abs_diff": 0.0, "adapter_off_a2_max_abs_diff": 0.0,
         "adapter_gradients_finite": True, "adapter_gradients_nonzero": True, "adapter_gradient_evidence": [{"adapter_index": i, "a_finite": True, "a_nonzero": False, "b_finite": True, "b_nonzero": True, "a_zero_at_init_allowed": True, "a_abs_sum": 0.0, "b_abs_sum": 1.0} for i in range(24)],
@@ -162,6 +162,9 @@ def test_smoke_payload_validator_accepts_complete_structural_evidence() -> None:
         "cuda_seconds": 1.0, "peak_allocated_bytes": 1, "peak_reserved_bytes": 2, "total_vram_bytes": 32 << 30, "download_bytes": 0,
     }
     _validate_smoke_payload(payload)
+    payload["cache_observations"] = payload["cache_observations"][:224]
+    with pytest.raises(RuntimeError, match="cache evidence"):
+        _validate_smoke_payload(payload)
 
 
 def test_smoke_payload_rejects_swapped_pre_lora_invocation_identity() -> None:
@@ -213,7 +216,7 @@ def _complete_smoke_payload_for_test(smoke, base, projections, parameters):
         "selected_layer_ids": [12, 13, 14, 15], "selected_base_projection_ids": base, "selected_projection_ids": projections, "selected_parameter_ids": parameters,
         "selected_projection_invocation_ids": {"single": identity, "repeat": [dict(row) for row in identity for _ in range(2)]}, "selected_projection_objects_shared": True,
         "layer_call_counts": {"single": {str(i): 1 for i in range(28)}, "single_expected": {str(i): 1 for i in range(28)}, "repeat": {str(i): (2 if 12 <= i < 16 else 1) for i in range(28)}, "repeat_expected": {str(i): (2 if 12 <= i < 16 else 1) for i in range(28)}, "single_total": 28, "repeat_total": 32},
-        "cache_observations": [{"past_key_values": None, "use_cache": False} for _ in range(224)], "layer_call_counts_passed": True, "cache_disabled": True,
+        "cache_observations": [{"past_key_values": None, "use_cache": False} for _ in range(244)], "layer_call_counts_passed": True, "cache_disabled": True,
         "causality_passed": True, "causality_max_abs_diff": 0.0, "causality_max_abs_diff_by_mode": {"single": 0.0, "repeat": 0.0, "damped": 0.0}, "shared_layer_objects": True,
         "adapter_off_f0_finite": True, "adapter_off_f1_finite": True, "adapter_off_f0_nonfinite_count": 0, "adapter_off_f1_nonfinite_count": 0, "adapter_off_a1_matches_f0": True, "adapter_off_a2_matches_f1": True, "adapter_off_a1_max_abs_diff": 0.0, "adapter_off_a2_max_abs_diff": 0.0,
         "adapter_gradients_finite": True, "adapter_gradients_nonzero": True, "adapter_gradient_evidence": [{"adapter_index": i, "a_finite": True, "a_nonzero": False, "b_finite": True, "b_nonzero": True, "a_zero_at_init_allowed": True, "a_abs_sum": 0.0, "b_abs_sum": 1.0} for i in range(24)],
