@@ -417,6 +417,105 @@ def test_report_hashes_sources_and_writes_immutable_outputs(tmp_path: Path) -> N
     assert (root / "report.json").read_bytes() == before
 
 
+def test_preconfirmation_report_does_not_open_sealed_rows_or_test_scores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ppmoe.recurrence.report as report_module
+
+    root = _root(tmp_path)
+    sealed_paths = (
+        root / "data" / "test.jsonl",
+        root / "scores" / "a1-47-test.jsonl",
+        root / "scores" / "a1-47-test.summary.json",
+        root / "scores" / "a1-48-confirm.jsonl",
+        root / "retention-scores" / "a1-48-test.jsonl",
+        root / "retention-scores" / "a1-48-confirm.jsonl",
+        root / "retention-scores" / "a1-48-confirm.summary.json",
+    )
+    for path in sealed_paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"sealed fixture bytes")
+
+    original_read = report_module._descriptor_read
+
+    def guarded_read(path: Path, trusted_root: Path | None = None):
+        relative = path.relative_to(root).as_posix()
+        assert relative != "data/test.jsonl", "report opened sealed test rows"
+        is_score_path = relative.startswith(("scores/", "retention-scores/"))
+        assert not (is_score_path and any(token in path.name for token in ("-test", "-confirm"))), (
+            "pre-confirm report opened a sealed score path"
+        )
+        return original_read(path, trusted_root)
+
+    monkeypatch.setattr(report_module, "_descriptor_read", guarded_read)
+
+    report = build_report(root)
+
+    assert report["decision"]["status"] == "stopped_scientific"
+
+
+def test_confirmed_report_reads_test_scores_but_never_sealed_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ppmoe.recurrence.report as report_module
+    from ppmoe.recurrence.provenance import canonical_json
+
+    root = _root(tmp_path)
+    signatures = {"source": "a" * 64, "data": "b" * 64, "config": "c" * 64, "code": "d" * 64}
+    test_hash = "e" * 64
+    data_manifest = {"split_sha256": {"test": test_hash}}
+    manifest_bytes = canonical_json(data_manifest)
+    (root / "data" / "manifest.json").parent.mkdir(parents=True, exist_ok=True)
+    (root / "data" / "manifest.json").write_bytes(manifest_bytes)
+    selection = {
+        "schema_version": 1,
+        "status": "passed",
+        "selected_condition": "A2",
+        "signatures": signatures,
+        "test_sha256": test_hash,
+        "n3": 1000,
+        "dev_score_hashes": {arm: "f" * 64 for arm in ("F0", "A1", "A2", "A3")},
+        "data_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+    }
+    selection_bytes = canonical_json(selection)
+    (root / "selection.json").write_bytes(selection_bytes)
+    _stage(root, "data", payload={"manifest_sha256": selection["data_manifest_sha256"]})
+    _stage(root, "discover", payload={
+        "decision": {"status": "stopped_scientific", "reason": "confirmation_fixture"},
+        "selection_sha256": hashlib.sha256(selection_bytes).hexdigest(),
+        "data_manifest_sha256": selection["data_manifest_sha256"],
+    })
+    _stage(root, "confirm", payload={
+        "decision": {"status": "stopped_scientific", "reason": "confirmation_fixture"},
+    })
+    test_score = root / "scores" / "a1-47-test.jsonl"
+    retention_score = root / "retention-scores" / "a1-48-confirm.jsonl"
+    sealed_rows = root / "data" / "test.jsonl"
+    for path in (test_score, retention_score, sealed_rows):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"opaque test fixture")
+
+    opened: list[str] = []
+    original_read = report_module._descriptor_read
+
+    def guarded_read(path: Path, trusted_root: Path | None = None):
+        relative = path.relative_to(root).as_posix()
+        assert relative != "data/test.jsonl", "report opened sealed test rows"
+        opened.append(relative)
+        return original_read(path, trusted_root)
+
+    monkeypatch.setattr(report_module, "_descriptor_read", guarded_read)
+
+    report = build_report(root)
+
+    assert report["decision"]["status"] == "stopped_scientific"
+    assert "scores/a1-47-test.jsonl" in opened
+    assert "retention-scores/a1-48-confirm.jsonl" in opened
+    assert "data/test.jsonl" not in opened
+    report_sources = json.loads((root / "report-sources.json").read_text(encoding="utf-8"))
+    assert "scores/a1-47-test.jsonl" in {entry["path"] for entry in report_sources["files"]}
+
+
 def test_report_rejects_summary_without_raw_records(tmp_path: Path) -> None:
     root = _root(tmp_path)
     _write(root / "scores" / "a2-47.summary.json", {
@@ -473,6 +572,79 @@ def test_source_manifest_reconciles_current_file_bytes(tmp_path: Path) -> None:
     root = _root(tmp_path)
     (root / "config.json").write_text("tampered", encoding="utf-8")
     with pytest.raises(ValueError, match="source manifest"):
+        build_report(root)
+
+
+def test_source_manifest_paths_resolve_inside_authenticated_snapshot(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    revision = "e" * 40
+    snapshot = root / "source" / revision
+    source_file = snapshot / ".cache" / "config.bin"
+    source_file.parent.mkdir(parents=True)
+    source_file.write_bytes(b"pinned source")
+    (root / "config.json").unlink()
+    _stage(root, "source", payload={
+        "source_manifest": "source-manifest.json",
+        "revision": revision,
+        "snapshot_relative_path": f"source/{revision}",
+    })
+    _write(root / "source-manifest.json", {
+        "schema_version": 1,
+        "repo_id": "Qwen/Qwen3-1.7B",
+        "revision": revision,
+        "files": [{
+            "relative_path": ".cache/config.bin",
+            "bytes": len(b"pinned source"),
+            "sha256": hashlib.sha256(b"pinned source").hexdigest(),
+        }],
+    })
+
+    report = build_report(root)
+
+    assert report["source_manifest"]["revision"] == revision
+
+
+def test_source_manifest_revision_must_match_authenticated_snapshot(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    revision = "e" * 40
+    _stage(root, "source", payload={
+        "source_manifest": "source-manifest.json",
+        "revision": revision,
+        "snapshot_relative_path": f"source/{revision}",
+    })
+    manifest = json.loads((root / "source-manifest.json").read_text(encoding="utf-8"))
+    manifest["revision"] = "f" * 40
+    _write(root / "source-manifest.json", manifest)
+
+    with pytest.raises(ValueError, match="revision.*source stage|source stage.*revision"):
+        build_report(root)
+
+
+@pytest.mark.parametrize("relative_path", ["../config.json", "..\\config.json", "C:/config.json"])
+def test_source_manifest_paths_cannot_escape_authenticated_snapshot(
+    tmp_path: Path, relative_path: str
+) -> None:
+    root = _root(tmp_path)
+    revision = "e" * 40
+    snapshot = root / "source" / revision
+    snapshot.mkdir(parents=True)
+    _stage(root, "source", payload={
+        "source_manifest": "source-manifest.json",
+        "revision": revision,
+        "snapshot_relative_path": f"source/{revision}",
+    })
+    _write(root / "source-manifest.json", {
+        "schema_version": 1,
+        "repo_id": "Qwen/Qwen3-1.7B",
+        "revision": revision,
+        "files": [{
+            "relative_path": relative_path,
+            "bytes": 2,
+            "sha256": hashlib.sha256(b"{}").hexdigest(),
+        }],
+    })
+
+    with pytest.raises(ValueError, match="source manifest path"):
         build_report(root)
 
 

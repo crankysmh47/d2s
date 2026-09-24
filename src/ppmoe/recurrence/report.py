@@ -15,6 +15,7 @@ import json
 import math
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import re
 
 import numpy as np
@@ -46,6 +47,11 @@ def build_report(run_root: Path) -> dict[str, object]:
     inputs = _read_inputs(root)
     inventory = {str(item["path"]): item for item in inputs}
     stages = _load_stages(root, inputs, inventory)
+    confirmed_test_scores = _confirmed_test_scores_authorized(root, stages, inventory)
+    if confirmed_test_scores:
+        inputs = _read_inputs(root, include_confirm_test_scores=True)
+        inventory = {str(item["path"]): item for item in inputs}
+        stages = _load_stages(root, inputs, inventory)
     signatures = _signatures(stages)
     source_manifest = _load_source_manifest(root, inputs, stages, inventory)
     events = _load_events(root, inventory)
@@ -105,10 +111,12 @@ def build_report(run_root: Path) -> dict[str, object]:
     return report
 
 
-def _read_inputs(root: Path) -> list[dict[str, object]]:
+def _read_inputs(root: Path, *, include_confirm_test_scores: bool = False) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     for path in sorted((entry for entry in root.rglob("*") if entry.is_file()), key=lambda p: p.as_posix()):
         relative = path.relative_to(root).as_posix()
+        if _sealed_evidence_path(relative, include_confirm_test_scores=include_confirm_test_scores):
+            continue
         if path.is_symlink():
             raise ValueError(f"report evidence may not be a symbolic link: {path}")
         if relative in _REPORT_OUTPUTS or relative == "stages/report.json":
@@ -119,6 +127,89 @@ def _read_inputs(root: Path) -> list[dict[str, object]]:
             raise ValueError(f"input changed during inventory: {path}")
         records.append({"path": relative, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
     return records
+
+
+def _sealed_evidence_path(relative: str, *, include_confirm_test_scores: bool) -> bool:
+    normalized = relative.casefold()
+    if normalized == "data/test.jsonl":
+        return True
+    if include_confirm_test_scores:
+        return False
+    is_score_path = normalized.startswith(("scores/", "retention-scores/"))
+    return is_score_path and any(token in Path(normalized).name for token in ("-test", "-confirm"))
+
+
+def _confirmed_test_scores_authorized(
+    root: Path,
+    stages: Mapping[str, Mapping[str, object]],
+    inventory: Mapping[str, Mapping[str, object]],
+) -> bool:
+    """Allow score inventory only after report verifies persisted G5 authorization."""
+    confirm = stages.get("confirm")
+    discover = stages.get("discover")
+    data_stage = stages.get("data")
+    if (
+        not isinstance(confirm, Mapping)
+        or confirm.get("status") != "passed"
+        or not isinstance(discover, Mapping)
+        or discover.get("status") != "passed"
+        or not isinstance(data_stage, Mapping)
+        or data_stage.get("status") != "passed"
+    ):
+        return False
+    selection_record = inventory.get("selection.json")
+    manifest_record = inventory.get("data/manifest.json")
+    if selection_record is None or manifest_record is None:
+        return False
+    selection_bytes = _read_verified(root / "selection.json", root, inventory)
+    try:
+        selection = json.loads(selection_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    required = {
+        "schema_version", "status", "selected_condition", "signatures", "test_sha256",
+        "n3", "dev_score_hashes", "data_manifest_sha256",
+    }
+    dev_hashes = selection.get("dev_score_hashes") if isinstance(selection, Mapping) else None
+    confirm_signatures = confirm.get("signatures")
+    if (
+        not isinstance(selection, Mapping)
+        or set(selection) != required
+        or canonical_json(selection) != selection_bytes
+        or selection.get("schema_version") != 1
+        or selection.get("status") != "passed"
+        or selection.get("selected_condition") != "A2"
+        or selection.get("signatures") != confirm_signatures
+        or isinstance(selection.get("n3"), bool)
+        or not isinstance(selection.get("n3"), int)
+        or selection["n3"] < 1000
+        or not isinstance(dev_hashes, Mapping)
+        or set(dev_hashes) != {"F0", "A1", "A2", "A3"}
+        or any(not isinstance(value, str) or not _SHA256.fullmatch(value) for value in dev_hashes.values())
+        or not isinstance(selection.get("test_sha256"), str)
+        or not _SHA256.fullmatch(selection["test_sha256"])
+        or not isinstance(selection.get("data_manifest_sha256"), str)
+        or not _SHA256.fullmatch(selection["data_manifest_sha256"])
+        or not isinstance(discover.get("payload"), Mapping)
+        or discover["payload"].get("selection_sha256") != hashlib.sha256(selection_bytes).hexdigest()
+        or not isinstance(data_stage.get("payload"), Mapping)
+        or data_stage["payload"].get("manifest_sha256") != selection["data_manifest_sha256"]
+        or not isinstance(discover.get("payload"), Mapping)
+        or discover["payload"].get("data_manifest_sha256") != selection["data_manifest_sha256"]
+    ):
+        return False
+    manifest_bytes = _read_verified(root / "data" / "manifest.json", root, inventory)
+    if hashlib.sha256(manifest_bytes).hexdigest() != selection["data_manifest_sha256"]:
+        return False
+    try:
+        data_manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    split_hashes = data_manifest.get("split_sha256") if isinstance(data_manifest, Mapping) else None
+    return (
+        isinstance(split_hashes, Mapping)
+        and split_hashes.get("test") == selection["test_sha256"]
+    )
 
 
 def _load_json(path: Path, *, root: Path, inventory: Mapping[str, Mapping[str, object]] | None = None) -> dict[str, object]:
@@ -424,6 +515,29 @@ def _load_source_manifest(root: Path, inputs: list[dict[str, object]], stages: M
     revision = manifest.get("revision")
     if not isinstance(revision, str) or not _REVISION.fullmatch(revision.lower()):
         raise ValueError("source manifest has no immutable revision")
+    source_record = stages.get("source")
+    source_payload = source_record.get("payload") if isinstance(source_record, Mapping) else None
+    snapshot_root: Path | None = None
+    if isinstance(source_payload, Mapping) and "snapshot_relative_path" in source_payload:
+        snapshot_relative = source_payload.get("snapshot_relative_path")
+        source_revision = source_payload.get("revision")
+        if (
+            not isinstance(snapshot_relative, str)
+            or not snapshot_relative
+            or "\\" in snapshot_relative
+            or PurePosixPath(snapshot_relative).is_absolute()
+            or PurePosixPath(snapshot_relative).as_posix() != snapshot_relative
+            or any(part in {".", ".."} for part in PurePosixPath(snapshot_relative).parts)
+            or ":" in PurePosixPath(snapshot_relative).parts[0]
+        ):
+            raise ValueError("source stage snapshot_relative_path is invalid")
+        if not isinstance(source_revision, str) or not _REVISION.fullmatch(source_revision.lower()):
+            raise ValueError("source stage has no immutable revision")
+        if revision.lower() != source_revision.lower():
+            raise ValueError("source manifest revision does not match source stage revision")
+        snapshot_root = _resolve_evidence_path(root, snapshot_relative)
+        if not snapshot_root.is_dir():
+            raise ValueError("source stage snapshot path is not a directory")
     files = manifest.get("files")
     if not isinstance(files, list):
         raise ValueError("source manifest has no file inventory")
@@ -435,7 +549,24 @@ def _load_source_manifest(root: Path, inputs: list[dict[str, object]], stages: M
         if relative in manifest_paths or isinstance(item.get("bytes"), bool) or not isinstance(item.get("bytes"), int) or item["bytes"] < 0:
             raise ValueError("source manifest contains duplicate or invalid file sizes")
         manifest_paths.add(relative)
-        path = _resolve_evidence_path(root, relative)
+        if snapshot_root is None:
+            path = _resolve_evidence_path(root, relative)
+        else:
+            source_relative = PurePosixPath(relative)
+            if (
+                not relative
+                or "\\" in relative
+                or source_relative.is_absolute()
+                or source_relative.as_posix() != relative
+                or any(part in {".", ".."} for part in source_relative.parts)
+                or ":" in source_relative.parts[0]
+            ):
+                raise ValueError(f"source manifest path is invalid: {relative}")
+            path = _resolve_evidence_path(root, (PurePosixPath(source_payload["snapshot_relative_path"]) / source_relative).as_posix())
+            try:
+                path.relative_to(snapshot_root)
+            except ValueError as error:
+                raise ValueError(f"source manifest path escapes pinned snapshot: {relative}") from error
         if not path.is_file():
             raise ValueError(f"source manifest path is missing: {relative}")
         expected = inventory.get(path.relative_to(root).as_posix())
@@ -1184,7 +1315,15 @@ def _failure_history(events: list[dict[str, object]], exact: Mapping[str, object
 
 def _resource_evidence(root: Path, inputs: list[dict[str, object]], inventory: Mapping[str, Mapping[str, object]], stages: Mapping[str, Mapping[str, object]]) -> dict[str, object]:
     ledger = root / "cuda-cost.jsonl"
-    result: dict[str, object] = {"status": "not_evaluated", "cuda": "not_evaluated", "disk_bytes": sum(int(item["bytes"]) for item in inputs)}
+    result: dict[str, object] = {
+        "status": "not_evaluated",
+        "cuda": "not_evaluated",
+        "disk_bytes": sum(int(item["bytes"]) for item in inputs),
+        "disk_bytes_scope": (
+            "inventoried report inputs; data/test.jsonl is always excluded and test score paths "
+            "are excluded until passing confirm authorization is verified"
+        ),
+    }
     if ledger.is_file():
         rows = _read_jsonl(ledger, root, inventory)
         _validate_cuda_ledger(root, ledger, rows, inventory)
