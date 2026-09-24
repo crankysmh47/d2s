@@ -126,7 +126,12 @@ def _ensure_initialization(context: "StageContext", seed: int) -> tuple[str, str
     path = context.run_root / "initializations" / f"{seed}.pt"
     stock, _ = _load_stock(context)
     wrapper = RecurrentQwen3(stock, context.config.loop.layer_start, context.config.loop.layer_stop)
-    install_adapters(wrapper, context.config.loop.layer_start, context.config.loop.layer_stop, seed)
+    install_adapters(
+        wrapper.stock_model,
+        context.config.loop.layer_start,
+        context.config.loop.layer_stop,
+        seed,
+    )
     initialization = capture_initialization(path, wrapper, seed)
     digest = sha256_file(path)
     del wrapper, stock
@@ -141,7 +146,12 @@ def _adapted(context: "StageContext", arm: str, seed: int) -> tuple[RecurrentQwe
     stock, tokenizer = _load_stock(context)
     wrapper = RecurrentQwen3(stock, context.config.loop.layer_start, context.config.loop.layer_stop)
     wrapper.tokenizer = tokenizer
-    install_adapters(wrapper, context.config.loop.layer_start, context.config.loop.layer_stop, seed)
+    install_adapters(
+        wrapper.stock_model,
+        context.config.loop.layer_start,
+        context.config.loop.layer_stop,
+        seed,
+    )
     initialization = load_initialization(
         context.run_root / "initializations" / f"{seed}.pt", wrapper, expected_seed=seed
     )
