@@ -121,6 +121,16 @@ def test_terminal_g3_report_accepts_frozen_f1_f2_dev_summaries(tmp_path: Path) -
     assert {item["arm"] for item in report["evaluations"]["exact_scores"]["aggregates"]} == {"F1", "F2"}
 
 
+def test_uninformative_g3_conclusion_does_not_claim_lora_failed() -> None:
+    from ppmoe.recurrence.report import _conclusion
+
+    conclusion = _conclusion({"status": "stopped_scientific", "reason": "uninformative_benchmark"})
+
+    assert "No recurrence-efficacy conclusion" in conclusion
+    assert "adapted arms and sealed tests were not run" in conclusion
+    assert "recurrent LoRA did not pass" not in conclusion
+
+
 def test_failed_environment_g3_report_inventories_but_does_not_aggregate_scores(tmp_path: Path) -> None:
     root = _root(tmp_path)
     signatures = {"source": "a" * 64, "data": "b" * 64, "config": "c" * 64, "code": "d" * 64}

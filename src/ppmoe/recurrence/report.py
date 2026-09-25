@@ -1431,6 +1431,11 @@ def _conclusion(decision: Mapping[str, object]) -> str:
     reason = decision.get("reason")
     if status == "passed":
         base = "recurrent LoRA passed this fixed two-seed, three-family protocol."
+    elif status == "stopped_scientific" and reason == "uninformative_benchmark":
+        base = (
+            "No recurrence-efficacy conclusion: F0 failed the preregistered "
+            "benchmark-informativeness gate, so adapted arms and sealed tests were not run."
+        )
     elif status == "stopped_scientific" and reason == "retention_uncertain":
         base = "task quality may have passed, but the registered retention bound was not established."
     elif status == "stopped_scientific" and reason == "timing_inconclusive":

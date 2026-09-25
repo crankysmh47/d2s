@@ -1,6 +1,6 @@
 # Current work queue
 
-Updated 2026-09-11. Detailed requirements and stop rules: [plan.md](plan.md). This file is a summary, not permission to skip gates.
+Updated 2026-09-25. Detailed requirements and stop rules: [plan.md](plan.md). This file is a summary, not permission to skip gates.
 
 Exact sequential execution contract: [docs/superpowers/plans/2026-09-11-pretrained-recurrence-execution.md](docs/superpowers/plans/2026-09-11-pretrained-recurrence-execution.md). Continue automatically through passing gates; pause only for a genuinely human-only blocker.
 
@@ -14,21 +14,16 @@ Exact sequential execution contract: [docs/superpowers/plans/2026-09-11-pretrain
 - [x] Harden the protocol with per-family informativeness and paired FineWeb retention-uncertainty gates.
 - [x] Write the exhaustive sequential implementation-to-report execution plan.
 
-## Active direction: pretrained recurrence
+## Pretrained recurrence V0: registered stop reached
 
-- [ ] Implement pinned source/configuration and deterministic task data.
-- [ ] Implement and verify the shared-block Qwen3 wrapper, with caches disabled.
-- [ ] Implement block LoRA, loss masking and resumable training.
-- [ ] Implement exact-answer evaluation, timing controls and decision gates.
-- [ ] Implement staged CLI and honest success/stop reports.
-- [ ] Run implementation checks and real-model correctness smoke.
-- [ ] Pass the resource pilot within the 24-hour total study cap.
-- [ ] Evaluate the three frozen controls on development data.
-- [ ] Run seed47 discovery: ordinary LoRA, repeated-block LoRA, extra-training-time control.
-- [ ] Only after discovery passes: run seed48 and sealed final evaluation.
-- [ ] Report the measured result and stop; propose further work only from the evidence.
+- [x] Implement and test pinned source/data, shared-block Qwen3, LoRA/training, evaluation, gates, staged CLI, and reporting.
+- [x] Pass G0 source/data, G1 real-model smoke, and G2 resource pilot in signed run `129d39646933`.
+- [x] Complete G3 F0/F1/F2 development and retention diagnostics. G3 stopped scientifically: F0 had no informative family (4/600 correct overall).
+- [x] Produce G6 terminal report and independently check its input hashes and decisive raw metrics.
+- [x] Preserve implementation-failure runs and document the G6 wording erratum in [PROJECT_LOG.md](PROJECT_LOG.md) and [docs/recurrence-v0-report-erratum.md](docs/recurrence-v0-report-erratum.md).
+- [x] Commit and push the observed-evidence closeout on `exp`.
 
-No recurrence code or experiment has run yet. Current request was planning/documentation only.
+G4 seed-47 discovery, G5 seed-48/sealed confirmation, and any claim about adapted recurrence quality are **not evaluated**. The registered stop forbids retuning this run; a new benchmark or protocol needs a separately approved study.
 
 ## Deferred, not an execution queue
 
