@@ -121,6 +121,54 @@ def test_terminal_g3_report_accepts_frozen_f1_f2_dev_summaries(tmp_path: Path) -
     assert {item["arm"] for item in report["evaluations"]["exact_scores"]["aggregates"]} == {"F1", "F2"}
 
 
+def test_failed_environment_g3_report_inventories_but_does_not_aggregate_scores(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    signatures = {"source": "a" * 64, "data": "b" * 64, "config": "c" * 64, "code": "d" * 64}
+    _stage(root, "frozen", status="failed_environment", payload={"reason": "persisted evidence check failed"})
+    paths: list[tuple[Path, Path]] = []
+    for arm in ("F0", "F1", "F2"):
+        raw = root / "scores" / f"frozen-{arm.lower()}.jsonl"
+        rows = [
+            {"example_id": f"{family}-0", "family": family, "correct": True,
+             "reason_code": "correct", "arm": arm, "seed": 47, "split": "dev",
+             "signatures": signatures}
+            for family in ("expressions", "lists", "graphs")
+        ]
+        raw.parent.mkdir(parents=True, exist_ok=True)
+        raw.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        _write(raw.with_name(f"{raw.stem}.summary.json"), {
+            "schema_version": 1, "kind": "exact_scores", "complete": True,
+            "record_count": 3, "expected_count": 3, "records_path": raw.relative_to(root).as_posix(),
+            "records_sha256": hashlib.sha256(raw.read_bytes()).hexdigest(),
+            "arm": arm, "seed": 47, "failures": 0,
+            "families": ["expressions", "lists", "graphs"], "signatures": signatures,
+            "split": "dev",
+        })
+        retention = root / "retention-scores" / f"frozen-{arm.lower()}.jsonl"
+        retention_rows = [{"chunk_index": 0, "arm": arm, "seed": 47, "split": "dev",
+                           "signatures": signatures, "nll_sum": 1.0, "scored_tokens": 1}]
+        retention.parent.mkdir(parents=True, exist_ok=True)
+        retention.write_text("".join(json.dumps(row) + "\n" for row in retention_rows), encoding="utf-8")
+        _write(retention.with_name(f"{retention.stem}.summary.json"), {
+            "schema_version": 1, "kind": "retention_scores", "complete": True,
+            "record_count": 1, "expected_count": 1, "records_path": retention.relative_to(root).as_posix(),
+            "records_sha256": hashlib.sha256(retention.read_bytes()).hexdigest(),
+            "arm": arm, "seed": 47, "failures": 0, "families": ["retention"],
+            "signatures": signatures, "split": "dev", "nll_sum": 1.0, "scored_tokens": 1,
+        })
+        paths.extend(((raw, raw.with_name(f"{raw.stem}.summary.json")),
+                      (retention, retention.with_name(f"{retention.stem}.summary.json"))))
+
+    report = build_report(root)
+    assert report["decision"]["status"] == "failed_environment"
+    assert report["evaluations"]["exact_scores"] == {"status": "not_evaluated", "aggregates": [], "examples_scored": 0, "failures": 0}
+    assert report["evaluations"]["retention"]["status"] == "not_evaluated"
+    inventory = json.loads((root / "report-sources.json").read_text(encoding="utf-8"))["files"]
+    inventory_hashes = {item["path"]: item["sha256"] for item in inventory}
+    assert all(inventory_hashes[summary.relative_to(root).as_posix()] == hashlib.sha256(summary.read_bytes()).hexdigest()
+               for _raw, summary in paths)
+
+
 def test_one_sample_timing_control_is_not_registered(tmp_path: Path) -> None:
     _root(tmp_path)
     def timing(seed: int) -> dict[str, object]:

@@ -650,6 +650,11 @@ def _collect_summaries(root: Path, inputs: list[dict[str, object]], *, kind: str
                 aggregate["chunk_tokens"] = {int(row["chunk_index"]): int(row["scored_tokens"]) for row in raw_rows}
                 if "ordered_indices_sha256" in summary and summary["ordered_indices_sha256"] != sha256_payload({"indices": aggregate["chunk_indices"]}):
                     raise ValueError(f"aggregate {relative} ordered chunk hash mismatch")
+        producer = _summary_producer(summary)
+        if stages.get(producer, {}).get("status") == "failed_environment":
+            # Preserve these fully inventoried and internally reconciled files
+            # as partial evidence, but never present them as a G3 result.
+            continue
         aggregates.append(aggregate)
     return {
         "status": "evaluated" if aggregates else "not_evaluated",
@@ -681,20 +686,26 @@ def _validate_summary_schema(summary: Mapping[str, object], kind: str, stages: M
     split = summary.get("split")
     if split not in {"train", "dev", "test", "pilot", "retention"}:
         raise ValueError(f"summary {relative} has an invalid split")
-    upper_arm = arm.upper()
-    producer = (
+    producer = _summary_producer(summary)
+    stage = stages.get(producer)
+    if (
+        not stage
+        or stage.get("status") not in {"passed", "stopped_scientific", "failed_environment"}
+        or stage.get("signatures") != signatures
+    ):
+        raise ValueError(f"summary {relative} signature is not bound to authorized {producer} stage")
+
+
+def _summary_producer(summary: Mapping[str, object]) -> str:
+    split = summary.get("split")
+    upper_arm = str(summary.get("arm", "")).upper()
+    seed = summary.get("seed")
+    return (
         "confirm" if split == "test"
         else "frozen" if upper_arm in {"F0", "F1", "F2"}
         else "discover" if upper_arm in {"A1", "A2", "A3"} and seed == 47
         else "confirm"
     )
-    stage = stages.get(producer)
-    if (
-        not stage
-        or stage.get("status") not in {"passed", "stopped_scientific"}
-        or stage.get("signatures") != signatures
-    ):
-        raise ValueError(f"summary {relative} signature is not bound to authorized {producer} stage")
 
 
 def _validate_raw(kind: str, rows: list[dict[str, object]], summary: Mapping[str, object], relative: str) -> None:

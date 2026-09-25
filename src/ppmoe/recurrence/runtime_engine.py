@@ -570,9 +570,6 @@ def _frozen(context: "StageContext") -> Mapping[str, object]:
         exact_rows[arm] = _records(Path(str(exact["records_path"])))
         retention_rows[arm] = _records(Path(str(retention["records_path"])))
         memory[arm] = _vram()
-        if arm in {"f1", "f2"}:
-            _hide_diagnostic_summary(exact)
-            _hide_diagnostic_summary(retention)
     classification = classify_informative_families(summaries["f0"]["exact"])
     informative = classification["passes"] is True
     decision = {

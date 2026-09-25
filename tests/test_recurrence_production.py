@@ -370,6 +370,44 @@ def test_parent_frozen_gate_rejects_raw_rows_from_a_foreign_producer(
         _validate_persisted_stage_evidence("frozen", payload, context)
 
 
+def test_frozen_gate_requires_visible_f1_f2_summary_sidecars(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """G3 diagnostic sidecars must remain available to retry validation."""
+    from ppmoe.recurrence import runtime_engine
+
+    context = _context(tmp_path, "frozen")
+    summary_paths: list[Path] = []
+
+    def score(*_args: object, prefix: str, **_kwargs: object) -> tuple[dict[str, object], dict[str, object]]:
+        exact_summary = context.run_root / "scores" / f"{prefix}.summary.json"
+        retention_summary = context.run_root / "retention-scores" / f"{prefix}.summary.json"
+        for path in (exact_summary, retention_summary):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}\n", encoding="utf-8")
+            summary_paths.append(path)
+        exact_rows = context.run_root / "scores" / f"{prefix}.jsonl"
+        retention_rows = context.run_root / "retention-scores" / f"{prefix}.jsonl"
+        exact_rows.write_text("{}\n", encoding="utf-8")
+        retention_rows.write_text("{}\n", encoding="utf-8")
+        return (
+            {"records_path": str(exact_rows), "summary_path": str(exact_summary)},
+            {"records_path": str(retention_rows), "summary_path": str(retention_summary)},
+        )
+
+    monkeypatch.setattr(runtime_engine, "_unadapted", lambda _context: (object(), object()))
+    monkeypatch.setattr(runtime_engine, "_rows", lambda *_args: [])
+    monkeypatch.setattr(runtime_engine, "load_retention_chunks", lambda _path: [])
+    monkeypatch.setattr(runtime_engine, "_score", score)
+    monkeypatch.setattr(runtime_engine, "_records", lambda _path: [])
+    monkeypatch.setattr(runtime_engine, "_vram", lambda: {})
+    monkeypatch.setattr(runtime_engine, "_hide_diagnostic_summary", lambda _result: pytest.fail("G3 hid a retry summary"))
+    monkeypatch.setattr(runtime_engine, "classify_informative_families", lambda _summary: {"passes": True})
+    monkeypatch.setattr(runtime_engine, "summarize_exact_scores", lambda *_args: {"families": {}, "macro_accuracy": 0.5, "global_invalid_rate": 0.0})
+    monkeypatch.setattr(runtime_engine, "_frozen_diagnostic", lambda *_args: {})
+    runtime_engine._frozen(context)
+    assert len(summary_paths) == 6
+    assert all(path.is_file() and path.suffix == ".json" for path in summary_paths)
+
+
 def test_retention_raw_records_bind_their_evaluation_split() -> None:
     """Catches discovery retention being mistaken for sealed confirmation evidence."""
     from ppmoe.recurrence.evaluate import _score_chunk
