@@ -9,6 +9,7 @@ import torch
 
 from ppmoe.recurrence.data import Example, RenderedExample, RetentionChunk
 from ppmoe.recurrence.evaluate import (
+    GenerationDeadlineExceeded,
     evaluate_examples,
     evaluate_retention,
     generate_answer,
@@ -78,6 +79,24 @@ def test_generation_can_force_full_token_budget_for_pessimistic_timing() -> None
     assert len(model.calls) == 4
     assert result["generated_token_count"] == 4
     assert result["stop_reason"] == "length"
+
+
+def test_generation_deadline_exposes_partial_tokens_without_changing_default_calls() -> None:
+    model = ScriptedModel([7, 8, EOS])
+    checks = 0
+
+    def check_deadline() -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 3:
+            raise TimeoutError("probe deadline reached")
+
+    with pytest.raises(GenerationDeadlineExceeded, match="probe deadline") as raised:
+        generate_answer(
+            model, torch.tensor([[1]]), "single", EOS, 6, check_deadline=check_deadline
+        )
+    assert raised.value.partial_result["token_ids"] == [7, 8]
+    assert len(model.calls) == 2
 
 
 def test_example_evaluation_persists_record_and_summary(tmp_path: Path) -> None:

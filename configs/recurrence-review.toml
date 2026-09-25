@@ -1,0 +1,10 @@
+[probe]
+source_run = "artifacts/recurrence-v0/129d39646933"
+source_revision = "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"
+output_dir = "artifacts/recurrence-review-v1/baseline-256"
+max_output_tokens = 256
+max_total_tokens = 512
+examples_per_family = 10
+seed = 9158
+deadline_seconds = 3600
+families = ["expressions", "lists", "graphs"]

@@ -8,7 +8,7 @@ chunk boundary can never create an accidental loss term.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 import json
 import math
 import numbers
@@ -73,6 +73,14 @@ _EXAMPLE_REASONS = frozenset(
 _MODES = frozenset({"single", "repeat", "damped"})
 
 
+class GenerationDeadlineExceeded(TimeoutError):
+    """Optional generation deadline, with tokens produced before expiry."""
+
+    def __init__(self, message: str, partial_result: Mapping[str, object]) -> None:
+        super().__init__(message)
+        self.partial_result = dict(partial_result)
+
+
 def generate_answer(
     model: object,
     input_ids: Tensor,
@@ -81,6 +89,7 @@ def generate_answer(
     max_new_tokens: int = 32,
     *,
     stop_on_eos: bool = True,
+    check_deadline: Callable[[], None] | None = None,
 ) -> dict[str, object]:
     """Greedily decode by recomputing the entire prefix at every step.
 
@@ -100,6 +109,8 @@ def generate_answer(
         raise ValueError("max_new_tokens must be a positive integer")
     if not isinstance(stop_on_eos, bool):
         raise TypeError("stop_on_eos must be a boolean")
+    if check_deadline is not None and not callable(check_deadline):
+        raise TypeError("check_deadline must be callable or None")
     if input_ids.shape[1] + max_new_tokens > 512:
         raise ValueError("generation would exceed the 512-token sequence limit")
 
@@ -111,6 +122,18 @@ def generate_answer(
     try:
         with torch.inference_mode():
             for _ in range(max_new_tokens):
+                if check_deadline is not None:
+                    try:
+                        check_deadline()
+                    except TimeoutError as error:
+                        partial = {
+                            "token_ids": list(generated),
+                            "completion_token_ids": list(generated),
+                            "stop_reason": "length",
+                            "generated_token_count": len(generated),
+                            "latency_seconds": max(0.0, time.perf_counter() - started),
+                        }
+                        raise GenerationDeadlineExceeded(str(error), partial) from error
                 # Do not pass use_cache, past_key_values, or any other cache
                 # argument.  The wrapper rejects those arguments explicitly.
                 output = model(prefix, mode)

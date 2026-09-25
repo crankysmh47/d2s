@@ -25,6 +25,16 @@ Exact sequential execution contract: [docs/superpowers/plans/2026-09-11-pretrain
 
 G4 seed-47 discovery, G5 seed-48/sealed confirmation, and any claim about adapted recurrence quality are **not evaluated**. The registered stop forbids retuning this run; a new benchmark or protocol needs a separately approved study.
 
+## Authorized follow-up: output-length and answer-review diagnostic
+
+Detailed bounded contract: [recurrence-review-plan.md](docs/recurrence-review-plan.md).
+
+- [x] Export editable Markdown `good/bad` review tables with validation and reviewer identity.
+- [x] Implement a separate 256-output-token baseline probe within 512 total tokens; keep V0 unchanged.
+- [ ] Test/review code and run one balanced 30-example development probe.
+- [ ] Have Luna grade a separate copy, explicitly as model review; retain a blank human copy.
+- [ ] Record evidence and decide whether a revised benchmark proposal is justified. No training yet.
+
 ## Deferred, not an execution queue
 
 Phase 1B clustering; sparse expert LoRA recovery; native-MoE diagnostics; MoE-to-dense merging; specialist assembly; adaptive loop selectors; quantization; cached loop deployment; custom pretraining. Offloading belongs to ExpertFlow. These do not start automatically if recurrence stops.
