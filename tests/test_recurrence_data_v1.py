@@ -3,7 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import replace
+import os
 from pathlib import Path
+import stat
+from types import SimpleNamespace
 
 import pytest
 
@@ -221,6 +224,74 @@ def test_freeze_refuses_existing_files_and_symlinks(tmp_path):
     else:
         with pytest.raises((FileExistsError, ValueError)):
             freeze_v1_split(link, [row], FakeTokenizer(), revision=config.model_revision, tokenizer_sha256="a" * 64)
+
+
+def test_freeze_cleans_both_new_files_when_manifest_fsync_fails(tmp_path, monkeypatch):
+    import ppmoe.recurrence.data_v1 as data_v1
+
+    config = load_v1_config(CONFIG)
+    row = replace(make_pilot(config, "expressions", 1, set())[0], split="dev")
+    path = tmp_path / "dev.jsonl"
+    manifest_path = Path(str(path) + ".manifest.json")
+    real_fsync = os.fsync
+    calls = 0
+
+    def fail_manifest_fsync(fd):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected manifest fsync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(data_v1.os, "fsync", fail_manifest_fsync)
+    with pytest.raises(OSError, match="injected manifest fsync failure"):
+        freeze_v1_split(
+            path, [row], FakeTokenizer(), revision=config.model_revision,
+            tokenizer_sha256="a" * 64,
+        )
+    assert calls == 2
+    assert not path.exists()
+    assert not manifest_path.exists()
+
+
+def test_freeze_preserves_preexisting_manifest_on_exclusive_create_failure(tmp_path):
+    config = load_v1_config(CONFIG)
+    row = replace(make_pilot(config, "expressions", 1, set())[0], split="dev")
+    path = tmp_path / "dev.jsonl"
+    manifest_path = Path(str(path) + ".manifest.json")
+    manifest_path.write_bytes(b"preexisting manifest")
+    with pytest.raises(FileExistsError):
+        freeze_v1_split(
+            path, [row], FakeTokenizer(), revision=config.model_revision,
+            tokenizer_sha256="a" * 64,
+        )
+    assert not path.exists()
+    assert manifest_path.read_bytes() == b"preexisting manifest"
+
+
+def test_freeze_rejects_reparse_point_in_existing_destination_ancestor(tmp_path, monkeypatch):
+    import ppmoe.recurrence.data_v1 as data_v1
+
+    config = load_v1_config(CONFIG)
+    row = replace(make_pilot(config, "expressions", 1, set())[0], split="dev")
+    ancestor = tmp_path / "reparse-ancestor"
+    ancestor.mkdir()
+    path = ancestor / "nested" / "dev.jsonl"
+    real_lstat = os.lstat
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+    def report_reparse(target, *args, **kwargs):
+        if Path(target) == ancestor:
+            return SimpleNamespace(st_mode=stat.S_IFDIR, st_file_attributes=reparse_flag)
+        return real_lstat(target, *args, **kwargs)
+
+    monkeypatch.setattr(data_v1.os, "lstat", report_reparse)
+    with pytest.raises(ValueError, match="symlink or reparse point"):
+        freeze_v1_split(
+            path, [row], FakeTokenizer(), revision=config.model_revision,
+            tokenizer_sha256="a" * 64,
+        )
+    assert not path.parent.exists()
 
 
 def test_freeze_rejects_wrong_split_duplicate_ids_and_inaccurate_rows(tmp_path):

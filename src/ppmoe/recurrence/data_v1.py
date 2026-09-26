@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import random
 import re
+import stat
 from typing import Mapping, Sequence
 
 from .config_v1 import V1Config
@@ -219,9 +220,9 @@ def freeze_v1_split(
     digest = sha256(raw).hexdigest()
     destination = Path(path)
     manifest_path = Path(str(destination) + ".manifest.json")
-    if destination.is_symlink() or manifest_path.is_symlink():
-        raise ValueError("split and manifest paths may not be symlinks")
+    _reject_reparse_ancestors(destination, manifest_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    _reject_reparse_ancestors(destination, manifest_path)
     manifest: dict[str, object] = {
         "schema_version": 1,
         "split": split,
@@ -235,24 +236,47 @@ def freeze_v1_split(
     }
     manifest_raw = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8") + b"\n"
     created_data = False
+    created_manifest = False
     try:
+        _reject_reparse_ancestors(destination, manifest_path)
         fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         created_data = True
         with os.fdopen(fd, "wb") as stream:
             stream.write(raw)
             stream.flush()
             os.fsync(stream.fileno())
+        _reject_reparse_ancestors(destination, manifest_path)
         fd = os.open(manifest_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        created_manifest = True
         with os.fdopen(fd, "wb") as stream:
             stream.write(manifest_raw)
             stream.flush()
             os.fsync(stream.fileno())
-    except FileExistsError:
-        if created_data:
-            destination.unlink(missing_ok=True)
-        raise
     except BaseException:
+        if created_manifest:
+            manifest_path.unlink(missing_ok=True)
         if created_data:
             destination.unlink(missing_ok=True)
         raise
     return manifest
+
+
+def _reject_reparse_ancestors(*targets: Path) -> None:
+    """Reject symlinks, junctions, and Windows reparse points along output paths."""
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    checked: set[Path] = set()
+    for target in targets:
+        absolute = Path(os.path.abspath(target))
+        chain = (*reversed(absolute.parents), absolute)
+        for ancestor in chain:
+            if ancestor in checked:
+                continue
+            checked.add(ancestor)
+            try:
+                metadata = os.lstat(ancestor)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(metadata.st_mode) or bool(
+                getattr(metadata, "st_file_attributes", 0) & reparse_flag
+            ):
+                raise ValueError(f"split output path contains a symlink or reparse point: {ancestor}")
