@@ -41,3 +41,24 @@ SHA256 of `src/ppmoe/recurrence/answer_v2.py`:
 `3fe4db3694a2e37d167eeeefe5a524c5d229d0a920b7595e016e44ec8e08b9ee`
 
 No unresolved Task 1 concerns. No GPU generation was run.
+
+## Reviewer fix round 1
+
+Fixed two issues reported against commit `3236861`:
+
+- Path candidates now have to be a complete standalone declarative sentence for the queried endpoints. The candidate must begin its sentence and contain no other clause before its sentence boundary; a question-mark ending is rejected. This rejects subordinate clauses and question/reversal phrasing without inferring an answer.
+- Graph answer candidates are now collected and resolved for absence or disagreement before the separate V1 explanation checker reads graph edges. Explanation contradictions remain available even when the answer candidates are invalid or ambiguous.
+
+TDD evidence: before the fix, `uv run pytest tests/test_recurrence_answer_v2.py -q` failed the two new nonconclusive-clause cases (both incorrectly parsed as `yes`) and the call-order regression (explanation assessment ran first). After the change, the focused scorer run passed.
+
+Verification for this fix:
+
+- `uv run pytest tests/test_recurrence_answer_v2.py tests/test_recurrence_answer_v1.py -q` — 43 passed.
+- `uv run pytest -q` — 814 passed, 3 skipped.
+- `uv run ruff check src/ppmoe/recurrence/answer_v2.py tests/test_recurrence_answer_v2.py` — passed.
+- `uv run python -m compileall -q src/ppmoe/recurrence/answer_v2.py` — passed.
+- `git diff --check` — passed.
+
+Updated `answer_v2.py` SHA256: `127d67489ba75b2c620257d79a9960b276d46ddd041e9ce2aae78b320e6c2b02`.
+
+No unresolved concerns from this fix round. No V0/V1 files or task-14 notes were changed, and no GPU generation was run.

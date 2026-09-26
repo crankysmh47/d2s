@@ -41,26 +41,29 @@ def score_completion_v2(
     if not isinstance(stop_reason, str) or stop_reason.casefold() != "eos":
         return _invalid(f"completion did not end with normal EOS (stop_reason={stop_reason!r})")
 
-    explanation_status, explanation_detail = answer_v1._assess_explanation(completion_text, example)
     candidates = _graph_candidates(completion_text, example)
+    parsed: str | None = None
+    candidate_failure: str | None = None
+    evidence: str | None = None
     if not candidates:
-        return _invalid(
-            "no explicit graph conclusion matches the queried endpoints",
-            explanation_status=explanation_status,
-            explanation_detail=explanation_detail,
-        )
+        candidate_failure = "no explicit graph conclusion matches the queried endpoints"
+    else:
+        values = {value for value, _span in candidates}
+        evidence = " | ".join(span for _value, span in candidates)
+        if len(values) != 1:
+            candidate_failure = "ambiguous disagreeing explicit graph conclusions"
+        else:
+            parsed = candidates[0][0]
 
-    values = {value for value, _span in candidates}
-    evidence = " | ".join(span for _value, span in candidates)
-    if len(values) != 1:
+    explanation_status, explanation_detail = answer_v1._assess_explanation(completion_text, example)
+    if candidate_failure is not None:
         return _invalid(
-            "ambiguous disagreeing explicit graph conclusions",
+            candidate_failure,
             evidence=evidence,
             explanation_status=explanation_status,
             explanation_detail=explanation_detail,
         )
 
-    parsed = candidates[0][0]
     expected = interpret(example.latent_spec, example.family)
     correct = parsed == expected
     return {
@@ -91,6 +94,20 @@ def _graph_candidates(text: str, example: Example) -> list[tuple[str, str]]:
     spec = example.latent_spec
     queried = str(spec["start"]).upper(), str(spec["end"]).upper()
     for match in _GRAPH_CONCLUSION.finditer(text):
+        preceding_boundaries = [text.rfind(mark, 0, match.start()) for mark in ".!?\n"]
+        sentence_start = max(preceding_boundaries) + 1
+        if text[sentence_start : match.start()].strip():
+            continue
+        following_boundaries = [
+            position
+            for mark in ".!?\n"
+            if (position := text.find(mark, match.end())) >= 0
+        ]
+        sentence_end = min(following_boundaries, default=len(text))
+        if text[sentence_end : sentence_end + 1] == "?":
+            continue
+        if text[match.end() : sentence_end].strip():
+            continue
         endpoints = _unmark(match.group("start")).upper(), _unmark(match.group("end")).upper()
         if endpoints != queried:
             continue

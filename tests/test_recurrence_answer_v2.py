@@ -58,6 +58,47 @@ def test_graph_extracts_bold_negative_path_conclusion(graph_example: Example) ->
     assert scored["reason_code"] == "wrong_value"
 
 
+@pytest.mark.parametrize(
+    "completion",
+    [
+        "Although there is a path from A to B, that is irrelevant.",
+        "There is a path from A to B? Actually, no.",
+    ],
+)
+def test_graph_rejects_nonconclusive_path_clauses(graph_example: Example, completion: str) -> None:
+    scored = _score(graph_example, completion)
+
+    assert scored["parsed_value"] is None
+    assert scored["correct"] is False
+    assert scored["reason_code"] == "invalid_format"
+
+
+def test_graph_resolves_answer_candidates_before_assessing_explanation(
+    graph_example: Example, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = importlib.import_module("ppmoe.recurrence.answer_v2")
+    original_candidates = module._graph_candidates
+    original_assessment = module.answer_v1._assess_explanation
+    calls: list[str] = []
+
+    def candidates(text: str, example: Example) -> list[tuple[str, str]]:
+        calls.append("candidates")
+        return original_candidates(text, example)
+
+    def assessment(text: str, example: Example) -> tuple[str, str]:
+        assert calls == ["candidates"]
+        calls.append("explanation")
+        return original_assessment(text, example)
+
+    monkeypatch.setattr(module, "_graph_candidates", candidates)
+    monkeypatch.setattr(module.answer_v1, "_assess_explanation", assessment)
+
+    scored = module.score_completion_v2(graph_example, "Yes", "eos")
+
+    assert scored["correct"] is True
+    assert calls == ["candidates", "explanation"]
+
+
 def test_graph_rejects_wrong_queried_endpoints_without_other_cue(graph_example: Example) -> None:
     scored = _score(graph_example, "There is a path from A to C.")
 
