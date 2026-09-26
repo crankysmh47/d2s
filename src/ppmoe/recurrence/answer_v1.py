@@ -53,12 +53,20 @@ def score_completion(
     else:
         raise ValueError(f"unknown recurrence answer family {example.family!r}")
 
+    if example.family == "graphs":
+        explanation_status, explanation_detail = _assess_explanation(completion_text, example)
+    else:
+        explanation_status, explanation_detail = "none", ""
     if failure is not None:
-        return _invalid(failure, evidence=evidence)
+        return _invalid(
+            failure,
+            evidence=evidence,
+            explanation_status=explanation_status,
+            explanation_detail=explanation_detail,
+        )
 
     expected = interpret(example.latent_spec, example.family)
     correct = parsed == expected
-    explanation_status, explanation_detail = _assess_explanation(completion_text, example)
     return {
         "parsed_value": parsed,
         "correct": bool(correct),
@@ -70,15 +78,21 @@ def score_completion(
     }
 
 
-def _invalid(detail: str, *, evidence: str | None = None) -> dict[str, object]:
+def _invalid(
+    detail: str,
+    *,
+    evidence: str | None = None,
+    explanation_status: str = "none",
+    explanation_detail: str = "",
+) -> dict[str, object]:
     return {
         "parsed_value": None,
         "correct": False,
         "reason_code": "invalid_format",
         "failure_detail": detail,
         "evidence_span": evidence,
-        "explanation_status": "none",
-        "explanation_detail": "",
+        "explanation_status": explanation_status,
+        "explanation_detail": explanation_detail,
     }
 
 
@@ -100,9 +114,13 @@ def _list_candidate(
     text: str, example: Example
 ) -> tuple[list[int] | None, str | None, str | None]:
     vectors: list[tuple[list[int], str]] = []
-    malformed = False
-    expected_length = len(interpret(example.latent_spec, "lists"))
-    for cue in _LIST_CUE.finditer(text):
+    cues = list(_LIST_CUE.finditer(text))
+    incomplete_cue = False
+    raw_input = example.latent_spec.get("input")
+    if not isinstance(raw_input, (list, tuple)):
+        return None, None, "list latent input is missing or malformed"
+    expected_length = len(raw_input)
+    for cue_index, cue in enumerate(cues):
         line_end = text.find("\n", cue.end())
         if line_end < 0:
             line_end = len(text)
@@ -112,17 +130,21 @@ def _list_candidate(
                 break
             next_end = text.find("\n", payload_end + 1)
             payload_end = len(text) if next_end < 0 else next_end
+        if cue_index + 1 < len(cues):
+            payload_end = min(payload_end, cues[cue_index + 1].start())
         payload = text[cue.start() : payload_end]
-        complete = list(_VECTOR.finditer(payload))
-        for match in complete:
+        match = _VECTOR.search(payload)
+        if match is not None:
             parsed = [int(value.strip()) for value in match.group(0)[1:-1].split(",")]
             vectors.append((parsed, match.group(0)))
-        if not complete and "[" in payload:
-            malformed = True
+        else:
+            incomplete_cue = True
 
     if not vectors:
-        detail = "final-answer cue has a malformed or incomplete vector" if malformed else "no complete integer vector follows a final-answer cue"
+        detail = "final-answer cue has a malformed or incomplete vector" if incomplete_cue else "no complete integer vector follows a final-answer cue"
         return None, None, detail
+    if incomplete_cue:
+        return None, " | ".join(span for _, span in vectors), "a final-answer cue has a malformed or incomplete vector"
     unique = {tuple(value) for value, _ in vectors}
     if len(unique) != 1:
         return None, " | ".join(span for _, span in vectors), "ambiguous distinct vectors follow final-answer cues"

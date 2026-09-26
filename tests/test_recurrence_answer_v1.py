@@ -120,6 +120,45 @@ def test_list_rejects_wrong_length_and_malformed_or_partial_vectors() -> None:
         assert result["reason_code"] == "invalid_format"
 
 
+def test_list_uses_first_complete_vector_within_each_cue_payload() -> None:
+    result = _score(
+        _list(),
+        "Final answer:\n[2, 3, 1]\nComparison with initial vector: [1, 2, 3]",
+    )
+
+    assert result["parsed_value"] == [2, 3, 1]
+    assert result["correct"] is True
+
+
+def test_distinct_vectors_under_separate_final_cues_are_ambiguous() -> None:
+    result = _score(_list(), "Final answer: [2, 3, 1]\nAnswer: [1, 2, 3]")
+
+    assert result["parsed_value"] is None
+    assert result["reason_code"] == "invalid_format"
+    assert "ambiguous" in str(result["failure_detail"])
+
+
+def test_malformed_later_list_cue_invalidates_earlier_complete_vector() -> None:
+    result = _score(_list(), "Final answer: [2, 3, 1]\nAnswer: [2, 3,")
+
+    assert result["parsed_value"] is None
+    assert result["reason_code"] == "invalid_format"
+    assert "malformed" in str(result["failure_detail"])
+
+
+def test_list_extraction_uses_input_length_before_interpreting_operations() -> None:
+    example = _example(
+        "lists",
+        {"input": [1, 2, 3], "ops": ["INVALID"]},
+        "unavailable",
+    )
+    result = _score(example, "Answer: [1, 2]")
+
+    assert result["parsed_value"] is None
+    assert result["reason_code"] == "invalid_format"
+    assert "expected 3" in str(result["failure_detail"])
+
+
 def test_length_cap_invalidates_previously_complete_looking_answer() -> None:
     result = _score(_expression(), "Final answer: \\boxed{6}", "length")
 
@@ -164,6 +203,20 @@ def test_graph_marks_invalid_claimed_path_contradicted_despite_correct_answer() 
     assert result["correct"] is True
     assert result["explanation_status"] == "contradicted"
     assert result["explanation_detail"]
+
+
+def test_graph_assesses_false_path_even_when_final_answer_is_ambiguous() -> None:
+    example = _example(
+        "graphs",
+        {"n": 4, "edges": ["A->B"], "start": "A", "end": "C"},
+        "no",
+    )
+    result = _score(example, "Yes. A path is A -> D -> C.\nAnswer: No")
+
+    assert result["parsed_value"] is None
+    assert result["reason_code"] == "invalid_format"
+    assert result["explanation_status"] == "contradicted"
+    assert "A->D" in str(result["explanation_detail"])
 
 
 def test_graph_verifies_wrapped_unicode_arrow_path_claim() -> None:
