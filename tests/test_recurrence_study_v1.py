@@ -308,13 +308,28 @@ def test_snapshot_allows_only_inventory_derived_huggingface_metadata(tmp_path: P
     snapshot.mkdir()
     listed = snapshot / "model.safetensors"
     listed.write_bytes(b"weights")
+    cache_root = snapshot / ".cache" / "huggingface"
+    (cache_root / "trees").mkdir(parents=True)
+    cache_files = {
+        ".cache/huggingface/.gitignore": b"*\n",
+        ".cache/huggingface/CACHEDIR.TAG": b"cache tag",
+        ".cache/huggingface/trees/revision.json": b"{}",
+    }
+    for relative, content in cache_files.items():
+        target = snapshot / Path(relative)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
     metadata_dir = snapshot / ".cache" / "huggingface" / "download"
     metadata_dir.mkdir(parents=True)
     (metadata_dir / "model.safetensors.metadata").write_bytes(b"etag\ncommit")
-    manifest = {"files": [{
+    manifest_files = [{
         "relative_path": "model.safetensors", "bytes": len(b"weights"),
         "sha256": hashlib.sha256(b"weights").hexdigest(),
-    }]}
+    }]
+    manifest_files.extend({
+        "relative_path": relative, "bytes": len(content), "sha256": hashlib.sha256(content).hexdigest(),
+    } for relative, content in cache_files.items())
+    manifest = {"files": manifest_files}
     _verify_snapshot(snapshot, manifest)
     (metadata_dir / "unlisted-config.json.metadata").write_bytes(b"unlisted")
     with pytest.raises(ValueError, match="inventory differs"):

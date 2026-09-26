@@ -199,7 +199,8 @@ def _verify_snapshot(snapshot: Path, source: Mapping[str, object]) -> None:
         expected_files[relative] = entry
         if isinstance(expected_size, bool) or not isinstance(expected_size, int) or not isinstance(expected_hash, str):
             raise ValueError(f"source file inventory metadata is invalid: {relative}")
-    metadata_names = [Path(relative).name + ".metadata" for relative in expected_files]
+    metadata_sources = [relative for relative in expected_files if not relative.startswith(".cache/")]
+    metadata_names = [Path(relative).name + ".metadata" for relative in metadata_sources]
     if len(set(metadata_names)) != len(metadata_names):
         raise ValueError("source inventory has ambiguous Hugging Face metadata basenames")
     metadata_directory = ".cache/huggingface/download"
