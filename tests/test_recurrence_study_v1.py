@@ -224,6 +224,10 @@ def test_prepare_verifies_train_dev_but_never_opens_v0_test(tmp_path: Path, monk
         {"relative_path": "tokenizer.json", "bytes": len(tokenizer_bytes), "sha256": hashlib.sha256(tokenizer_bytes).hexdigest()},
         {"relative_path": "weights.safetensors", "bytes": len(weights_bytes), "sha256": hashlib.sha256(weights_bytes).hexdigest()},
     ]
+    metadata_dir = snapshot / ".cache" / "huggingface" / "download"
+    metadata_dir.mkdir(parents=True)
+    for entry in files:
+        (metadata_dir / f"{Path(str(entry['relative_path'])).name}.metadata").write_bytes(b"etag\ncommit")
     source_manifest = {"repo_id": "Qwen/Qwen3-1.7B", "revision": revision, "model_class": "Qwen3ForCausalLM", "files": files}
     source_raw = canonical_json(source_manifest)
     (source_root / "source.json").write_bytes(source_raw)
@@ -289,6 +293,30 @@ def test_snapshot_rejects_unlisted_regular_files(tmp_path: Path) -> None:
         "relative_path": "weights.safetensors", "bytes": 6,
         "sha256": hashlib.sha256(b"listed").hexdigest(),
     }]}
+    metadata_dir = snapshot / ".cache" / "huggingface" / "download"
+    metadata_dir.mkdir(parents=True)
+    (metadata_dir / "weights.safetensors.metadata").write_bytes(b"metadata")
+    with pytest.raises(ValueError, match="inventory differs"):
+        _verify_snapshot(snapshot, manifest)
+
+
+def test_snapshot_allows_only_inventory_derived_huggingface_metadata(tmp_path: Path) -> None:
+    import hashlib
+    from ppmoe.recurrence.study_v1 import _verify_snapshot
+
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    listed = snapshot / "model.safetensors"
+    listed.write_bytes(b"weights")
+    metadata_dir = snapshot / ".cache" / "huggingface" / "download"
+    metadata_dir.mkdir(parents=True)
+    (metadata_dir / "model.safetensors.metadata").write_bytes(b"etag\ncommit")
+    manifest = {"files": [{
+        "relative_path": "model.safetensors", "bytes": len(b"weights"),
+        "sha256": hashlib.sha256(b"weights").hexdigest(),
+    }]}
+    _verify_snapshot(snapshot, manifest)
+    (metadata_dir / "unlisted-config.json.metadata").write_bytes(b"unlisted")
     with pytest.raises(ValueError, match="inventory differs"):
         _verify_snapshot(snapshot, manifest)
 
@@ -403,3 +431,16 @@ def test_cuda_budget_ledger_tampering_fails_closed(tmp_path: Path) -> None:
     ledger_path.write_bytes(ledger_path.read_bytes()[:-1])
     with pytest.raises(ValueError, match="integrity|truncated|anchor"):
         _load_cost_ledger(root, 86400.0)
+
+
+def test_failed_measured_model_load_is_charged_to_anchored_ledger(tmp_path: Path) -> None:
+    from ppmoe.recurrence.gates import CudaCostLedger
+    from ppmoe.recurrence.study_v1 import _record_phase_cost
+
+    root = tmp_path / "run"
+    (root / "resources").mkdir(parents=True)
+    ledger = CudaCostLedger.load(root / "resources" / "cuda-cost.jsonl", 86400.0)
+    _record_phase_cost(root, ledger, "failed-load", "calibration-model-load", 1.75, "failed_environment")
+    reloaded = CudaCostLedger.load(root / "resources" / "cuda-cost.jsonl", 86400.0)
+    assert reloaded.total_seconds == pytest.approx(1.75)
+    assert reloaded.entries[-1].outcome == "failed_environment"

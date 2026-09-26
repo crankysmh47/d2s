@@ -199,7 +199,13 @@ def _verify_snapshot(snapshot: Path, source: Mapping[str, object]) -> None:
         expected_files[relative] = entry
         if isinstance(expected_size, bool) or not isinstance(expected_size, int) or not isinstance(expected_hash, str):
             raise ValueError(f"source file inventory metadata is invalid: {relative}")
+    metadata_names = [Path(relative).name + ".metadata" for relative in expected_files]
+    if len(set(metadata_names)) != len(metadata_names):
+        raise ValueError("source inventory has ambiguous Hugging Face metadata basenames")
+    metadata_directory = ".cache/huggingface/download"
+    expected_metadata = {f"{metadata_directory}/{name}" for name in metadata_names}
     actual_files: set[str] = set()
+    actual_metadata: set[str] = set()
     for directory, dirs, files in os.walk(snapshot, followlinks=False):
         parent = Path(directory)
         for name in [*dirs, *files]:
@@ -213,10 +219,14 @@ def _verify_snapshot(snapshot: Path, source: Mapping[str, object]) -> None:
                 continue
             if not stat.S_ISREG(metadata.st_mode):
                 raise ValueError(f"model snapshot contains a non-regular file: {target}")
-            actual_files.add(target.relative_to(snapshot).as_posix())
-    if actual_files != set(expected_files):
-        extra = sorted(actual_files - set(expected_files))
-        missing = sorted(set(expected_files) - actual_files)
+            relative = target.relative_to(snapshot).as_posix()
+            if relative.startswith(metadata_directory + "/"):
+                actual_metadata.add(relative)
+            else:
+                actual_files.add(relative)
+    if actual_files != set(expected_files) or actual_metadata != expected_metadata:
+        extra = sorted((actual_files - set(expected_files)) | (actual_metadata - expected_metadata))
+        missing = sorted((set(expected_files) - actual_files) | (expected_metadata - actual_metadata))
         raise ValueError(f"snapshot file inventory differs from manifest (extra={extra[:1]}, missing={missing[:1]})")
     for relative, entry in expected_files.items():
         target = snapshot / Path(relative)
@@ -300,7 +310,7 @@ def _calibrate(root: Path, config: V1Config, config_path: Path, project_root: Pa
         try:
             model, tokenizer, model_load_seconds = _load_calibration_runtime_measured(snapshot, config.model_revision)
         except MeasuredPhaseFailure as error:
-            _complete_phase(root, phase_id, "calibration-model-load", error.cuda_active_seconds, "failed_environment")
+            _record_phase_cost(root, cost_ledger, phase_id, "calibration-model-load", error.cuda_active_seconds, "failed_environment")
             raise
         except Exception:
             _complete_phase(root, phase_id, "calibration-model-load", 0.0, "failed_environment")
@@ -863,6 +873,14 @@ def _complete_phase(
         "cuda_active_seconds": float(cuda_seconds), "outcome": outcome,
         "completed_utc": _utc_now(), **dict(evidence or {}),
     })
+
+
+def _record_phase_cost(
+    root: Path, ledger: CudaCostLedger, phase_id: str, stage: str,
+    cuda_seconds: float, outcome: str,
+) -> None:
+    ledger.record(phase_id, stage, cuda_seconds, outcome)
+    _complete_phase(root, phase_id, stage, cuda_seconds, outcome)
 
 
 def _utc_now() -> str:
