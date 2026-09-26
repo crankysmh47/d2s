@@ -108,7 +108,7 @@ definitions = "; ".join(OPERATION_DEFINITIONS[op] for op in dict.fromkeys(ops))
 
 **Files:** Extend `data_v2.py` and `tests/test_recurrence_data_v2.py`.
 
-- [ ] Write RED tests for six 30-row pilots and selected 300/600-row splits, exact family/difficulty/seed schedules, answer recomputation, graph label balance, alternating expression shape, list identity and adjacent-reverse rejection, 100-attempt failure, local PRNG isolation, and no overlap against supplied forbidden IDs or between produced splits. Compare each list `row.answer` with `json.dumps(interpret(row.latent_spec, "lists"), separators=(",", ":"))`. Run tests red.
+- [ ] Write RED tests for six 30-row pilots and selected 300/600-row splits, exact family/difficulty/seed schedules, graph label balance, alternating expression shape, list identity and adjacent-reverse rejection, 100-attempt failure, local PRNG isolation, and no overlap against supplied forbidden IDs or between produced splits. Use hand-computed fixed latents for answer tests—`[3,8]` with `ADD1` yields `[4,9]`, and graph `A->B` queried `A` to `B` yields `yes`. A whole-pilot cross-check against `interpret` may supplement but must not be the only answer assertion. Run tests red.
 - [ ] Implement V2 generator using V1 math helpers and `random.Random(seed)`, but V2 list prompts only. IDs remain `sha256_payload({"family":family,"latent_spec":latent})`. `make_selected_splits_v2` must accept a complete three-family choice map and consume/update a local `seen` set; it must not mutate the caller's set. Run focused tests green.
 
 ```python
@@ -117,7 +117,8 @@ def test_pilot_is_deterministic_and_disjoint(v2_config: V2Config) -> None:
     second = make_pilot_v2(v2_config, "lists", 1, set())
     assert first == second and len(first) == 30
     assert len({row.id for row in first}) == 30
-    assert all(row.answer == json.dumps(interpret(row.latent_spec, "lists"), separators=(",", ":")) for row in first)
+    assert all(row.family == "lists" and row.split == "pilot" for row in first)
+    assert all(row.prompt.startswith("Initial list:") for row in first)
 
 # Implementation shape: each call owns its random state and exclusion copy.
 rng = random.Random(config.data.pilot_seeds[family][candidate - 1])
@@ -157,12 +158,13 @@ forbidden_ids = v0_train_dev_ids | v1_pilot_ids
 - [ ] Write RED runtime tests with a tiny local Qwen model and tokenizer fixture: same rendered prompt/256/512 limits, greedy `mode="single"`, V2 scorer call, one fsynced JSONL row per ID, complete ordered-ID reconciliation, preserved partial rows on generation exception, no overwrite, and measured CUDA-active duration. Run focused tests red. Implement `score_v2_examples` using V1 `score_v1_examples` record schema and `generate_answer` semantics but importing V2 scorer. Include a CPU tiny-model test path; real production load still requires CUDA. Run green.
 
 ```python
-def test_v2_runtime_scores_graph_with_markdown_answer(tmp_path: Path, tiny_model, tokenizer, graph_example):
+def test_v2_runtime_scores_graph_with_markdown_answer(tmp_path: Path, controlled_model, tokenizer, graph_example):
     signatures = {"source": "a" * 64, "scorer": "b" * 64}
-    result = score_v2_examples(tiny_model, tokenizer, [graph_example], "single", tmp_path / "scores.jsonl", signatures)
+    result = score_v2_examples(controlled_model, tokenizer, [graph_example], "single", tmp_path / "scores.jsonl", signatures)
     rows = [json.loads(line) for line in (tmp_path / "scores.jsonl").read_text().splitlines()]
     assert result["validated_count"] == 1
-    assert rows[0]["scorer_fields"] == score_completion_v2(graph_example, rows[0]["completion_text"], rows[0]["stop_reason"])
+    assert rows[0]["completion_text"] == "**Answer: yes**"
+    assert rows[0]["reason_code"] == "correct" and rows[0]["parsed_value"] == "yes"
 
 # Implementation shape: durable raw row precedes aggregate publication.
 stream.write(canonical_json(record))
