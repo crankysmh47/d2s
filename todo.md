@@ -46,7 +46,13 @@ Design: [2026-09-26-recurrence-v1-design.md](docs/superpowers/specs/2026-09-26-r
 - [x] Seal the V1 terminal report and independently check pilot counts, hashes, and the absence of development/sealed/training artifacts. See [V1 calibration report](docs/recurrence-v1-calibration-report.md).
 - [ ] Frozen F0/F1/F2 controls, LoRA discovery, retention/timing, seed-48 confirmation, and sealed evaluation: **not run, and not authorized in this stopped V1 run**.
 
-Next research decision: whether to authorize a separately registered V2 benchmark/calibration protocol that fixes graph final-answer parsing without accepting conflicting answers and disambiguates list instructions. It must use fresh pilot seeds and preserve V1 as a no-go; V1 provides no recurrence-efficacy result.
+V1 provides no recurrence-efficacy result. Its no-go motivated the separately registered V2 design below; V1 remains sealed.
+
+## Recurrence V2: design review
+
+- [x] Approve the three-family measurement-repair direction in conversation.
+- [ ] Review the written [V2 design](docs/superpowers/specs/2026-09-26-recurrence-v2-design.md) before an implementation plan or code changes.
+- [ ] After spec approval, write and review the detailed implementation plan; then implement and advance only through passing V2 gates.
 
 ## Deferred, not an execution queue
 
