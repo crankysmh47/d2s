@@ -431,6 +431,7 @@ def _calibrate_v2(root: Path, config: V2Config, config_path: Path, project_root:
                 "run_id": payload["run_id"], "status": "stopped_scientific", "pilot_table": pilot_table,
                 "pilot_scores": score_manifest, "eligible_families": eligible_families,
                 "selected_difficulty": {}, "fallback_families": list(FAMILIES), "dev": None, "sealed": None,
+                "pilot_eligibility_state": "complete",
                 "resources": _v2_resource_summary(root, cost_ledger, config, started),
                 "signatures": signatures, "runtime_code_files": runtime_files, "next_stage": "report",
             }
@@ -478,6 +479,7 @@ def _calibrate_v2(root: Path, config: V2Config, config_path: Path, project_root:
             "run_id": payload["run_id"], "status": status, "pilot_table": pilot_table,
             "pilot_scores": score_manifest, "eligible_families": eligible_families,
             "selected_difficulty": choices, "fallback_families": fallback,
+            "pilot_eligibility_state": "complete",
             "dev": {**dev_entry, "scores": summary, "gate": gate}, "sealed": sealed_meta,
             "human_review": review, "resources": _v2_resource_summary(root, cost_ledger, config, started),
             "signatures": signatures, "runtime_code_files": runtime_files,
@@ -505,6 +507,7 @@ def _calibrate_v2(root: Path, config: V2Config, config_path: Path, project_root:
     failure_payload = {
         "run_id": payload["run_id"], "status": failure_status, "failure": failure,
         "pilot_table": pilot_table, "pilot_scores": score_manifest,
+        "pilot_eligibility_state": _pilot_eligibility_state(score_manifest),
         "dev": None, "sealed": None, "signatures": signatures, "runtime_code_files": runtime_files,
         "resources": _v2_resource_summary(root, cost_ledger, config, started), "next_stage": "report",
     }
@@ -698,6 +701,16 @@ def _finish_v2_calibration(root: Path, payload: Mapping[str, object], status: st
     return {**value, "run_id": value.get("run_id"), "status": status, "run_root": str(root), "stage_sha256": record["stage_sha256"], "next_stage": value.get("next_stage", "report")}
 
 
+def _pilot_eligibility_state(evidence: Mapping[str, object]) -> str:
+    """Eligibility is complete only after all six pilots have complete score files."""
+    for family in FAMILIES:
+        for candidate in (1, 2):
+            entry = evidence.get(f"pilot-{family}-c{candidate}")
+            if not isinstance(entry, Mapping) or entry.get("partial") is True or entry.get("score_sha256") is None:
+                return "incomplete"
+    return "complete"
+
+
 def _safe_v2_run_file(root: Path, relative: Path) -> Path:
     if relative.is_absolute() or ".." in relative.parts:
         raise ValueError("V2 run evidence path is unsafe")
@@ -826,6 +839,7 @@ def _recover_v2_interrupted(root: Path, prepare: Mapping[str, object], config: V
         "run_id": attempt_payload.get("run_id"), "status": "failed_environment",
         "failure": "process ended before calibration stage was durably completed",
         "pilot_scores": score_entries, "partial_failure": partial,
+        "pilot_eligibility_state": _pilot_eligibility_state(score_entries),
         "resources": {
             "calibration_cuda_active_seconds": _v2_calibration_seconds(ledger),
             "cuda_budget_state": "unknown_after_process_loss",
@@ -879,7 +893,8 @@ def _validate_v2_calibration_files(root: Path, payload: Mapping[str, object]) ->
             summary = summarize_exact_scores(rows)
             if isinstance(entry.get("summary"), Mapping) and summary != entry["summary"]:
                 raise ValueError(f"V2 score summary mismatch for {key}")
-            summaries[key] = summary
+            if entry.get("partial") is not True:
+                summaries[key] = summary
     partial = payload.get("partial_failure")
     if isinstance(partial, Mapping) and partial.get("path"):
         relative = Path(str(partial["path"]))
@@ -915,6 +930,11 @@ def _validate_v2_calibration_decisions(
     payload: Mapping[str, object], summaries: Mapping[str, Mapping[str, object]], status: str,
 ) -> None:
     """Recompute pilot choices and the development gate from authenticated raw scores."""
+    expected_pilot_keys = {f"pilot-{family}-c{candidate}" for family in FAMILIES for candidate in (1, 2)}
+    complete_pilots = expected_pilot_keys.issubset(summaries)
+    expected_eligibility_state = "complete" if complete_pilots else "incomplete"
+    if payload.get("pilot_eligibility_state") != expected_eligibility_state:
+        raise ValueError("V2 pilot eligibility state differs from authenticated complete pilot scores")
     pilot_rows: list[dict[str, object]] = []
     for family in FAMILIES:
         for candidate in (1, 2):
@@ -949,7 +969,6 @@ def _validate_v2_calibration_decisions(
             if any(recorded.get(field) != expected[field] for field in expected):
                 raise ValueError("V2 pilot eligibility or summary differs from authenticated raw scores")
 
-    expected_pilot_keys = {f"pilot-{family}-c{candidate}" for family in FAMILIES for candidate in (1, 2)}
     if status in {"passed", "stopped_scientific"} and not expected_pilot_keys.issubset(summaries):
         raise ValueError("scientific V2 decision requires all six authenticated pilot score summaries")
     if status in {"passed", "stopped_scientific"}:

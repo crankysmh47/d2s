@@ -690,6 +690,40 @@ def test_report_refuses_recovery_while_calibration_process_is_live(
     assert not (root / "stages/calibrate.json").exists()
 
 
+def test_report_authenticates_partial_pilot_rows_and_marks_eligibility_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ppmoe.recurrence.v2_runtime import ScoreExecutionError
+
+    root, _ = _enable_fake_calibration_sources(tmp_path, monkeypatch)
+    raw_row = {
+        "example_id": None, "family": "expressions", "correct": False,
+        "reason_code": "wrong_value",
+    }
+
+    def partial_score(_model, _tokenizer, examples, _mode, output_path, _signatures, **_kwargs):
+        raw_row["example_id"] = examples[0].id
+        encoded = canonical_json(raw_row)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(encoded)
+        raise ScoreExecutionError(
+            "injected failure after one durable row", row_count=1,
+            raw_sha256=hashlib.sha256(encoded).hexdigest(), cuda_active_seconds=0.0,
+        )
+
+    monkeypatch.setattr(study_v2, "score_v2_examples", partial_score)
+    calibrated = study_v2.run_v2_stage("calibrate", Path("configs/recurrence-v2.toml"), root)
+    assert calibrated["status"] == "failed_environment"
+    assert calibrated["pilot_scores"]["pilot-expressions-c1"]["partial"] is True
+    assert calibrated["pilot_scores"]["pilot-expressions-c1"]["score_count"] == 1
+
+    report = study_v2.run_v2_stage("report", Path("configs/recurrence-v2.toml"), root)
+    assert report["status"] == "failed_environment"
+    assert report["calibration"]["pilot_eligibility_state"] == "incomplete"
+    score_path = root / "scores/pilot-expressions-c1.jsonl"
+    assert [json.loads(line)["example_id"] for line in score_path.read_bytes().splitlines()] == [raw_row["example_id"]]
+
+
 def test_exhausted_calibration_cuda_budget_is_a_resource_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = replace(
         load_v2_config(Path("configs/recurrence-v2.toml")),
