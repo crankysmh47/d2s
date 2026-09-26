@@ -60,7 +60,7 @@ V1 provides no recurrence-efficacy result. Its no-go motivated the separately re
 
 Design: [answer-audit design](docs/superpowers/specs/2026-09-27-recurrence-answer-audit-design.md). Execution: [answer-audit plan](docs/superpowers/plans/2026-09-27-recurrence-answer-audit.md).
 
-- [ ] Authenticate the signed V2 development evidence and export gold-free answer packets.
+- [x] Authenticate the signed V2 development evidence and export gold-free answer packets.
 - [ ] Obtain separate Luna extraction reviews and reconcile them against deterministic answers.
 - [ ] Report parser misses versus wrong or incomplete answers; preserve V2's terminal stop.
 - [ ] Only if a bounded scorer repair is supported, freeze a separate V3 protocol before fresh model outputs. Training remains gated.
