@@ -12,7 +12,7 @@
 
 **Execution plan:** [2026-09-11-pretrained-recurrence-execution.md](docs/superpowers/plans/2026-09-11-pretrained-recurrence-execution.md). It expands this protocol into the only authorized sequential implementation and experiment order.
 
-**Status (2026-09-25):** V0 is implemented and reached the registered G3 benchmark-calibration stop in run `129d39646933`; no LoRA arms trained. Historical protocol below remains unchanged. The user authorized a separate [longer-output and editable answer-review diagnostic](docs/recurrence-review-plan.md), including explicitly identified Luna model review. That addendum is the current bounded execution queue, not permission to reopen V0 gates.
+**Status (2026-09-26):** V0 is implemented and reached the registered G3 benchmark-calibration stop in run `129d39646933`; no LoRA arms trained. Historical protocol below remains unchanged. The separate [longer-output and editable answer-review diagnostic](docs/recurrence-review-plan.md) is complete. The user has authorized the [V1 scorer, benchmark, and conditional adaptation study](docs/superpowers/specs/2026-09-26-recurrence-v1-design.md) under its [sequential execution contract](docs/superpowers/plans/2026-09-26-recurrence-v1-execution.md). V1 has separate artifacts and gates; it does not reopen V0.
 
 ## 1. Direction and document precedence
 

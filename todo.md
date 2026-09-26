@@ -1,6 +1,6 @@
 # Current work queue
 
-Updated 2026-09-25. Detailed requirements and stop rules: [plan.md](plan.md). This file is a summary, not permission to skip gates.
+Updated 2026-09-26. Historical V0 requirements and stop rules: [plan.md](plan.md). This file is a summary, not permission to skip gates.
 
 Exact sequential execution contract: [docs/superpowers/plans/2026-09-11-pretrained-recurrence-execution.md](docs/superpowers/plans/2026-09-11-pretrained-recurrence-execution.md). Continue automatically through passing gates; pause only for a genuinely human-only blocker.
 
@@ -36,6 +36,16 @@ Detailed bounded contract: [recurrence-review-plan.md](docs/recurrence-review-pl
 - [x] Record evidence: 24 EOS / 6 capped; Luna 18 good / 12 bad; strict parser 0/30. A fresh benchmark and revised gates are justified before training.
 
 The blank human sheet is [artifacts/recurrence-review-v1/baseline-256/human-review/review.md](artifacts/recurrence-review-v1/baseline-256/human-review/review.md). Edit only the last column. The model-graded comparison is in `luna-review/review.md`. No training has started; the registered V0 stop still applies.
+
+## Authorized V1 study: current execution queue
+
+Design: [2026-09-26-recurrence-v1-design.md](docs/superpowers/specs/2026-09-26-recurrence-v1-design.md). Detailed sequential contract: [2026-09-26-recurrence-v1-execution.md](docs/superpowers/plans/2026-09-26-recurrence-v1-execution.md). This is a new run; V0 remains terminal.
+
+- [ ] Freeze deterministic final-answer scoring and graph explanation audit; prove it on old answers and adversarial cases.
+- [ ] Generate two bounded difficulty pilots per family, select deterministically, and pass a fresh development informativeness gate.
+- [ ] Score F0/F1/F2 on the selected fresh development set and check resource evidence.
+- [ ] If gates pass, run paired A1/A2/A3 LoRA discovery, retention, and timing controls; stop on any no-go.
+- [ ] If discovery passes, run seed-48 confirmation and sealed evaluation, report and push the supported result.
 
 ## Deferred, not an execution queue
 
