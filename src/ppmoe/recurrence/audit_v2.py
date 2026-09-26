@@ -8,9 +8,10 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 from typing import Mapping
 
-from .data import FAMILIES
+from .data import FAMILIES, interpret
 from .provenance import canonical_json, sha256_payload
 from . import study_v2
 
@@ -25,6 +26,12 @@ DEFAULT_SEED = 927001
 _DEV_SPLIT = Path("data/dev.jsonl")
 _DEV_SIDECAR = Path("data/dev.jsonl.manifest.json")
 _DEV_SCORE = Path("scores/dev-f0.jsonl")
+_REVIEW_FIELDS = {
+    "audit_id", "family", "status", "claimed_value", "evidence_span", "reason",
+    "reviewer_id", "explanation_status", "explanation_note",
+}
+_REVIEW_STATUSES = {"conclusive", "ambiguous", "missing", "truncated"}
+_EXPLANATION_STATUSES = {"valid", "invalid", "indeterminate"}
 
 
 def verify_v2_audit_source(run_root: Path) -> dict[str, object]:
@@ -245,13 +252,311 @@ def export_v2_audit(run_root: Path, output_root: Path, seed: int = DEFAULT_SEED)
     return {"audit_id": audit_id, "output_root": str(destination)}
 
 
+def reconcile_v2_audit(run_root: Path, audit_root: Path) -> dict[str, object]:
+    """Validate blind reviews against authenticated V2 rows, then exclusively write diagnostics."""
+    source = verify_v2_audit_source(run_root)
+    root = Path(audit_root).resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("V2 audit root must be a directory")
+    source_root = Path(run_root).resolve(strict=True)
+    try:
+        root.relative_to(source_root)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("V2 audit root must be outside the read-only source run")
+
+    manifest_raw = (root / "manifest.json").read_bytes()
+    manifest = _parse_object(manifest_raw, "V2 audit manifest")
+    manifest, packets, source_ids = _authenticate_audit_export(source, root, manifest)
+
+    reviews: dict[str, list[dict[str, object]]] = {}
+    review_hashes: dict[str, str] = {}
+    for family in FAMILIES:
+        review_path = root / "reviews" / f"{family}-luna.jsonl"
+        try:
+            review_raw = review_path.read_bytes()
+        except OSError as error:
+            raise ValueError(f"missing V2 {family} review file") from error
+        review_hashes[family] = hashlib.sha256(review_raw).hexdigest()
+        review_rows = _parse_jsonl(review_raw, f"V2 {family} reviews")
+        reviews[family] = _validate_review_rows(family, review_rows, packets[family])
+    assigned_reviewers = {
+        family: str(reviews[family][0]["reviewer_id"])
+        for family in FAMILIES
+    }
+    if len(set(assigned_reviewers.values())) != len(FAMILIES):
+        raise ValueError("each family review must identify a distinct GPT-6 Luna reviewer")
+
+    dev_by_id = {str(row["id"]): row for row in _mapping_rows(source["dev_rows"], "authenticated dev rows")}
+    scores_by_id = {str(row["example_id"]): row for row in _mapping_rows(source["score_rows"], "authenticated score rows")}
+    counts_by_family = {
+        family: {key: 0 for key in ("correct", "wrong", "ambiguous", "missing", "truncated")}
+        for family in FAMILIES
+    }
+    explanation_counts = {key: 0 for key in sorted(_EXPLANATION_STATUSES)}
+    rows: list[dict[str, object]] = []
+    for family in FAMILIES:
+        review_by_id = {str(row["audit_id"]): row for row in reviews[family]}
+        for packet in packets[family]:
+            audit_id = packet["audit_id"]
+            review = review_by_id[audit_id]
+            source_id = source_ids[audit_id]
+            dev = dev_by_id[source_id]
+            score = scores_by_id[source_id]
+            expected = interpret(_mapping(dev.get("latent_spec"), "V2 latent specification"), family)
+            status = str(review["status"])
+            claimed = review["claimed_value"]
+            adjudication_required = bool(
+                status == "conclusive"
+                and not _claim_appears_in_response(claimed, family, packet["response"])
+            )
+            if status == "conclusive":
+                classification = "ambiguous" if adjudication_required else ("correct" if claimed == expected else "wrong")
+            else:
+                classification = status
+            counts_by_family[family][classification] += 1
+            if family == "graphs":
+                explanation_counts[str(review["explanation_status"])] += 1
+
+            reason_code = score.get("reason_code")
+            v2_parsed = score.get("parsed_value")
+            v2_correct = score.get("correct")
+            reviewer_v2_disagreement = bool(
+                status == "conclusive"
+                and not adjudication_required
+                and reason_code in {"correct", "wrong_value"}
+                and (claimed != v2_parsed or (claimed == expected) != (v2_correct is True))
+            )
+            parser_miss = bool(
+                status == "conclusive" and not adjudication_required
+                and claimed == expected and reason_code == "invalid_format"
+            )
+            rows.append({
+                "audit_id": audit_id,
+                "family": family,
+                "source_id": source_id,
+                "classification": classification,
+                "model_claim": {
+                    "status": status,
+                    "claimed_value": claimed,
+                    "evidence_span": review["evidence_span"],
+                    "reason": review["reason"],
+                    "reviewer_id": review["reviewer_id"],
+                    "explanation_status": review["explanation_status"],
+                    "explanation_note": review["explanation_note"],
+                },
+                "v2_reason_code": reason_code,
+                "v2_parsed_value": v2_parsed,
+                "v2_correct": v2_correct,
+                "v2_failure_detail": score.get("failure_detail"),
+                "reference_value": expected,
+                "adjudication_required": adjudication_required,
+                "reviewer_v2_disagreement": reviewer_v2_disagreement,
+                "parser_miss": parser_miss,
+            })
+
+    diagnostic: dict[str, object] = {
+        "schema_version": 1,
+        "audit_id": manifest["audit_id"],
+        "run_id": source["run_id"],
+        "source_hashes": source["hashes"],
+        "stage_hashes": source["stage_hashes"],
+        "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+        "packet_sha256": manifest["packet_sha256"],
+        "review_file_sha256": review_hashes,
+        "counts_by_family": counts_by_family,
+        "graph_explanation_counts": explanation_counts,
+        "rows": rows,
+    }
+    diagnostic_path = root / "diagnostic.json"
+    _write_exclusive(diagnostic_path, canonical_json(diagnostic))
+    return {
+        "audit_id": manifest["audit_id"],
+        "diagnostic_path": str(diagnostic_path),
+        "row_count": len(rows),
+        "counts_by_family": counts_by_family,
+    }
+
+
+def _authenticate_audit_export(
+    source: Mapping[str, object], root: Path, manifest: Mapping[str, object],
+) -> tuple[dict[str, object], dict[str, list[dict[str, str]]], dict[str, str]]:
+    expected_manifest_fields = {
+        "schema_version", "audit_id", "run_id", "seed", "source_hashes", "stage_hashes",
+        "audit_ids", "packet_sha256", "source_ids", "selection_reasons",
+    }
+    if set(manifest) != expected_manifest_fields:
+        raise ValueError("V2 audit manifest has unexpected or missing fields")
+    seed = manifest["seed"]
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("V2 audit manifest seed must be an integer")
+    audit_id = sha256_payload({
+        "schema_version": 1,
+        "run_id": source["run_id"],
+        "source_hashes": source["hashes"],
+        "stage_hashes": source["stage_hashes"],
+        "seed": seed,
+    })
+    if manifest.get("schema_version") != 1 or manifest.get("audit_id") != audit_id:
+        raise ValueError("V2 audit manifest identity does not match authenticated source hashes")
+    if manifest.get("run_id") != source.get("run_id"):
+        raise ValueError("V2 audit manifest run ID differs from the authenticated source")
+    if manifest.get("source_hashes") != source.get("hashes") or manifest.get("stage_hashes") != source.get("stage_hashes"):
+        raise ValueError("V2 audit manifest source hashes differ from authenticated V2 evidence")
+    if root.name != audit_id:
+        raise ValueError("V2 audit root name does not match its manifest identity")
+
+    selected = select_v2_audit_rows(source, seed)
+    packets: dict[str, list[dict[str, str]]] = {family: [] for family in FAMILIES}
+    for packet in selected:
+        packets[packet["family"]].append(packet)
+    expected_audit_ids = {family: [packet["audit_id"] for packet in packets[family]] for family in FAMILIES}
+    source_id_by_audit_id = {
+        hashlib.sha256(f"v2-audit:{row['id']}".encode("utf-8")).hexdigest()[:16]: str(row["id"])
+        for row in _mapping_rows(source["dev_rows"], "authenticated dev rows")
+    }
+    scores_by_id = {
+        str(score["example_id"]): score
+        for score in _mapping_rows(source["score_rows"], "authenticated score rows")
+    }
+    expected_source_ids: dict[str, str] = {}
+    expected_reasons: dict[str, str] = {}
+    for family in FAMILIES:
+        for packet in packets[family]:
+            source_id = source_id_by_audit_id[packet["audit_id"]]
+            expected_source_ids[packet["audit_id"]] = source_id
+            expected_reasons[packet["audit_id"]] = str(scores_by_id[source_id]["reason_code"])
+    expected_packet_hashes: dict[str, str] = {}
+    for family in FAMILIES:
+        raw = b"".join(canonical_json(packet) for packet in packets[family])
+        expected_packet_hashes[family] = hashlib.sha256(raw).hexdigest()
+        packet_path = root / "packets" / f"{family}.jsonl"
+        try:
+            packet_raw = packet_path.read_bytes()
+        except OSError as error:
+            raise ValueError(f"missing V2 {family} packet file") from error
+        if hashlib.sha256(packet_raw).hexdigest() != expected_packet_hashes[family] or packet_raw != raw:
+            raise ValueError(f"V2 {family} packet hash or content differs from authenticated selection")
+    expected_manifest = {
+        "schema_version": 1,
+        "audit_id": audit_id,
+        "run_id": source["run_id"],
+        "seed": seed,
+        "source_hashes": source["hashes"],
+        "stage_hashes": source["stage_hashes"],
+        "audit_ids": expected_audit_ids,
+        "packet_sha256": expected_packet_hashes,
+        "source_ids": expected_source_ids,
+        "selection_reasons": expected_reasons,
+    }
+    if dict(manifest) != expected_manifest:
+        raise ValueError("V2 audit manifest hashes, packet IDs, or selection mapping drifted")
+    return expected_manifest, packets, expected_source_ids
+
+
+def _validate_review_rows(
+    family: str, rows: list[dict[str, object]], packets: list[dict[str, str]],
+) -> list[dict[str, object]]:
+    packet_by_id = {packet["audit_id"]: packet for packet in packets}
+    if len(rows) != len(packet_by_id):
+        raise ValueError(f"V2 {family} review must contain each packet ID exactly once")
+    seen: set[str] = set()
+    reviewer_ids: set[str] = set()
+    for line_number, row in enumerate(rows, start=1):
+        if set(row) != _REVIEW_FIELDS:
+            raise ValueError(f"V2 {family} review row {line_number} must have exactly the required fields")
+        audit_id = _nonempty_string(row.get("audit_id"), f"V2 {family} review audit ID")
+        if audit_id not in packet_by_id:
+            raise ValueError(f"V2 {family} review contains an extra audit ID")
+        if audit_id in seen:
+            raise ValueError(f"V2 {family} review contains a duplicate audit ID")
+        seen.add(audit_id)
+        packet = packet_by_id[audit_id]
+        if row.get("family") != family or packet.get("family") != family:
+            raise ValueError(f"V2 {family} review row has the wrong family")
+        status = row.get("status")
+        if not isinstance(status, str) or status not in _REVIEW_STATUSES:
+            raise ValueError(f"V2 {family} review row has an invalid status")
+        reviewer_id = _nonempty_string(row.get("reviewer_id"), f"V2 {family} reviewer ID")
+        reviewer_id_folded = reviewer_id.casefold()
+        if "gpt-6" not in reviewer_id_folded or "luna" not in reviewer_id_folded or "human" in reviewer_id_folded:
+            raise ValueError(f"V2 {family} reviewer ID must identify a GPT-6 Luna model")
+        reviewer_ids.add(reviewer_id)
+        evidence_span = row.get("evidence_span")
+        reason = row.get("reason")
+        explanation_note = row.get("explanation_note")
+        if not isinstance(evidence_span, str) or len(evidence_span) > 1000:
+            raise ValueError(f"V2 {family} review evidence span must be short text")
+        if not isinstance(reason, str):
+            raise ValueError(f"V2 {family} review reason must be text")
+        if not isinstance(explanation_note, str):
+            raise ValueError(f"V2 {family} explanation note must be text")
+        claimed = row.get("claimed_value")
+        if status == "conclusive":
+            if family == "expressions" and (isinstance(claimed, bool) or not isinstance(claimed, int)):
+                raise ValueError("conclusive expression review must claim an integer")
+            if family == "lists" and (
+                not isinstance(claimed, list)
+                or any(isinstance(value, bool) or not isinstance(value, int) for value in claimed)
+            ):
+                raise ValueError("conclusive list review must claim a list of integers")
+            if family == "graphs" and (not isinstance(claimed, str) or claimed not in {"yes", "no"}):
+                raise ValueError("conclusive graph review must claim yes or no")
+            if not evidence_span or evidence_span not in packet["response"]:
+                raise ValueError("conclusive review evidence must be a substring of the response")
+        else:
+            if claimed is not None:
+                raise ValueError("nonconclusive review rows must have a null claimed value")
+            if not reason.strip() or len(reason) > 500:
+                raise ValueError("nonconclusive review rows require a short reason")
+        if packet["stop_reason"].casefold() != "eos" and status != "truncated":
+            raise ValueError("non-EOS V2 response must be marked truncated")
+        explanation_status = row.get("explanation_status")
+        if family == "graphs":
+            if (
+                not isinstance(explanation_status, str)
+                or explanation_status not in _EXPLANATION_STATUSES
+                or not explanation_note.strip()
+                or len(explanation_note) > 500
+            ):
+                raise ValueError("graph reviews require an explanation status and short note")
+        elif explanation_status != "not_applicable" or explanation_note != "":
+            raise ValueError("non-graph reviews require not_applicable with an empty note")
+    if seen != set(packet_by_id):
+        raise ValueError(f"V2 {family} review is missing packet IDs")
+    if len(reviewer_ids) != 1:
+        raise ValueError(f"V2 {family} review must identify one consistent reviewer")
+    return rows
+
+
+def _claim_appears_in_response(claimed: object, family: str, response: str) -> bool:
+    if family == "expressions":
+        pattern = rf"(?<![\w.+-]){re.escape(str(claimed))}(?![\w.+-])"
+        return re.search(pattern, response) is not None
+    if family == "lists":
+        assert isinstance(claimed, list)
+        members = r"\s*,\s*".join(re.escape(str(value)) for value in claimed)
+        pattern = rf"(?<!\w)\[\s*{members}\s*\](?!\w)"
+        return re.search(pattern, response) is not None
+    return re.search(rf"(?<!\w){re.escape(str(claimed))}(?!\w)", response, re.IGNORECASE) is not None
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Export a blind audit packet from authenticated V2 development evidence")
-    parser.add_argument("--stage", required=True, choices=("export",))
+    parser = argparse.ArgumentParser(description="Export or reconcile a blind audit of authenticated V2 development evidence")
+    parser.add_argument("--stage", required=True, choices=("export", "reconcile"))
     parser.add_argument("--run-root", required=True, type=Path)
-    parser.add_argument("--output-root", required=True, type=Path)
+    parser.add_argument("--output-root", type=Path)
+    parser.add_argument("--audit-root", type=Path)
     args = parser.parse_args(argv)
-    result = export_v2_audit(args.run_root, args.output_root)
+    if args.stage == "export":
+        if args.output_root is None or args.audit_root is not None:
+            parser.error("--stage export requires --output-root and does not accept --audit-root")
+        result = export_v2_audit(args.run_root, args.output_root)
+    else:
+        if args.audit_root is None or args.output_root is not None:
+            parser.error("--stage reconcile requires --audit-root and does not accept --output-root")
+        result = reconcile_v2_audit(args.run_root, args.audit_root)
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     return 0
 

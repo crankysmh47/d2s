@@ -44,24 +44,38 @@ def audit_run(
     for family in FAMILIES:
         for index in range(100):
             example_id = f"{family}-{index:03d}"
+            latent_spec, expected = _fixture_answer(family, index)
             dev_rows.append({
                 "id": example_id,
                 "family": family,
                 "split": "dev",
                 "prompt": f"Question for {example_id}?",
-                "answer": index,
-                "latent_spec": {"answer": index},
+                "answer": expected,
+                "latent_spec": latent_spec,
                 "structure_id": f"structure-{example_id}",
             })
             reason = "invalid_format" if index < 31 else ("wrong_value" if index < 61 else "correct")
+            if reason == "invalid_format":
+                completion_text, parsed_value = f"Final answer: {_fixture_render(expected)}", None
+                if family == "lists" and index == 0:
+                    completion_text = "Final list: [0,1]"
+                if family == "expressions" and index == 1:
+                    completion_text = "Final answer: 2\nFinal answer: 3"
+            elif reason == "wrong_value":
+                wrong_value = _fixture_wrong_value(family, expected)
+                completion_text, parsed_value = f"Final answer: {_fixture_render(wrong_value)}", wrong_value
+            else:
+                completion_text, parsed_value = f"Final answer: {_fixture_render(expected)}", expected
+                if family == "expressions" and index == 68:
+                    completion_text = "Intermediate result: 70\nFinal answer: 69"
             score_rows.append({
                 "example_id": example_id,
                 "family": family,
-                "completion_text": f"Final answer: {index}",
-                "stop_reason": "eos",
+                "completion_text": completion_text,
+                "stop_reason": "length" if family == "expressions" and index == 0 else "eos",
                 "reason_code": reason,
                 "correct": reason == "correct",
-                "parsed_value": index,
+                "parsed_value": parsed_value,
             })
     split_raw = b"".join(canonical_json(row) for row in dev_rows)
     score_raw = b"".join(canonical_json(row) for row in score_rows)
@@ -116,6 +130,74 @@ def _api():
     from ppmoe.recurrence import audit_v2
 
     return audit_v2
+
+
+def _fixture_answer(family: str, index: int) -> tuple[dict[str, object], object]:
+    if family == "expressions":
+        return {"leaves": [index, 1], "operators": ["+"], "shape": "chain"}, index + 1
+    if family == "lists":
+        values = [index % 10, (index + 1) % 10]
+        return {"input": values, "ops": []}, values
+    edges = ["A->B"] if index % 2 == 0 else ["A->B", "B->C"]
+    return {"n": 3, "edges": edges, "start": "A", "end": "C"}, "yes" if index % 2 else "no"
+
+
+def _fixture_render(value: object) -> str:
+    return json.dumps(value, separators=(",", ":")) if isinstance(value, list) else str(value)
+
+
+def _fixture_wrong_value(family: str, expected: object) -> object:
+    if family == "expressions":
+        return int(expected) + 1
+    if family == "lists":
+        assert isinstance(expected, list)
+        return [(int(expected[0]) + 1) % 10, expected[1]]
+    return "no" if expected == "yes" else "yes"
+
+
+def _write_review_files(
+    audit_root: Path,
+    *,
+    overrides: dict[str, dict[str, object]] | None = None,
+) -> dict[str, list[dict[str, object]]]:
+    manifest = json.loads((audit_root / "manifest.json").read_bytes())
+    overrides = overrides or {}
+    reviews: dict[str, list[dict[str, object]]] = {}
+    for family in FAMILIES:
+        packet_path = audit_root / f"packets/{family}.jsonl"
+        packets = [json.loads(line) for line in packet_path.read_bytes().splitlines()]
+        rows: list[dict[str, object]] = []
+        for packet in packets:
+            source_id = manifest["source_ids"][packet["audit_id"]]
+            value = _fixture_answer(family, int(source_id.rsplit("-", 1)[1]))[1]
+            claim_value = value
+            if manifest["selection_reasons"][packet["audit_id"]] == "wrong_value":
+                claim_value = _fixture_wrong_value(family, value)
+            rendered = _fixture_render(claim_value)
+            row: dict[str, object] = {
+                "audit_id": packet["audit_id"],
+                "family": family,
+                "status": "conclusive" if packet["stop_reason"].casefold() == "eos" else "truncated",
+                "claimed_value": claim_value if packet["stop_reason"].casefold() == "eos" else None,
+                "evidence_span": rendered if packet["stop_reason"].casefold() == "eos" else "",
+                "reason": "" if packet["stop_reason"].casefold() == "eos" else "The completion did not end with EOS.",
+                "reviewer_id": f"gpt-6-luna-{family}",
+                "explanation_status": "indeterminate" if family == "graphs" else "not_applicable",
+                "explanation_note": "No rationale was offered." if family == "graphs" else "",
+            }
+            row.update(overrides.get(packet["audit_id"], {}))
+            rows.append(row)
+        reviews[family] = rows
+        review_path = audit_root / f"reviews/{family}-luna.jsonl"
+        review_path.parent.mkdir(exist_ok=True)
+        review_path.write_bytes(b"".join(canonical_json(row) for row in rows))
+    return reviews
+
+
+def _export_fixture_audit(audit_run, tmp_path: Path) -> Path:
+    source_root, _, _ = audit_run
+    result = _api().export_v2_audit(source_root, tmp_path / "audit")
+    return Path(result["output_root"])
 
 
 def _trust_fixture_stage_bytes(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -370,3 +452,181 @@ def test_cli_export_prints_compact_json(audit_run, tmp_path: Path, capsys: pytes
     assert " " not in printed.strip()
     result_payload = json.loads(printed)
     assert result_payload["output_root"] == str(output / result_payload["audit_id"])
+
+
+def _source_audit_id(audit_root: Path, source_id: str) -> str:
+    manifest = json.loads((audit_root / "manifest.json").read_bytes())
+    return next(audit_id for audit_id, original_id in manifest["source_ids"].items() if original_id == source_id)
+
+
+def _replace_review_row(audit_root: Path, family: str, audit_id: str, changes: dict[str, object]) -> None:
+    path = audit_root / f"reviews/{family}-luna.jsonl"
+    rows = [json.loads(line) for line in path.read_bytes().splitlines()]
+    for row in rows:
+        if row["audit_id"] == audit_id:
+            row.update(changes)
+            break
+    else:
+        raise AssertionError(f"review row {audit_id} was not found")
+    path.write_bytes(b"".join(canonical_json(row) for row in rows))
+
+
+def test_reconcile_preserves_wrong_reviewer_claim_and_flags_v2_disagreement(audit_run, tmp_path: Path) -> None:
+    audit_root = _export_fixture_audit(audit_run, tmp_path)
+    _write_review_files(audit_root)
+    audit_id = _source_audit_id(audit_root, "expressions-068")
+    _replace_review_row(audit_root, "expressions", audit_id, {
+        "claimed_value": 70, "evidence_span": "70", "reason": "",
+    })
+
+    score_path = audit_run[0] / "scores/dev-f0.jsonl"
+    score_bytes = score_path.read_bytes()
+    review_bytes = (audit_root / "reviews/expressions-luna.jsonl").read_bytes()
+    result = _api().reconcile_v2_audit(audit_run[0], audit_root)
+
+    diagnostic = json.loads(Path(result["diagnostic_path"]).read_bytes())
+    row = next(item for item in diagnostic["rows"] if item["audit_id"] == audit_id)
+    assert row["model_claim"]["claimed_value"] == 70
+    assert row["classification"] == "wrong"
+    assert row["reviewer_v2_disagreement"] is True
+    assert row["v2_reason_code"] == "correct"
+    assert row["v2_parsed_value"] == 69
+    assert score_path.read_bytes() == score_bytes
+    assert (audit_root / "reviews/expressions-luna.jsonl").read_bytes() == review_bytes
+    assert diagnostic["review_file_sha256"]["expressions"] == hashlib.sha256(review_bytes).hexdigest()
+    assert set(diagnostic["counts_by_family"]["expressions"]) == {
+        "correct", "wrong", "ambiguous", "missing", "truncated",
+    }
+
+
+def test_reconcile_sends_unsubstantiated_claim_to_adjudication(audit_run, tmp_path: Path) -> None:
+    audit_root = _export_fixture_audit(audit_run, tmp_path)
+    _write_review_files(audit_root)
+    audit_id = _source_audit_id(audit_root, "expressions-068")
+    _replace_review_row(audit_root, "expressions", audit_id, {"claimed_value": 999})
+
+    result = _api().reconcile_v2_audit(audit_run[0], audit_root)
+
+    diagnostic = json.loads(Path(result["diagnostic_path"]).read_bytes())
+    row = next(item for item in diagnostic["rows"] if item["audit_id"] == audit_id)
+    assert row["model_claim"]["claimed_value"] == 999
+    assert row["adjudication_required"] is True
+    assert row["classification"] == "ambiguous"
+    assert diagnostic["counts_by_family"]["expressions"]["ambiguous"] == 1
+
+
+def test_reconcile_classifies_correct_final_list_as_parser_miss(audit_run, tmp_path: Path) -> None:
+    audit_root = _export_fixture_audit(audit_run, tmp_path)
+    source_id = "lists-000"
+    score_path = audit_run[0] / "scores/dev-f0.jsonl"
+    score_rows = [json.loads(line) for line in score_path.read_bytes().splitlines()]
+    # The export fixture's invalid_format score models V2 missing the Final list cue.
+    assert next(row for row in score_rows if row["example_id"] == source_id)["reason_code"] == "invalid_format"
+    _write_review_files(audit_root)
+    packets = [json.loads(line) for line in (audit_root / "packets/lists.jsonl").read_bytes().splitlines()]
+    assert next(packet for packet in packets if packet["audit_id"] == _source_audit_id(audit_root, source_id))["response"] == "Final list: [0,1]"
+    audit_id = _source_audit_id(audit_root, source_id)
+    _replace_review_row(audit_root, "lists", audit_id, {
+        "evidence_span": "[0,1]",
+    })
+
+    result = _api().reconcile_v2_audit(audit_run[0], audit_root)
+
+    diagnostic = json.loads(Path(result["diagnostic_path"]).read_bytes())
+    row = next(item for item in diagnostic["rows"] if item["audit_id"] == audit_id)
+    assert row["model_claim"]["claimed_value"] == [0, 1]
+    assert row["classification"] == "correct"
+    assert row["parser_miss"] is True
+    assert row["reviewer_v2_disagreement"] is False
+
+
+def test_reconcile_keeps_explicit_conflicting_cues_ambiguous(audit_run, tmp_path: Path) -> None:
+    audit_root = _export_fixture_audit(audit_run, tmp_path)
+    _write_review_files(audit_root)
+    audit_id = _source_audit_id(audit_root, "expressions-001")
+    _replace_review_row(audit_root, "expressions", audit_id, {
+        "status": "ambiguous", "claimed_value": None, "evidence_span": "Final answer: 2",
+        "reason": "The response gives two conflicting final values.",
+    })
+
+    result = _api().reconcile_v2_audit(audit_run[0], audit_root)
+
+    diagnostic = json.loads(Path(result["diagnostic_path"]).read_bytes())
+    row = next(item for item in diagnostic["rows"] if item["audit_id"] == audit_id)
+    assert row["classification"] == "ambiguous"
+    assert row["model_claim"]["claimed_value"] is None
+    assert diagnostic["counts_by_family"]["expressions"]["ambiguous"] == 1
+    packets = [json.loads(line) for line in (audit_root / "packets/expressions.jsonl").read_bytes().splitlines()]
+    assert next(packet for packet in packets if packet["audit_id"] == audit_id)["response"] == "Final answer: 2\nFinal answer: 3"
+
+
+def test_reconcile_validates_all_reviews_before_exclusive_diagnostic_write(audit_run, tmp_path: Path) -> None:
+    audit_root = _export_fixture_audit(audit_run, tmp_path)
+    _write_review_files(audit_root)
+    review_path = audit_root / "reviews/graphs-luna.jsonl"
+    original = [json.loads(line) for line in review_path.read_bytes().splitlines()]
+    original[0]["unrecognized"] = "extra field"
+    review_path.write_bytes(b"".join(canonical_json(row) for row in original))
+    before = {path: path.read_bytes() for path in (audit_root / "reviews").glob("*.jsonl")}
+
+    with pytest.raises(ValueError, match="exactly|field"):
+        _api().reconcile_v2_audit(audit_run[0], audit_root)
+
+    assert not (audit_root / "diagnostic.json").exists()
+    assert before == {path: path.read_bytes() for path in (audit_root / "reviews").glob("*.jsonl")}
+
+
+@pytest.mark.parametrize("malformation", [
+    "missing_id", "duplicate_id", "extra_id", "wrong_family", "invalid_status", "unhashable_status",
+    "wrong_expression_type", "false_eos_conclusive", "bad_graph_explanation", "human_reviewer",
+])
+def test_reconcile_rejects_malformed_review_rows_before_writing(audit_run, tmp_path: Path, malformation: str) -> None:
+    audit_root = _export_fixture_audit(audit_run, tmp_path)
+    reviews = _write_review_files(audit_root)
+    rows = reviews["expressions"]
+    if malformation == "missing_id":
+        rows.pop()
+    elif malformation == "duplicate_id":
+        rows[1]["audit_id"] = rows[0]["audit_id"]
+    elif malformation == "extra_id":
+        rows[0]["audit_id"] = "not-in-packet"
+    elif malformation == "wrong_family":
+        rows[0]["family"] = "lists"
+    elif malformation == "invalid_status":
+        rows[0]["status"] = "certain"
+    elif malformation == "unhashable_status":
+        rows[1]["status"] = ["conclusive"]
+    elif malformation == "wrong_expression_type":
+        rows[1]["claimed_value"] = True
+    elif malformation == "false_eos_conclusive":
+        rows[0].update({"status": "conclusive", "claimed_value": 1, "evidence_span": "1", "reason": ""})
+    elif malformation == "bad_graph_explanation":
+        rows = reviews["graphs"]
+        rows[0]["explanation_status"] = "not_applicable"
+    else:
+        rows[0]["reviewer_id"] = "human-reviewer-1"
+    if malformation in {"missing_id", "duplicate_id", "extra_id", "wrong_family", "invalid_status", "unhashable_status", "wrong_expression_type", "false_eos_conclusive", "human_reviewer"}:
+        (audit_root / "reviews/expressions-luna.jsonl").write_bytes(b"".join(canonical_json(row) for row in rows))
+    else:
+        (audit_root / "reviews/graphs-luna.jsonl").write_bytes(b"".join(canonical_json(row) for row in rows))
+
+    with pytest.raises(ValueError):
+        _api().reconcile_v2_audit(audit_run[0], audit_root)
+    assert not (audit_root / "diagnostic.json").exists()
+
+
+def test_reconcile_rejects_packet_hash_drift_and_cli_prints_compact_json(audit_run, tmp_path: Path, capsys) -> None:
+    audit_root = _export_fixture_audit(audit_run, tmp_path)
+    _write_review_files(audit_root)
+    packet_path = audit_root / "packets/lists.jsonl"
+    packet_path.write_bytes(packet_path.read_bytes() + b" ")
+    with pytest.raises(ValueError, match="packet.*hash|hash.*packet"):
+        _api().reconcile_v2_audit(audit_run[0], audit_root)
+    assert not (audit_root / "diagnostic.json").exists()
+
+    packet_path.write_bytes(packet_path.read_bytes()[:-1])
+    result = _api().main(["--stage", "reconcile", "--run-root", str(audit_run[0]), "--audit-root", str(audit_root)])
+    printed = capsys.readouterr().out
+    assert result == 0
+    assert " " not in printed.strip()
+    assert json.loads(printed)["diagnostic_path"] == str(audit_root / "diagnostic.json")
