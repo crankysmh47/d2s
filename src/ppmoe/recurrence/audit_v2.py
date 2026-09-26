@@ -32,6 +32,21 @@ _REVIEW_FIELDS = {
 }
 _REVIEW_STATUSES = {"conclusive", "ambiguous", "missing", "truncated"}
 _EXPLANATION_STATUSES = {"valid", "invalid", "indeterminate"}
+_AUDIT_FINAL_CUE = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]*)?(?:[*_]{1,3})?(?:Final[ \t]+(?:answer|result|list)|Answer|"
+    r"So[ \t]+the[ \t]+final[ \t]+answer[ \t]+is)\b(?:[*_]{1,3})?[ \t]*:?[ \t]*",
+    re.IGNORECASE | re.MULTILINE,
+)
+_AUDIT_BOXED_INTEGER = re.compile(r"^\\boxed\s*\{\s*([+-]?\d+)\s*\}")
+_AUDIT_BARE_INTEGER = re.compile(r"^(?:is\b[ \t]*)?(?:=[ \t]*)?([+-]?\d+)(?![\w+-]|\.\d)", re.IGNORECASE)
+_AUDIT_VECTOR = re.compile(r"^\[\s*[+-]?\d+(?:\s*,\s*[+-]?\d+)*\s*\]")
+_AUDIT_GRAPH_VALUE = re.compile(r"^(?:is\b[ \t]*)?(yes|no)\b", re.IGNORECASE)
+_AUDIT_GRAPH_LEADING = re.compile(r"^[ \t]*(yes|no)\s*\.", re.IGNORECASE)
+_AUDIT_GRAPH_CONCLUSION = re.compile(
+    r"\bthere\s+is\s+(?P<negative>no\s+)?(?:(?:direct(?:\s+or\s+indirect)?|indirect)\s+)?path\s+"
+    r"from\s+[A-Z]\s+to\s+[A-Z]\b",
+    re.IGNORECASE,
+)
 
 
 def verify_v2_audit_source(run_root: Path) -> dict[str, object]:
@@ -269,6 +284,8 @@ def reconcile_v2_audit(run_root: Path, audit_root: Path) -> dict[str, object]:
     manifest_raw = (root / "manifest.json").read_bytes()
     manifest = _parse_object(manifest_raw, "V2 audit manifest")
     manifest, packets, source_ids = _authenticate_audit_export(source, root, manifest)
+    if canonical_json(manifest) != manifest_raw:
+        raise ValueError("V2 audit manifest bytes are not canonical")
 
     reviews: dict[str, list[dict[str, object]]] = {}
     review_hashes: dict[str, str] = {}
@@ -309,7 +326,7 @@ def reconcile_v2_audit(run_root: Path, audit_root: Path) -> dict[str, object]:
             claimed = review["claimed_value"]
             adjudication_required = bool(
                 status == "conclusive"
-                and not _claim_appears_in_response(claimed, family, packet["response"])
+                and not _claim_has_final_evidence(claimed, family, review["evidence_span"], packet["response"])
             )
             if status == "conclusive":
                 classification = "ambiguous" if adjudication_required else ("correct" if claimed == expected else "wrong")
@@ -530,16 +547,62 @@ def _validate_review_rows(
     return rows
 
 
-def _claim_appears_in_response(claimed: object, family: str, response: str) -> bool:
-    if family == "expressions":
-        pattern = rf"(?<![\w.+-]){re.escape(str(claimed))}(?![\w.+-])"
-        return re.search(pattern, response) is not None
+def _claim_has_final_evidence(claimed: object, family: str, evidence: str, response: str) -> bool:
+    evidence_values, evidence_complete = _final_assertions(evidence, family)
+    response_values, response_complete = _final_assertions(response, family)
+    if not evidence_complete or not response_complete or not evidence_values or not response_values:
+        return False
+    if not all(_same_answer(value, claimed, family) for value in evidence_values):
+        return False
+    if not all(_same_answer(value, claimed, family) for value in response_values):
+        return False
+    return True
+
+
+def _final_assertions(text: str, family: str) -> tuple[list[object], bool]:
+    values: list[object] = []
+    complete = True
+    matches = list(_AUDIT_FINAL_CUE.finditer(text))
+    for index, cue in enumerate(matches):
+        window_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        payload = text[cue.end() : min(window_end, cue.end() + 256)].lstrip()
+        if family == "expressions":
+            boxed = _AUDIT_BOXED_INTEGER.match(payload)
+            bare = _AUDIT_BARE_INTEGER.match(payload)
+            match = boxed or bare
+            if match is None:
+                complete = False
+            else:
+                values.append(int(match.group(1)))
+        elif family == "lists":
+            match = _AUDIT_VECTOR.match(payload)
+            if match is None:
+                complete = False
+            else:
+                values.append([int(part.strip()) for part in match.group(0)[1:-1].split(",")])
+        else:
+            match = _AUDIT_GRAPH_VALUE.match(payload)
+            if match is None:
+                complete = False
+            else:
+                values.append(match.group(1).casefold())
+
+    if family == "graphs":
+        first_line = next((line for line in text.splitlines() if line.strip()), "")
+        leading = _AUDIT_GRAPH_LEADING.match(first_line)
+        if leading is not None:
+            values.append(leading.group(1).casefold())
+        values.extend(
+            "no" if match.group("negative") else "yes"
+            for match in _AUDIT_GRAPH_CONCLUSION.finditer(text)
+        )
+    return values, complete
+
+
+def _same_answer(left: object, right: object, family: str) -> bool:
     if family == "lists":
-        assert isinstance(claimed, list)
-        members = r"\s*,\s*".join(re.escape(str(value)) for value in claimed)
-        pattern = rf"(?<!\w)\[\s*{members}\s*\](?!\w)"
-        return re.search(pattern, response) is not None
-    return re.search(rf"(?<!\w){re.escape(str(claimed))}(?!\w)", response, re.IGNORECASE) is not None
+        return isinstance(left, list) and isinstance(right, list) and left == right
+    return left == right
 
 
 def main(argv: list[str] | None = None) -> int:
