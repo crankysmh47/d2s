@@ -3,8 +3,11 @@ from __future__ import annotations
 from dataclasses import replace
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import random
+import stat
+from types import SimpleNamespace
 
 import pytest
 
@@ -434,6 +437,24 @@ def test_freeze_requires_immutable_tokenizer_provenance(tmp_path, revision, toke
     assert not Path(str(path) + ".manifest.json").exists()
 
 
+def test_freeze_rejects_a_different_but_immutable_tokenizer_revision(tmp_path) -> None:
+    config = load_v2_config(CONFIG)
+    row = make_pilot_v2(config, "expressions", 1, set())[0]
+    path = tmp_path / "wrong-revision.jsonl"
+
+    with pytest.raises(ValueError, match="registered tokenizer revision"):
+        freeze_v2_split(
+            path,
+            [row],
+            FakeTokenizer(),
+            revision="a" * 40,
+            tokenizer_sha256="a" * 64,
+        )
+
+    assert not path.exists()
+    assert not Path(str(path) + ".manifest.json").exists()
+
+
 def test_freeze_enforces_256_new_token_prompt_budget_before_writing(tmp_path) -> None:
     row = make_pilot_v2(load_v2_config(CONFIG), "expressions", 1, set())[0]
     path = tmp_path / "too-long.jsonl"
@@ -537,3 +558,21 @@ def test_freeze_rejects_symlinked_output_ancestor(tmp_path) -> None:
     with pytest.raises(ValueError, match="symlink or reparse point"):
         freeze_v2_split(path, [row], FakeTokenizer(), revision=config.model_revision, tokenizer_sha256="a" * 64)
     assert not (target / "pilot.jsonl").exists()
+
+
+def test_freeze_rejects_mocked_reparse_attribute_ancestor(tmp_path, monkeypatch) -> None:
+    config = load_v2_config(CONFIG)
+    row = make_pilot_v2(config, "expressions", 1, set())[0]
+    path = tmp_path / "pilot.jsonl"
+    real_lstat = data_v2.os.lstat
+    reparse_ancestor = Path(os.path.abspath(tmp_path))
+
+    def report_reparse(target, *args, **kwargs):
+        if Path(target) == reparse_ancestor:
+            return SimpleNamespace(st_mode=stat.S_IFDIR, st_file_attributes=0x400)
+        return real_lstat(target, *args, **kwargs)
+
+    monkeypatch.setattr(data_v2.os, "lstat", report_reparse)
+    with pytest.raises(ValueError, match="symlink or reparse point"):
+        freeze_v2_split(path, [row], FakeTokenizer(), revision=config.model_revision, tokenizer_sha256="a" * 64)
+    assert not path.exists()

@@ -24,6 +24,7 @@ _OPERATION_DEFINITIONS = {
 }
 _FAMILIES = {"expressions", "lists", "graphs"}
 _FAMILY_ORDER = ("expressions", "lists", "graphs")
+_V2_TOKENIZER_REVISION = "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"
 _FREEZE_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -203,6 +204,8 @@ def freeze_v2_split(
         validate_revision(revision)
     except ValueError as error:
         raise ValueError("V2 freeze requires an immutable tokenizer revision") from error
+    if revision != _V2_TOKENIZER_REVISION:
+        raise ValueError("V2 freeze requires the registered tokenizer revision")
     if not isinstance(tokenizer_sha256, str) or _FREEZE_SHA256.fullmatch(tokenizer_sha256) is None:
         raise ValueError("V2 freeze requires a full tokenizer SHA-256")
     if isinstance(examples, (str, bytes)) or not isinstance(examples, Sequence) or not examples:
