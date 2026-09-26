@@ -36,7 +36,8 @@ scores. First require nonempty completion and normal EOS. Length cap, partial
 generation, decode failure, and execution failure are ungradable/incorrect.
 
 - Expression: use only a line beginning with optional Markdown heading and
-  `Final answer`, then within the next 128 characters a `\boxed{signed integer}`.
+  `Final answer`, or the exact line-anchored phrase `So the final answer is`,
+  then within the next 128 characters a `\boxed{signed integer}`.
   Allow surrounding display/math markup. Any two distinct final-cue values make
   the response ambiguous. Integers in calculations or uncued boxes do not count.
 - List: use only a line beginning with optional Markdown heading and `Final
@@ -46,7 +47,9 @@ generation, decode failure, and execution failure are ungradable/incorrect.
   multi-digit values before verification: an `11` is a wrong value, not a parse
   failure. Require the expected list length and syntactically complete vector.
   Multiple distinct final-cue vectors are ambiguous. Earlier initial or
-  intermediate lists cannot be used.
+  intermediate lists cannot be used. A malformed or incomplete final-cue
+  vector invalidates the completion even if an earlier final cue was complete;
+  within each cue's payload, only its first complete vector is a candidate.
 - Graph: accept a standalone leading `Yes.`/`No.` at the beginning of the
   completion, a terminal `Answer: yes/no`, or a conclusive sentence of the form
   `there is [no] [direct or indirect] path from X to Y` with X/Y matching the
@@ -57,12 +60,18 @@ The output `correct` is true only when the unique extracted answer equals
 `interpret(example.latent_spec, example.family)`. A well-formed wrong answer is
 `wrong_value`; no unique extracted answer is `invalid_format` or `ambiguous`.
 All ungradable cases count toward the gate's invalid rate, including length cap.
-Do not use the reference answer to search, pick, or disambiguate spans.
+Do not use the reference answer to search, pick, or disambiguate spans. Derive
+the required list length from the latent input length, which list operations
+preserve, rather than consulting the computed target during extraction.
 
 Explanation assessment is an independent, non-gating field: `supported`,
 `contradicted`, `unverified`, or `none`. For graph answers, if a path is asserted
 as evidence, verify every stated edge and endpoints against the prompt's latent
-graph. A false claimed path is `contradicted` even if the final yes/no is right.
+graph. Accept ASCII `->` or Unicode `→` arrows in a bounded, possibly
+line-wrapped path claim. A false claimed path is `contradicted` even if the
+final yes/no is right. For non-EOS or absent completions, explanation is `none`
+because the text is incomplete; for EOS completions it is assessed even when
+the final answer is invalid.
 Other explanation styles are `unverified` unless a small deterministic verifier
 can prove them without guessing. Preserve a short reason and cited text span.
 
@@ -73,6 +82,11 @@ adversarial intermediate values, conflicting conclusions, malformed vectors,
 out-of-range list values, missing EOS, and wrong graph path explanations. Freeze
 the implementation hash before generating V1 calibration outputs; later code
 changes require a new diagnostic root and invalidate the old gate.
+
+Scorer freeze before V1 GPU generation: `answer_v1.py` SHA256
+`2f138e6fe106c81dd03712d0a49a3a916cec2596a4acfa8f4e111f6463bab719`.
+The 30-row offline audit yielded 23 parsed, 18 correct, five wrong, and seven
+ungradable. The immutable V1 run identity must bind this hash.
 
 ## Fresh benchmark and calibration
 

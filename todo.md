@@ -41,7 +41,7 @@ The blank human sheet is [artifacts/recurrence-review-v1/baseline-256/human-revi
 
 Design: [2026-09-26-recurrence-v1-design.md](docs/superpowers/specs/2026-09-26-recurrence-v1-design.md). Detailed sequential contract: [2026-09-26-recurrence-v1-execution.md](docs/superpowers/plans/2026-09-26-recurrence-v1-execution.md). This is a new run; V0 remains terminal.
 
-- [ ] Freeze deterministic final-answer scoring and graph explanation audit; prove it on old answers and adversarial cases.
+- [x] Freeze deterministic final-answer scoring and graph explanation audit; prove it on old answers and adversarial cases (23 parsed, 18 correct, five wrong, seven ungradable; SHA256 in V1 spec).
 - [ ] Generate two bounded difficulty pilots per family, select deterministically, and pass a fresh development informativeness gate.
 - [ ] Score F0/F1/F2 on the selected fresh development set and check resource evidence.
 - [ ] If gates pass, run paired A1/A2/A3 LoRA discovery, retention, and timing controls; stop on any no-go.

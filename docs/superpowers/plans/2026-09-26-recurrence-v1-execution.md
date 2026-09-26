@@ -19,7 +19,7 @@
 - Exactly two pilot difficulties per family, 30 rows each, six pilots total; select first eligible in table order. Seeds, task rules, gate thresholds, split counts, and stop conditions are exactly those in the spec.
 - An absent/ambiguous/capped final answer is incorrect and `reason_code="invalid_format"` in normalized score rows; keep more specific `failure_detail` separately so existing gate aggregation counts it.
 - Freeze the scorer code hash before V1 GPU generation. Never open sealed confirmation contents before a persisted passing discovery and seed-48 prerequisite.
-- New artifact root `artifacts/recurrence-v1/<run-id>`; derive ID from config/source/scorer/data hashes. No overwrites of existing output or stage records. Partial runs retain raw rows and failure evidence.
+- New artifact root `artifacts/recurrence-v1/<run-id>`; derive the initial ID from config, verified source, scorer/generator code, and read-only training-data hashes. The selected fresh split hashes are unknown until calibration and bind the immutable calibration stage, not the initial ID. No overwrites of existing output or stage records. Partial runs retain raw rows and failure evidence.
 - Calibration cap 7,200 CUDA-active seconds; whole V1 cap 86,400 CUDA-active seconds; new artifact cap 20 GiB. Stop with a report when a scientific/resource gate fails. Do not search prompts, model blocks, ranks, output caps, or new difficulty candidates.
 - After each implemented task: focused tests, source diff review, coherent commit. Use GPT-6 Luna implementers per user's request; parent makes scientific decisions and checks integration. Full suite once before first V1 GPU generation and after any later cross-cutting code change.
 
@@ -77,7 +77,8 @@ def make_pilot(config: V1Config, family: str, candidate: int,
 def make_selected_splits(config: V1Config, choices: Mapping[str, int],
                          forbidden_ids: set[str]) -> dict[str, tuple[Example, ...]]: ...
 def freeze_v1_split(path: Path, examples: Sequence[Example],
-                    tokenizer: object) -> dict[str, object]: ...
+                    tokenizer: object, *, revision: str,
+                    tokenizer_sha256: str) -> dict[str, object]: ...
 ```
 
 - [ ] Encode exact candidate grid, seed constants, 30 pilot/100 dev/200 sealed per family, source paths, token bounds, time/disk caps, and adaptation settings in a strict new TOML; reject unknown/missing keys, bool-as-int, mutable revision, invalid source/output paths, and impossible token budgets.
@@ -105,6 +106,7 @@ def score_v1_examples(model: object, tokenizer: object,
 - [ ] `calibrate`: score the six 30-example pilots as F0 using one verified local model load, same chat rendering and generation settings as the completed 256-token probe, `score_completion`, per-token deadline, per-row fsync. Validate exact row IDs/hashes before summary; incomplete execution is a failed stage, not a quality no-go.
 - [ ] Summarize each candidate through `summarize_exact_scores`; pick the first meeting strict 5%-95% accuracy and <=10% invalid. Persist full candidate table and choice. Fewer than two chosen informative families => terminal `stopped_scientific` report. Never try a third candidate.
 - [ ] Generate independent 100/family development and 200/family sealed splits using chosen difficulty. Score only development F0. Gate macro 5%-95%, global invalid <=10%, and >=2 individually informative families. Persist status, all counts, raw hashes and exact next allowed stage. Stop scientifically on failure.
+- [ ] Export a blinded 10/family development answer sample through the existing editable review tool; assign a Luna model reviewer to grade `good/bad` and compare disagreements with V1 objective scores. Record reviewer identity and hashes. The audit diagnoses parser/task failures but never changes the frozen gate or candidate choice.
 - [ ] Implement stage prerequisites so `frozen`/`discover`/`confirm` cannot run early; `confirm` must reject before opening any sealed bytes. Test this with a poisoned/sealed path whose read raises. Test paired manifest+split tamper, output overwrite, partial score crash and recovery, CUDA budget exhaustion, and wrong model/hash.
 - [ ] Verify real tiny-Qwen local inference/scorer data flow on CPU, then run focused tests, Ruff, compileall, diff check and full suite. Get independent Luna code review; fix actionable issues; commit before real pilot.
 - [ ] Run `uv run python scripts/run_recurrence_v1.py --stage prepare --config configs/recurrence-v1.toml`, then `--stage calibrate --run-id <printed-id>`. Record all measured outputs in `PROJECT_LOG.md`; if scientific or resource stop, run `--stage report` and end without training.
