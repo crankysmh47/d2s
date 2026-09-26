@@ -120,6 +120,10 @@ F0 accuracy strictly between 5% and 95% and ungradable rate <=10%; if the
 first fails, try its second. Preserve every pilot score and rejection. There
 is no third condition, cap change, prompt edit, or threshold retuning. If fewer
 than two families have an eligible candidate, record a scientific stop.
+If exactly two families have eligible candidates, assign the third family
+candidate 1 as a prespecified fallback for the development/confirmation splits;
+mark it ineligible in the pilot table and retain it in all three-family macro
+metrics. Do not select a fallback based on which failed pilot scored better.
 
 Once selected, generate fresh independent development (100/family) and sealed
 confirmation (200/family) splits at the selected difficulty. Persist source,
