@@ -737,7 +737,8 @@ def _report_v2(root: Path, config: V2Config, config_path: Path, project_root: Pa
         dev = _mapping(cal_payload.get("dev"), "passed development evidence")
         if not _mapping(dev.get("gate"), "passed development gate").get("passes") or cal_payload.get("next_stage") != "frozen":
             raise ValueError("passed calibration does not bind the registered development gate")
-    _validate_v2_calibration_files(root, cal_payload)
+    recomputed_summaries = _validate_v2_calibration_files(root, cal_payload)
+    _validate_v2_calibration_decisions(cal_payload, recomputed_summaries, str(calibration.get("status")))
     expected_runtime = _runtime_code_files(project_root)
     if cal_payload.get("runtime_code_files") != expected_runtime:
         raise ValueError("V2 calibration runtime code hashes changed")
@@ -838,10 +839,11 @@ def _recover_v2_interrupted(root: Path, prepare: Mapping[str, object], config: V
     return _finish_v2_calibration(root, payload, "failed_environment", ledger)
 
 
-def _validate_v2_calibration_files(root: Path, payload: Mapping[str, object]) -> None:
+def _validate_v2_calibration_files(root: Path, payload: Mapping[str, object]) -> dict[str, dict[str, object]]:
     evidence = _mapping(payload.get("pilot_scores", {}), "V2 calibration evidence")
     expected_data: set[str] = {"data/train-view.jsonl", "data/train-view.jsonl.manifest.json"}
     expected_scores: set[str] = set()
+    summaries: dict[str, dict[str, object]] = {}
     for key, raw_entry in evidence.items():
         if key != "dev-f0" and key not in {f"pilot-{family}-c{candidate}" for family in FAMILIES for candidate in (1, 2)}:
             raise ValueError(f"unknown V2 calibration evidence key {key}")
@@ -874,8 +876,10 @@ def _validate_v2_calibration_files(root: Path, payload: Mapping[str, object]) ->
                     raise ValueError(f"V2 partial score ordered IDs mismatch for {key}")
             elif score_ids != ids:
                 raise ValueError(f"V2 score ordered IDs mismatch for {key}")
-            if isinstance(entry.get("summary"), Mapping) and summarize_exact_scores(rows) != entry["summary"]:
+            summary = summarize_exact_scores(rows)
+            if isinstance(entry.get("summary"), Mapping) and summary != entry["summary"]:
                 raise ValueError(f"V2 score summary mismatch for {key}")
+            summaries[key] = summary
     partial = payload.get("partial_failure")
     if isinstance(partial, Mapping) and partial.get("path"):
         relative = Path(str(partial["path"]))
@@ -904,6 +908,120 @@ def _validate_v2_calibration_files(root: Path, payload: Mapping[str, object]) ->
             path = _safe_v2_run_file(root, relative)
             if sha256_file(path) != review[hash_field]:
                 raise ValueError("V2 human review export hash changed")
+    return summaries
+
+
+def _validate_v2_calibration_decisions(
+    payload: Mapping[str, object], summaries: Mapping[str, Mapping[str, object]], status: str,
+) -> None:
+    """Recompute pilot choices and the development gate from authenticated raw scores."""
+    pilot_rows: list[dict[str, object]] = []
+    for family in FAMILIES:
+        for candidate in (1, 2):
+            key = f"pilot-{family}-c{candidate}"
+            summary = summaries.get(key)
+            if summary is None:
+                continue
+            family_values = _mapping(summary.get("families"), f"{key} family summaries")
+            family_summary = _mapping(family_values.get(family), f"{key} family result")
+            accuracy, invalid = float(family_summary["accuracy"]), float(family_summary["invalid_rate"])
+            pilot_rows.append({
+                "family": family, "candidate": candidate,
+                "record_count": int(summary["record_count"]), "correct": int(summary["correct"]),
+                "invalid_format": int(summary["invalid_format"]), "accuracy": accuracy,
+                "invalid_rate": invalid, "eligible": is_informative_family(accuracy, invalid),
+            })
+    recorded_table = payload.get("pilot_table")
+    if recorded_table is not None:
+        if not isinstance(recorded_table, list):
+            raise ValueError("V2 pilot table must be a list")
+        recorded_by_key = {
+            (row.get("family"), row.get("candidate")): row
+            for row in recorded_table if isinstance(row, Mapping)
+        }
+        if len(recorded_by_key) != len(recorded_table):
+            raise ValueError("V2 pilot table has malformed or duplicate rows")
+        expected_by_key = {(str(row["family"]), int(row["candidate"])): row for row in pilot_rows}
+        if set(recorded_by_key) != set(expected_by_key):
+            raise ValueError("V2 pilot table does not match available authenticated pilot scores")
+        for key, expected in expected_by_key.items():
+            recorded = recorded_by_key[key]
+            if any(recorded.get(field) != expected[field] for field in expected):
+                raise ValueError("V2 pilot eligibility or summary differs from authenticated raw scores")
+
+    expected_pilot_keys = {f"pilot-{family}-c{candidate}" for family in FAMILIES for candidate in (1, 2)}
+    if status in {"passed", "stopped_scientific"} and not expected_pilot_keys.issubset(summaries):
+        raise ValueError("scientific V2 decision requires all six authenticated pilot score summaries")
+    if status in {"passed", "stopped_scientific"}:
+        if not isinstance(recorded_table, list) or not isinstance(payload.get("eligible_families"), list):
+            raise ValueError("scientific V2 decision must retain its pilot table and eligible-family set")
+        if "selected_difficulty" not in payload:
+            raise ValueError("scientific V2 decision must retain its selected difficulty decision")
+    if len(expected_pilot_keys.intersection(summaries)) == 6:
+        choices, fallback = study_v1._select_pilot_difficulties(pilot_rows)
+        eligible_families = sorted(family for family in FAMILIES if any(
+            row["family"] == family and row["eligible"] is True for row in pilot_rows
+        ))
+        if "selected_difficulty" in payload:
+            stored_choices = _mapping(payload.get("selected_difficulty"), "stored V2 pilot choices")
+            expected_choices = choices if len(eligible_families) >= 2 else {}
+            if dict(stored_choices) != expected_choices:
+                raise ValueError("V2 selected difficulty differs from recomputed pilot selection")
+        if "eligible_families" in payload and payload.get("eligible_families") != eligible_families:
+            raise ValueError("V2 eligible families differ from authenticated pilot summaries")
+        if len(eligible_families) < 2:
+            if status != "stopped_scientific" or payload.get("dev") is not None or payload.get("next_stage") != "report":
+                raise ValueError("V2 pilot no-go must stop scientifically before development")
+        else:
+            if status in {"passed", "stopped_scientific"} and "fallback_families" not in payload:
+                raise ValueError("scientific V2 decision must retain its candidate-1 fallback set")
+            if "fallback_families" in payload and payload.get("fallback_families") != fallback:
+                raise ValueError("V2 candidate-1 fallback differs from authenticated pilot selection")
+            recorded_rows = payload.get("pilot_table")
+            if isinstance(recorded_rows, list):
+                for recorded in recorded_rows:
+                    if not isinstance(recorded, Mapping):
+                        continue
+                    family, candidate = str(recorded["family"]), int(recorded["candidate"])
+                    selected = candidate == choices[family]
+                    kind = (
+                        "selected_first_eligible" if family not in fallback and selected
+                        else "prespecified_candidate_1_fallback" if family in fallback and selected
+                        else "not_selected"
+                    )
+                    has_selection = "selected" in recorded or "selection_kind" in recorded
+                    if status in {"passed", "stopped_scientific"} and not has_selection:
+                        raise ValueError("scientific V2 calibration is missing its persisted pilot selection table")
+                    if has_selection and (recorded.get("selected") is not selected or recorded.get("selection_kind") != kind):
+                        raise ValueError("V2 pilot selection table differs from recomputed first-eligible choice")
+
+    dev_summary = summaries.get("dev-f0")
+    dev = payload.get("dev")
+    if dev is None:
+        if dev_summary is not None and status in {"passed", "stopped_scientific"}:
+            raise ValueError("V2 development raw scores exist without a stored development decision")
+        if status == "passed":
+            raise ValueError("passed V2 calibration requires a development decision")
+        eligible_count = len([family for family in FAMILIES if any(
+            row["family"] == family and row["eligible"] is True for row in pilot_rows
+        )])
+        if status == "stopped_scientific" and eligible_count >= 2:
+            raise ValueError("V2 scientific stop after eligible pilots requires a development gate")
+        return
+    dev_record = _mapping(dev, "V2 development decision")
+    if dev_summary is None:
+        raise ValueError("V2 development decision has no authenticated raw score summary")
+    if dev_record.get("scores") != dev_summary:
+        raise ValueError("V2 development summary differs from authenticated raw scores")
+    expected_gate = _development_gate_v2(dev_summary)
+    if dev_record.get("gate") != expected_gate:
+        raise ValueError("V2 development gate differs from recomputed raw-score gate")
+    if status == "passed":
+        if not expected_gate["passes"] or payload.get("next_stage") != "frozen":
+            raise ValueError("passed V2 calibration requires a passing recomputed development gate")
+    elif status == "stopped_scientific":
+        if expected_gate["passes"] or payload.get("next_stage") != "report":
+            raise ValueError("V2 development no-go status differs from recomputed gate")
 
 
 def _validate_v2_cost_binding(root: Path, payload: Mapping[str, object], config: V2Config) -> None:

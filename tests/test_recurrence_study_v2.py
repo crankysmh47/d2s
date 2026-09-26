@@ -595,6 +595,101 @@ def test_report_rejects_corrupted_pilot_score_row(tmp_path: Path, monkeypatch: p
         study_v2.run_v2_stage("report", Path("configs/recurrence-v2.toml"), root)
 
 
+def _rewrite_calibration_payload(root: Path, update) -> None:
+    record = study_v2.read_v2_stage(root / "stages/calibrate.json", "calibrate")
+    payload = json.loads(json.dumps(record["payload"]))
+    update(payload)
+    tampered = study_v2._stage_record("calibrate", record["status"], payload, record["prerequisite_stage_sha256"])
+    (root / "stages/calibrate.json").write_bytes(canonical_json(tampered))
+
+
+def test_report_recomputes_pilot_selection_after_stage_record_is_rehashed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _ = _enable_fake_calibration_sources(tmp_path, monkeypatch)
+    _fake_v2_score_factory(monkeypatch, {"expressions", "lists"}, [])
+    study_v2.run_v2_stage("calibrate", Path("configs/recurrence-v2.toml"), root)
+
+    def tamper(payload):
+        payload["selected_difficulty"]["expressions"] = 1
+
+    _rewrite_calibration_payload(root, tamper)
+    with pytest.raises(ValueError, match="pilot selection|selected difficulty"):
+        study_v2.run_v2_stage("report", Path("configs/recurrence-v2.toml"), root)
+
+
+def test_report_recomputes_development_summary_and_gate_after_rehash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _ = _enable_fake_calibration_sources(tmp_path, monkeypatch)
+    _fake_v2_score_factory(monkeypatch, {"expressions", "lists"}, [])
+    study_v2.run_v2_stage("calibrate", Path("configs/recurrence-v2.toml"), root)
+
+    def tamper(payload):
+        payload["dev"]["scores"]["macro_accuracy"] = 0.99
+        payload["dev"]["gate"]["macro_accuracy"] = 0.99
+
+    _rewrite_calibration_payload(root, tamper)
+    with pytest.raises(ValueError, match="development.*(raw|gate|summary)|gate.*recomputed"):
+        study_v2.run_v2_stage("report", Path("configs/recurrence-v2.toml"), root)
+
+
+def test_report_recomputes_stored_development_gate_from_raw_scores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _ = _enable_fake_calibration_sources(tmp_path, monkeypatch)
+    _fake_v2_score_factory(monkeypatch, {"expressions", "lists"}, [])
+    study_v2.run_v2_stage("calibrate", Path("configs/recurrence-v2.toml"), root)
+
+    def tamper(payload):
+        payload["dev"]["gate"]["macro_pass"] = False
+
+    _rewrite_calibration_payload(root, tamper)
+    with pytest.raises(ValueError, match="development gate"):
+        study_v2.run_v2_stage("report", Path("configs/recurrence-v2.toml"), root)
+
+
+@pytest.mark.parametrize(
+    ("accuracies", "invalid", "expected"),
+    [
+        ((0.05, 0.05, 0.05), 0.0, False),
+        ((0.95, 0.95, 0.95), 0.0, False),
+        ((0.50, 0.50, 0.50), 0.10, True),
+        ((0.50, 0.50, 0.50), 0.101, False),
+        ((0.20, 1.00, 0.00), 0.0, False),
+    ],
+)
+def test_development_gate_enforces_macro_global_invalid_and_two_family_boundaries(
+    accuracies: tuple[float, float, float], invalid: float, expected: bool,
+) -> None:
+    summary = {
+        "macro_accuracy": sum(accuracies) / 3,
+        "global_invalid_rate": invalid,
+        "families": {
+            family: {"accuracy": accuracy, "invalid_rate": 0.0, "record_count": 100}
+            for family, accuracy in zip(("expressions", "lists", "graphs"), accuracies, strict=True)
+        },
+    }
+    assert study_v2._development_gate_v2(summary)["passes"] is expected
+
+
+def test_report_refuses_recovery_while_calibration_process_is_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _ = _enable_fake_calibration_sources(tmp_path, monkeypatch)
+    prepare = study_v2.read_v2_stage(root / "stages/prepare.json", "prepare")
+    attempt = study_v2._stage_record("calibration-attempt", "running", {
+        "run_id": prepare["payload"]["run_id"],
+        "config_sha256": hashlib.sha256(Path("configs/recurrence-v2.toml").read_bytes()).hexdigest(),
+        "started_utc": "2026-09-27T00:00:00Z", "wall_started_monotonic": 1.0, "process_id": 99999999,
+    }, {"prepare": prepare["stage_sha256"]})
+    (root / "stages/calibration-attempt.json").write_bytes(canonical_json(attempt))
+    monkeypatch.setattr(study_v2.study_v1, "_process_is_alive", lambda _pid: True)
+    with pytest.raises(RuntimeError, match="still active"):
+        study_v2.run_v2_stage("report", Path("configs/recurrence-v2.toml"), root)
+    assert not (root / "stages/calibrate.json").exists()
+
+
 def test_exhausted_calibration_cuda_budget_is_a_resource_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = replace(
         load_v2_config(Path("configs/recurrence-v2.toml")),
