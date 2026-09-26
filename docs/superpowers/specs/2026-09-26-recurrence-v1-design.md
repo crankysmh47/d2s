@@ -140,6 +140,17 @@ whole V1 study gets at most 24 CUDA-active hours and 20 GiB new artifacts.
 Persist failed attempts and elapsed CUDA time. No download is planned; use the
 pinned local Qwen3-1.7B snapshot at revision
 `70d244cc86ccca08cf5af4e1e306ecf908b1ad5e` after verifying source hashes.
+Separately, calibration has a conservative 7,200-second wall watchdog checked
+per generated token; host-side delays may trigger it before the CUDA-active
+cap. Such a stop is `stopped_resource`, never a scientific no-go. Record which
+limit fired and partial raw evidence; do not auto-retry or use a stopped run
+to select difficulty.
+CUDA-duration entries use the existing hash-chained cost ledger. Each GPU
+phase writes a durable start marker before work and a completed/failed ledger
+entry afterward. A hard interruption with an open marker is terminal
+`failed_environment` with unknown exact CUDA duration (and a conservative
+wall-time bound if recoverable); it never permits an unaccounted retry under
+the same V1 run ID.
 
 ## Frozen controls and conditional LoRA
 
