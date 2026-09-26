@@ -16,6 +16,11 @@ from . import study_v2
 
 
 RUN_ID = "18433b1f62c799ac06bfab7250511e4b06c1d936a4174ecfb9d7b21ff834451d"
+_TRUSTED_STAGE_HASHES = {
+    "prepare": "b1bd10a2d019907fdf222d092879b9c5cdad68861072915407632d6eeaec4a46",
+    "calibrate": "da11072965258f088322ecc567981078adf0895ba8f1a947a076b18acd1fae7d",
+    "report": "0799e0c3d34bacac86cd0c942693a29d18bd502ec6d83713feebf975ef0fcbcf",
+}
 DEFAULT_SEED = 927001
 _DEV_SPLIT = Path("data/dev.jsonl")
 _DEV_SIDECAR = Path("data/dev.jsonl.manifest.json")
@@ -33,6 +38,13 @@ def verify_v2_audit_source(run_root: Path) -> dict[str, object]:
     report = study_v2.read_v2_stage(study_v2._safe_v2_run_file(root, Path("stages/report.json")), "report")
     prepare_hash = str(prepare["stage_sha256"])
     calibrate_hash = str(calibrate["stage_sha256"])
+    stage_hashes = {
+        "prepare": prepare_hash,
+        "calibrate": calibrate_hash,
+        "report": str(report["stage_sha256"]),
+    }
+    if stage_hashes != _TRUSTED_STAGE_HASHES:
+        raise ValueError("V2 stage hashes do not match trusted registered stage anchors")
     if prepare.get("status") != "passed":
         raise ValueError("V2 prepare stage is not passed")
     if calibrate.get("prerequisite_stage_sha256") != {"prepare": prepare_hash}:
@@ -103,11 +115,7 @@ def verify_v2_audit_source(run_root: Path) -> dict[str, object]:
             "dev_sidecar": sidecar_hash,
             "dev_score": score_hash,
         },
-        "stage_hashes": {
-            "prepare": prepare_hash,
-            "calibrate": calibrate_hash,
-            "report": str(report["stage_sha256"]),
-        },
+        "stage_hashes": stage_hashes,
     }
 
 
@@ -206,7 +214,8 @@ def export_v2_audit(run_root: Path, output_root: Path, seed: int = DEFAULT_SEED)
         packet_groups[family].append(packet)
         audit_ids[family].append(audit_row_id)
 
-    destination = Path(output_root).resolve(strict=False)
+    output_base = Path(output_root).resolve(strict=False)
+    destination = output_base / audit_id
     try:
         destination.relative_to(Path(run_root).resolve(strict=True))
     except ValueError:

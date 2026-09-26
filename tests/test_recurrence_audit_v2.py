@@ -11,6 +11,11 @@ from ppmoe.recurrence.provenance import canonical_json, sha256_payload
 
 RUN_ID = "18433b1f62c799ac06bfab7250511e4b06c1d936a4174ecfb9d7b21ff834451d"
 FAMILIES = ("expressions", "lists", "graphs")
+TRUSTED_STAGE_HASHES = {
+    "prepare": "b1bd10a2d019907fdf222d092879b9c5cdad68861072915407632d6eeaec4a46",
+    "calibrate": "da11072965258f088322ecc567981078adf0895ba8f1a947a076b18acd1fae7d",
+    "report": "0799e0c3d34bacac86cd0c942693a29d18bd502ec6d83713feebf975ef0fcbcf",
+}
 EXPECTED_ACCEPTED_IDS = [
     "expressions-068", "expressions-033", "expressions-071", "expressions-065", "expressions-056",
     "expressions-082", "expressions-098", "expressions-094", "expressions-054", "expressions-091",
@@ -33,7 +38,9 @@ def _record(stage: str, status: str, payload: dict[str, object], prerequisites: 
 
 
 @pytest.fixture
-def audit_run(tmp_path: Path) -> tuple[Path, list[dict[str, object]], list[dict[str, object]]]:
+def audit_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, list[dict[str, object]], list[dict[str, object]]]:
     root = tmp_path / RUN_ID
     for folder in ("data", "scores", "stages"):
         (root / folder).mkdir(parents=True, exist_ok=True)
@@ -102,6 +109,11 @@ def audit_run(tmp_path: Path) -> tuple[Path, list[dict[str, object]], list[dict[
     })
     for stage, record in (("prepare", prepare), ("calibrate", calibration), ("report", report)):
         (root / f"stages/{stage}.json").write_bytes(canonical_json(record))
+    monkeypatch.setattr(_api(), "_TRUSTED_STAGE_HASHES", {
+        "prepare": str(prepare["stage_sha256"]),
+        "calibrate": str(calibration["stage_sha256"]),
+        "report": str(report["stage_sha256"]),
+    }, raising=False)
     return root, dev_rows, score_rows
 
 
@@ -109,6 +121,20 @@ def _api():
     from ppmoe.recurrence import audit_v2
 
     return audit_v2
+
+
+def _trust_fixture_stage_bytes(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    hashes = {
+        stage: json.loads((root / f"stages/{stage}.json").read_bytes())["stage_sha256"]
+        for stage in ("prepare", "calibrate", "report")
+    }
+    monkeypatch.setattr(_api(), "_TRUSTED_STAGE_HASHES", hashes)
+
+
+def test_live_v2_run_matches_the_registered_stage_hash_anchors() -> None:
+    root = Path.cwd() / "artifacts/recurrence-v2" / RUN_ID
+    source = _api().verify_v2_audit_source(root)
+    assert source["stage_hashes"] == TRUSTED_STAGE_HASHES
 
 
 def test_source_verification_authenticates_nonsealed_evidence_and_never_reads_sealed(
@@ -156,7 +182,7 @@ def test_source_verification_rejects_stage_hash_drift(audit_run) -> None:
         _api().verify_v2_audit_source(root)
 
 
-def test_source_verification_rejects_report_prerequisite_drift(audit_run) -> None:
+def test_source_verification_rejects_report_prerequisite_drift(audit_run, monkeypatch: pytest.MonkeyPatch) -> None:
     root, _, _ = audit_run
     report_path = root / "stages/report.json"
     report = json.loads(report_path.read_bytes())
@@ -164,7 +190,62 @@ def test_source_verification_rejects_report_prerequisite_drift(audit_run) -> Non
     report_path.write_bytes(canonical_json(_record(
         "report", report["status"], report["payload"], report["prerequisite_stage_sha256"],
     )))
+    _trust_fixture_stage_bytes(root, monkeypatch)
     with pytest.raises(ValueError, match="report prerequisite"):
+        _api().verify_v2_audit_source(root)
+
+
+def test_coordinated_dev_and_stage_rewrite_with_same_run_id_fails_registered_anchors(audit_run) -> None:
+    root, dev_rows, _ = audit_run
+    dev_rows[0]["prompt"] = "Rewritten prompt with unchanged registered run ID"
+    split_raw = b"".join(canonical_json(row) for row in dev_rows)
+    split_path = root / "data/dev.jsonl"
+    split_path.write_bytes(split_raw)
+    sidecar_path = root / "data/dev.jsonl.manifest.json"
+    sidecar = json.loads(sidecar_path.read_bytes())
+    sidecar["sha256"] = hashlib.sha256(split_raw).hexdigest()
+    sidecar_raw = canonical_json(sidecar)
+    sidecar_path.write_bytes(sidecar_raw)
+
+    prepare_path = root / "stages/prepare.json"
+    prepare = json.loads(prepare_path.read_bytes())
+    prepare_payload = prepare["payload"]
+    prepare_payload["rewrite_marker"] = "same run ID, newly signed prepare"
+    prepare = _record("prepare", prepare["status"], prepare_payload, {})
+    prepare_path.write_bytes(canonical_json(prepare))
+
+    calibrate_path = root / "stages/calibrate.json"
+    calibrate = json.loads(calibrate_path.read_bytes())
+    calibrate_payload = calibrate["payload"]
+    dev_evidence = calibrate_payload["pilot_scores"]["dev-f0"]
+    dev_evidence["split_sha256"] = hashlib.sha256(split_raw).hexdigest()
+    dev_evidence["split_manifest_sha256"] = hashlib.sha256(sidecar_raw).hexdigest()
+    calibrate = _record("calibrate", calibrate["status"], calibrate_payload, {
+        "prepare": str(prepare["stage_sha256"]),
+    })
+    calibrate_path.write_bytes(canonical_json(calibrate))
+
+    report_path = root / "stages/report.json"
+    report = json.loads(report_path.read_bytes())
+    report_payload = report["payload"]
+    report_payload["prepare_stage_sha256"] = str(prepare["stage_sha256"])
+    report_payload["calibration_stage_sha256"] = str(calibrate["stage_sha256"])
+    report_payload["calibration"] = calibrate_payload
+    report = _record("report", report["status"], report_payload, {
+        "prepare": str(prepare["stage_sha256"]),
+        "calibrate": str(calibrate["stage_sha256"]),
+    })
+    report_path.write_bytes(canonical_json(report))
+
+    signed_prepare = _api().study_v2.read_v2_stage(prepare_path, "prepare")
+    signed_calibrate = _api().study_v2.read_v2_stage(calibrate_path, "calibrate")
+    signed_report = _api().study_v2.read_v2_stage(report_path, "report")
+    assert signed_prepare["payload"]["run_id"] == RUN_ID
+    assert signed_calibrate["prerequisite_stage_sha256"] == {"prepare": signed_prepare["stage_sha256"]}
+    assert signed_report["prerequisite_stage_sha256"] == {
+        "prepare": signed_prepare["stage_sha256"], "calibrate": signed_calibrate["stage_sha256"],
+    }
+    with pytest.raises(ValueError, match="trusted.*stage anchor"):
         _api().verify_v2_audit_source(root)
 
 
@@ -193,7 +274,9 @@ def test_selection_includes_all_invalid_and_ten_seeded_accepted_rows_per_family(
     assert all(not ({"answer", "latent_spec", "parsed_value", "correct", "reason_code"} & set(packet)) for packet in packets)
 
 
-def test_reordered_score_file_is_rejected_even_when_row_set_is_unchanged(audit_run) -> None:
+def test_reordered_score_file_is_rejected_even_when_row_set_is_unchanged(
+    audit_run, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     root, _, score_rows = audit_run
     path = root / "scores/dev-f0.jsonl"
     path.write_bytes(b"".join(canonical_json(row) for row in reversed(score_rows)))
@@ -213,6 +296,7 @@ def test_reordered_score_file_is_rejected_even_when_row_set_is_unchanged(audit_r
         "calibrate": str(calibrate["stage_sha256"]),
     })
     report_path.write_bytes(canonical_json(report))
+    _trust_fixture_stage_bytes(root, monkeypatch)
     with pytest.raises(ValueError, match="score ordered IDs"):
         _api().verify_v2_audit_source(root)
 
@@ -227,11 +311,21 @@ def test_export_authenticates_before_output_creation_and_refuses_existing_root(a
     assert not output.exists()
 
     score_path.write_bytes(score_path.read_bytes()[:-1])
-    _api().export_v2_audit(root, output)
-    assert {path.relative_to(output).as_posix() for path in output.rglob("*") if path.is_file()} == {
+    output.mkdir()
+    legacy_manifest = output / "manifest.json"
+    legacy_manifest.write_bytes(b"legacy base-level export")
+    (output / "packets").mkdir()
+    legacy_packet = output / "packets/expressions.jsonl"
+    legacy_packet.write_bytes(b"legacy packet bytes")
+    result = _api().export_v2_audit(root, output)
+    export_root = Path(result["output_root"])
+    assert export_root == output / result["audit_id"]
+    assert legacy_manifest.read_bytes() == b"legacy base-level export"
+    assert legacy_packet.read_bytes() == b"legacy packet bytes"
+    assert {path.relative_to(export_root).as_posix() for path in export_root.rglob("*") if path.is_file()} == {
         "manifest.json", "packets/expressions.jsonl", "packets/lists.jsonl", "packets/graphs.jsonl",
     }
-    manifest = json.loads((output / "manifest.json").read_bytes())
+    manifest = json.loads((export_root / "manifest.json").read_bytes())
     assert len(manifest["audit_ids"]["expressions"]) == 41
     assert len(manifest["source_ids"]) == 123
     assert len(manifest["selection_reasons"]) == 123
@@ -247,9 +341,11 @@ def test_packet_ids_use_required_hash_prefix_and_family_files_contain_only_blind
     output = tmp_path / "export"
     result = _api().export_v2_audit(root, output)
     assert result["audit_id"]
-    manifest = json.loads((output / "manifest.json").read_bytes())
+    export_root = Path(result["output_root"])
+    assert export_root == output / result["audit_id"]
+    manifest = json.loads((export_root / "manifest.json").read_bytes())
     for family in FAMILIES:
-        raw = (output / f"packets/{family}.jsonl").read_bytes()
+        raw = (export_root / f"packets/{family}.jsonl").read_bytes()
         rows = [json.loads(line) for line in raw.splitlines()]
         assert len(rows) == 41
         assert hashlib.sha256(raw).hexdigest() == manifest["packet_sha256"][family]
@@ -265,7 +361,7 @@ def test_audit_id_changes_when_authenticated_source_hashes_change(audit_run, tmp
     first = _api().export_v2_audit(root, tmp_path / "first")
     second = _api().export_v2_audit(root, tmp_path / "second")
     assert first["audit_id"] == second["audit_id"]
-    manifest = json.loads((tmp_path / "second/manifest.json").read_bytes())
+    manifest = json.loads((Path(second["output_root"]) / "manifest.json").read_bytes())
     assert manifest["seed"] == 927001
     assert manifest["source_hashes"]
     assert manifest["stage_hashes"]
@@ -283,4 +379,5 @@ def test_cli_export_prints_compact_json(audit_run, tmp_path: Path, capsys: pytes
     assert result == 0
     assert printed.startswith('{"audit_id":"')
     assert " " not in printed.strip()
-    assert json.loads(printed)["output_root"] == str(output)
+    result_payload = json.loads(printed)
+    assert result_payload["output_root"] == str(output / result_payload["audit_id"])
