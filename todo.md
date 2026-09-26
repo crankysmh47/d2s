@@ -51,8 +51,8 @@ V1 provides no recurrence-efficacy result. Its no-go motivated the separately re
 ## Recurrence V2: design review
 
 - [x] Approve the three-family measurement-repair direction in conversation.
-- [ ] Review the written [V2 design](docs/superpowers/specs/2026-09-26-recurrence-v2-design.md) before an implementation plan or code changes.
-- [ ] After spec approval, write and review the detailed implementation plan; then implement and advance only through passing V2 gates.
+- [x] Approve the written [V2 design](docs/superpowers/specs/2026-09-26-recurrence-v2-design.md); user directed autonomous continuation through process-only reviews.
+- [ ] Implement and review the [V2 calibration plan](docs/superpowers/plans/2026-09-26-recurrence-v2-calibration.md); advance only through passing V2 gates.
 
 ## Deferred, not an execution queue
 

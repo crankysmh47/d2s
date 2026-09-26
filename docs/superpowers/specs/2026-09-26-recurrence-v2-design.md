@@ -1,6 +1,6 @@
 # Pretrained recurrence V2: measurement-repair study
 
-Date: 2026-09-26. Status: written design awaiting user review. The user approved a three-family V2 design in conversation. This document does not authorize GPU generation or training until its implementation plan is reviewed.
+Date: 2026-09-26. Status: design approved by the user's subsequent "proceed" instruction. The user also directed autonomous continuation through process-only reviews; production GPU work still requires frozen implementation and passing registered gates.
 
 ## Purpose and scientific boundary
 
@@ -24,7 +24,7 @@ The V2 graph extractor collects only explicit answer candidates:
 
 1. The first nonblank line is solely `yes` or `no`, case-insensitive, optionally followed by `.` or `!`; Markdown heading/bold around that token may be ignored. A leading `Yes` without a period is now valid, but a prose clause such as `Yes, because ...` is not a standalone cue.
 2. A complete line beginning with `Answer:`, `Final answer:`, or `So, the answer is:` and ending in a standalone `yes` or `no`, with optional Markdown heading/bold and final punctuation. The cue may occur anywhere in the completion, so earlier and later explicit cues can conflict. Do not infer from arbitrary yes/no in edge prose.
-3. A conclusive `there is [no] [direct or indirect] path from X to Y` sentence with endpoints exactly equal to the queried start/end, allowing Markdown emphasis around `no`, `path`, `X`, and `Y`. Do not treat a path statement about other endpoints as the answer.
+3. A conclusive `there is [no] [a] [direct or indirect] path from X to Y` sentence with endpoints exactly equal to the queried start/end, allowing Markdown emphasis around `no`, `path`, `X`, and `Y`. The article `a` is allowed only for a positive claim. Do not treat a path statement about other endpoints as the answer.
 
 Normalize only the permitted light Markdown decoration around these cues; do not strip arbitrary text until it happens to look like an answer. Preserve original-text evidence spans. If all explicit candidates agree, extract that value. If any explicit candidates disagree—including a leading `Yes` followed by `**Answer: No**`—return `invalid_format` with an ambiguity detail, not the last answer. If no explicit candidate exists, return `invalid_format`. Never inspect the gold answer while identifying or resolving candidates. Missing EOS, empty, capped, decoding-failed, or partially generated completions remain invalid.
 
