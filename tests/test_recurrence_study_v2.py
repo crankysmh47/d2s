@@ -31,6 +31,7 @@ _RUNTIME_FILES = (
     "src/ppmoe/recurrence/gates.py",
 )
 _CODE_FILES = (
+    "scripts/run_recurrence_v2.py",
     "src/ppmoe/recurrence/answer_v1.py",
     "src/ppmoe/recurrence/data_v1.py",
     "src/ppmoe/recurrence/config_v1.py",
@@ -45,6 +46,7 @@ _CODE_FILES = (
     "src/ppmoe/recurrence/config_v2.py",
     "src/ppmoe/recurrence/data_v2.py",
     "src/ppmoe/recurrence/study_v2.py",
+    "src/ppmoe/recurrence/v2_runtime.py",
     "src/ppmoe/recurrence/provenance.py",
 )
 
@@ -367,6 +369,7 @@ def _prepare_inputs() -> tuple[list[dict[str, object]], dict[str, object]]:
         "dev_count": 600,
         "forbidden_ids": {f"id-{index}" for index in range(8780)},
         "train_records": tuple(rows),
+        "v0_train_ids": tuple(str(row["id"]) for row in rows),
     }
 
 
@@ -380,7 +383,7 @@ def _run_prepare(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(study_v2, "verify_v2_sources", lambda _config, _root: inputs)
     monkeypatch.setattr(study_v2, "_load_v2_tokenizer", lambda _snapshot, _revision: _TinyTokenizer())
     result = study_v2.run_v2_stage("prepare", Path("configs/recurrence-v2.toml"))
-    assert result["status"] == "passed"
+    assert result["status"] == "passed", result.get("failure")
     return Path(str(result["run_root"]))
 
 
@@ -445,6 +448,188 @@ def test_prepare_failure_after_root_creation_records_failed_environment(tmp_path
     assert result["status"] == "failed_environment"
     record = study_v2.read_v2_stage(Path(str(result["run_root"])) / "stages/prepare.json", "prepare")
     assert record["status"] == "failed_environment"
+
+
+def test_calibrate_rehashes_prepared_train_view_before_any_gpu_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _run_prepare(tmp_path, monkeypatch)
+    train_path = root / "data/train-view.jsonl"
+    train_path.write_bytes(train_path.read_bytes() + b" ")
+    model_loaded = False
+
+    def load_model(*_args):
+        nonlocal model_loaded
+        model_loaded = True
+        raise AssertionError("model load must not start after prepared data drift")
+
+    monkeypatch.setattr(study_v2, "_load_v2_model_measured", load_model, raising=False)
+    with pytest.raises(ValueError, match="train-view.*hash|signature changed"):
+        study_v2.run_v2_stage("calibrate", Path("configs/recurrence-v2.toml"), root)
+    assert model_loaded is False
+
+
+def test_report_after_calibration_stop_does_not_read_sealed_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _ = _enable_fake_calibration_sources(tmp_path, monkeypatch)
+    _fake_v2_score_factory(monkeypatch, {"expressions"}, [])
+    stopped = study_v2.run_v2_stage("calibrate", Path("configs/recurrence-v2.toml"), root)
+    assert stopped["status"] == "stopped_scientific"
+    sealed = root / "data/sealed.jsonl"
+    sealed.write_bytes(b"poisoned; any read raises")
+
+    def forbidden_read(path: Path, description: str = ""):
+        if Path(path) == sealed:
+            raise AssertionError("sealed bytes must remain unopened after a terminal stop")
+        return Path(path).read_bytes()
+
+    monkeypatch.setattr(study_v2, "_read_bytes", lambda path, description="": forbidden_read() if Path(path) == sealed else Path(path).read_bytes())
+    result = study_v2.run_v2_stage("report", Path("configs/recurrence-v2.toml"), root)
+    assert result["next_stage"] == "complete"
+
+
+def _enable_fake_calibration_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict[str, object]]:
+    config = replace(
+        load_v2_config(Path("configs/recurrence-v2.toml")),
+        data=replace(load_v2_config(Path("configs/recurrence-v2.toml")).data, output_root=str(tmp_path / "runs")),
+    )
+    _, inputs = _prepare_inputs()
+    monkeypatch.setattr(study_v2, "load_v2_config", lambda _path: config)
+    monkeypatch.setattr(study_v2, "verify_v2_sources", lambda _config, _root: inputs)
+    monkeypatch.setattr(study_v2, "_load_v2_tokenizer", lambda _snapshot, _revision: _TinyTokenizer())
+    root = Path(str(study_v2.run_v2_stage("prepare", Path("configs/recurrence-v2.toml"))["run_root"]))
+    monkeypatch.setattr(study_v2, "_load_v2_model_measured", lambda *_args: (object(), _TinyTokenizer(), 0.0))
+    return root, {"config": config, "inputs": inputs}
+
+
+def _fake_v2_score_factory(monkeypatch: pytest.MonkeyPatch, eligible: set[str], calls: list[str]) -> None:
+    def fake_score(_model, _tokenizer, examples, _mode, output_path, _signatures, **_kwargs):
+        from ppmoe.recurrence.gates import summarize_exact_scores
+
+        rows = []
+        for index, row in enumerate(examples):
+            calls.append(f"{row.split}:{row.family}:{row.structure_id}")
+            if row.split == "dev":
+                correct = index % 5 == 0
+            else:
+                family = row.family
+                candidate = output_path.stem.rsplit("-c", 1)[1]
+                chosen = candidate == "2" if family == "expressions" else candidate == "1"
+                correct = family in eligible and chosen and index % 6 == 0
+            rows.append({"example_id": row.id, "family": row.family, "correct": correct, "reason_code": "correct" if correct else "wrong_value"})
+        raw = b"".join(canonical_json(row) for row in rows)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(raw)
+        return {"validated_count": len(rows), "raw_sha256": hashlib.sha256(raw).hexdigest(), "summary": summarize_exact_scores(rows), "cuda_active_seconds": 0.0}
+
+    monkeypatch.setattr(study_v2, "score_v2_examples", fake_score)
+
+
+def test_calibration_scores_six_pilots_once_selects_first_eligible_and_candidate_one_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _ = _enable_fake_calibration_sources(tmp_path, monkeypatch)
+    calls: list[str] = []
+    _fake_v2_score_factory(monkeypatch, {"expressions", "lists"}, calls)
+    result = study_v2.run_v2_stage("calibrate", Path("configs/recurrence-v2.toml"), root)
+    assert result["status"] == "passed", result.get("failure")
+    assert len([call for call in calls if call.startswith("pilot:")]) == 180
+    assert result["selected_difficulty"] == {"expressions": 2, "lists": 1, "graphs": 1}
+    assert result["fallback_families"] == ["graphs"]
+    assert result["next_stage"] == "frozen"
+    assert (root / "human-review/review.md").is_file()
+    assert not (root / "stages/frozen.json").exists()
+
+
+def test_calibration_with_fewer_than_two_eligible_families_stops_before_dev_or_sealed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _ = _enable_fake_calibration_sources(tmp_path, monkeypatch)
+    calls: list[str] = []
+    _fake_v2_score_factory(monkeypatch, {"expressions"}, calls)
+    result = study_v2.run_v2_stage("calibrate", Path("configs/recurrence-v2.toml"), root)
+    assert result["status"] == "stopped_scientific", result
+    assert result["next_stage"] == "report"
+    assert len([call for call in calls if call.startswith("pilot:")]) == 180
+    assert not any(call.startswith("dev:") for call in calls)
+    assert not (root / "data/dev.jsonl").exists()
+    assert not (root / "data/sealed.jsonl").exists()
+    assert not (root / "human-review").exists()
+
+
+def test_interrupted_open_phase_is_terminal_with_unknown_cuda_duration_and_no_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _ = _enable_fake_calibration_sources(tmp_path, monkeypatch)
+    prepare = study_v2.read_v2_stage(root / "stages/prepare.json", "prepare")
+    attempt = study_v2._stage_record("calibration-attempt", "running", {
+        "run_id": prepare["payload"]["run_id"],
+        "config_sha256": hashlib.sha256(Path("configs/recurrence-v2.toml").read_bytes()).hexdigest(),
+        "started_utc": "2026-09-27T00:00:00Z", "wall_started_monotonic": 1.0, "process_id": 99999999,
+    }, {"prepare": prepare["stage_sha256"]})
+    (root / "stages/calibration-attempt.json").write_bytes(canonical_json(attempt))
+    study_v2.study_v1._append_ledger(root, {
+        "event": "phase_started", "phase_id": "interrupted", "phase": "score", "process_id": 99999999,
+        "monotonic_started": 1.0, "path": "scores/pilot-expressions-c1.jsonl", "score_key": "pilot-expressions-c1",
+    })
+    with pytest.raises(FileExistsError, match="already started"):
+        study_v2.run_v2_stage("calibrate", Path("configs/recurrence-v2.toml"), root)
+    report = study_v2.run_v2_stage("report", Path("configs/recurrence-v2.toml"), root)
+    calibration = study_v2.read_v2_stage(root / "stages/calibrate.json", "calibrate")
+    resources = calibration["payload"]["resources"]
+    assert report["status"] == "failed_environment"
+    assert resources["cuda_budget_state"] == "unknown_after_process_loss"
+    assert resources["open_phase_count"] == 1
+    assert not (root / "stages/frozen.json").exists()
+
+
+def test_report_rejects_corrupted_pilot_score_row(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, _ = _enable_fake_calibration_sources(tmp_path, monkeypatch)
+    calls: list[str] = []
+    _fake_v2_score_factory(monkeypatch, {"expressions"}, calls)
+    study_v2.run_v2_stage("calibrate", Path("configs/recurrence-v2.toml"), root)
+    score = root / "scores/pilot-expressions-c1.jsonl"
+    score.write_bytes(score.read_bytes() + b" ")
+    with pytest.raises(ValueError, match="score hash/count mismatch"):
+        study_v2.run_v2_stage("report", Path("configs/recurrence-v2.toml"), root)
+
+
+def test_exhausted_calibration_cuda_budget_is_a_resource_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = replace(
+        load_v2_config(Path("configs/recurrence-v2.toml")),
+        data=replace(load_v2_config(Path("configs/recurrence-v2.toml")).data, output_root=str(tmp_path / "runs")),
+        resources=replace(load_v2_config(Path("configs/recurrence-v2.toml")).resources, maximum_calibration_cuda_seconds=0),
+    )
+    _, inputs = _prepare_inputs()
+    monkeypatch.setattr(study_v2, "load_v2_config", lambda _path: config)
+    monkeypatch.setattr(study_v2, "verify_v2_sources", lambda _config, _root: inputs)
+    monkeypatch.setattr(study_v2, "_load_v2_tokenizer", lambda _snapshot, _revision: _TinyTokenizer())
+    root = Path(str(study_v2.run_v2_stage("prepare", Path("configs/recurrence-v2.toml"))["run_root"]))
+    result = study_v2.run_v2_stage("calibrate", Path("configs/recurrence-v2.toml"), root)
+    assert result["status"] == "stopped_resource"
+    assert "CUDA-active time cap" in result["failure"]
+    assert not list((root / "scores").glob("*.jsonl"))
+
+
+def test_v2_cli_requires_full_run_id_for_calibration_and_emits_one_json_result(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from scripts import run_recurrence_v2 as cli
+
+    config = load_v2_config(Path("configs/recurrence-v2.toml"))
+    monkeypatch.setattr(cli, "load_v2_config", lambda _path: config)
+    monkeypatch.setattr(cli, "run_v2_stage", lambda stage, config_path, root: {"status": "stopped_scientific", "stage": stage, "run_root": str(root)})
+    with pytest.raises(SystemExit) as missing:
+        cli.main(["--stage", "calibrate", "--config", "configs/recurrence-v2.toml"])
+    assert missing.value.code == 2
+    with pytest.raises(SystemExit) as malformed:
+        cli.main(["--stage", "report", "--config", "configs/recurrence-v2.toml", "--run-id", "abc"])
+    assert malformed.value.code == 2
+    assert cli.main(["--stage", "calibrate", "--config", "configs/recurrence-v2.toml", "--run-id", "a" * 64]) == 0
+    assert json.loads(capsys.readouterr().out.splitlines()[-1])["status"] == "stopped_scientific"
+    with pytest.raises(ValueError, match="implemented stages"):
+        study_v2.run_v2_stage("frozen", Path("configs/recurrence-v2.toml"))
 
 
 def test_partial_prepare_stage_write_does_not_claim_failure_was_durably_recorded(
