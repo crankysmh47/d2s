@@ -1,0 +1,64 @@
+[source]
+run = "artifacts/recurrence-v0/129d39646933"
+
+[model]
+repo_id = "Qwen/Qwen3-1.7B"
+revision = "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"
+
+[inference]
+dtype = "bfloat16"
+attention_implementation = "eager"
+layer_start = 12
+layer_stop = 16
+use_cache = false
+enable_thinking = false
+greedy = true
+max_new_tokens = 256
+max_sequence_tokens = 512
+
+[data]
+output_root = "artifacts/recurrence-v1"
+pilot_per_candidate = 30
+development_per_family = 100
+sealed_per_family = 200
+maximum_attempts_per_example = 100
+maximum_absolute_expression_answer = 9999
+graph_edge_probability = 0.20
+
+[data.candidates]
+expression_leaf_counts = [6, 7]
+list_item_counts = [4, 5]
+list_operation_counts = [1, 2]
+graph_vertex_counts = [7, 8]
+
+[data.seeds]
+pilot_expressions = [621001, 621002]
+pilot_lists = [622001, 622002]
+pilot_graphs = [623001, 623002]
+development = [631001, 631002, 631003]
+sealed = [641001, 641002, 641003]
+
+[lora]
+rank = 8
+alpha = 16
+dropout = 0.0
+seeds = [47, 48]
+target_modules = ["q_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+[optimizer]
+name = "AdamW"
+updates = 1000
+microbatch_size = 1
+accumulation_steps = 8
+warmup_updates = 20
+learning_rate = 0.0001
+beta1 = 0.9
+beta2 = 0.95
+epsilon = 0.00000001
+weight_decay = 0.0
+max_grad_norm = 1.0
+
+[resources]
+maximum_calibration_cuda_seconds = 7200
+maximum_study_cuda_seconds = 86400
+maximum_artifact_bytes = 21474836480
