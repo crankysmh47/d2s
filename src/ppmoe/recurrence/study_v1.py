@@ -11,6 +11,7 @@ import random
 import stat
 import time
 from typing import Any
+import uuid
 
 import torch
 
@@ -18,6 +19,7 @@ from .config_v1 import V1Config, load_v1_config
 from .data import Example
 from .data_v1 import FAMILIES, freeze_v1_split, make_pilot, make_selected_splits
 from .gates import is_informative_family, summarize_exact_scores
+from .gates import CudaCostLedger
 from .provenance import canonical_json, sha256_file, sha256_payload
 from .v1_runtime import ScoreExecutionError, load_v1_model, score_v1_examples
 
@@ -25,6 +27,7 @@ from .v1_runtime import ScoreExecutionError, load_v1_model, score_v1_examples
 _FROZEN_SCORER_SHA256 = "2f138e6fe106c81dd03712d0a49a3a916cec2596a4acfa8f4e111f6463bab719"
 _STAGES = {"prepare", "calibrate", "report"}
 _TERMINAL = {"stopped_scientific", "stopped_resource", "failed_environment", "passed"}
+_WALL_SAFETY_SECONDS = 7200.0
 
 
 class ResourceLimitReached(RuntimeError):
@@ -184,21 +187,40 @@ def _verify_snapshot(snapshot: Path, source: Mapping[str, object]) -> None:
     entries = source.get("files")
     if not isinstance(entries, list) or not entries:
         raise ValueError("source file inventory is missing")
-    seen_paths: set[str] = set()
+    expected_files: dict[str, Mapping[str, object]] = {}
     for entry in entries:
         if not isinstance(entry, Mapping):
             raise ValueError("source file inventory entry is invalid")
         relative, expected_size, expected_hash = entry.get("relative_path"), entry.get("bytes"), entry.get("sha256")
         if not isinstance(relative, str) or Path(relative).is_absolute() or ".." in Path(relative).parts:
             raise ValueError("source file inventory path is invalid")
-        if relative in seen_paths:
+        if relative in expected_files:
             raise ValueError("source file inventory paths must be unique")
-        seen_paths.add(relative)
+        expected_files[relative] = entry
+        if isinstance(expected_size, bool) or not isinstance(expected_size, int) or not isinstance(expected_hash, str):
+            raise ValueError(f"source file inventory metadata is invalid: {relative}")
+    actual_files: set[str] = set()
+    for directory, dirs, files in os.walk(snapshot, followlinks=False):
+        parent = Path(directory)
+        for name in [*dirs, *files]:
+            target = parent / name
+            metadata = target.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or getattr(metadata, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
+                raise ValueError(f"symlink or reparse point in model snapshot: {target}")
+            if name in dirs:
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise ValueError(f"model snapshot contains a non-directory path: {target}")
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(f"model snapshot contains a non-regular file: {target}")
+            actual_files.add(target.relative_to(snapshot).as_posix())
+    if actual_files != set(expected_files):
+        extra = sorted(actual_files - set(expected_files))
+        missing = sorted(set(expected_files) - actual_files)
+        raise ValueError(f"snapshot file inventory differs from manifest (extra={extra[:1]}, missing={missing[:1]})")
+    for relative, entry in expected_files.items():
         target = snapshot / Path(relative)
-        _assert_no_reparse(target)
-        if not target.is_file() or isinstance(expected_size, bool) or not isinstance(expected_size, int):
-            raise ValueError(f"pinned model file missing: {relative}")
-        if target.stat().st_size != expected_size or sha256_file(target) != expected_hash:
+        if target.stat().st_size != entry["bytes"] or sha256_file(target) != entry["sha256"]:
             raise ValueError(f"pinned model file hash mismatch: {relative}")
 
 
@@ -238,10 +260,12 @@ def _prepare(root: Path, run_id: str, config_path: Path, config: V1Config, input
 def _calibrate(root: Path, config: V1Config, config_path: Path, project_root: Path) -> dict[str, object]:
     prepare_path = root / "stages" / "prepare.json"
     prepare_record = _read_stage(prepare_path, "prepare")
+    _validate_run_binding(root, prepare_record, config, config_path, project_root)
     if prepare_record.get("status") != "passed":
         raise ValueError("calibrate requires a passed prepare stage")
     if (root / "stages" / "calibrate.json").exists():
         raise FileExistsError("calibration stage already exists; retries require a new run identity")
+    _assert_calibration_not_started(root)
     payload = _mapping(prepare_record.get("payload"), "prepare payload")
     if payload.get("config_sha256") != sha256_file(config_path):
         raise ValueError("config hash changed after prepare")
@@ -256,8 +280,10 @@ def _calibrate(root: Path, config: V1Config, config_path: Path, project_root: Pa
     snapshot = Path(str(fresh["snapshot"]))
     if Path(str(payload.get("source_root"))).resolve(strict=True) != Path(fresh["source_root"]).resolve(strict=True):
         raise ValueError("source run path changed after prepare")
-    deadline = time.monotonic() + config.resources.maximum_calibration_cuda_seconds
-    cumulative = _ledger_seconds(root)
+    _write_attempt_marker(root, prepare_record, config_path)
+    deadline = time.monotonic() + _WALL_SAFETY_SECONDS
+    cost_ledger = _load_cost_ledger(root, float(config.resources.maximum_study_cuda_seconds))
+    cumulative = _calibration_cost_seconds(cost_ledger)
     score_manifest: dict[str, object] = {}
     pilot_table: list[dict[str, object]] = []
     dev_summary: dict[str, object] | None = None
@@ -267,19 +293,26 @@ def _calibrate(root: Path, config: V1Config, config_path: Path, project_root: Pa
     status = "passed"
     failure: str | None = None
     try:
-        _budget_check(root, cumulative, config)
-        _append_ledger(root, {"event": "before_model_load", "cumulative_cuda_active_seconds": cumulative, "artifact_bytes": _tree_bytes(root)})
+        _budget_check(root, cost_ledger, config)
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
-        model, tokenizer, model_load_seconds = _load_calibration_runtime_measured(snapshot, config.model_revision)
-        cumulative += model_load_seconds
-        _append_ledger(root, {"event": "model_loaded", "phase_cuda_active_seconds": model_load_seconds, "cumulative_cuda_active_seconds": cumulative, "artifact_bytes": _tree_bytes(root)})
+        phase_id = _start_phase(root, "model_load")
+        try:
+            model, tokenizer, model_load_seconds = _load_calibration_runtime_measured(snapshot, config.model_revision)
+        except MeasuredPhaseFailure as error:
+            _complete_phase(root, phase_id, "calibration-model-load", error.cuda_active_seconds, "failed_environment")
+            raise
+        except Exception:
+            _complete_phase(root, phase_id, "calibration-model-load", 0.0, "failed_environment")
+            raise
+        cost_ledger.record(phase_id, "calibration-model-load", model_load_seconds, "completed")
+        _complete_phase(root, phase_id, "calibration-model-load", model_load_seconds, "completed")
+        cumulative = _calibration_cost_seconds(cost_ledger)
         forbidden = set(fresh["forbidden_ids"])
         pilot_examples: dict[tuple[str, int], tuple[Example, ...]] = {}
         for family in FAMILIES:
             for candidate in (1, 2):
-                _budget_check(root, cumulative, config)
-                _append_ledger(root, {"event": "before_pilot", "family": family, "candidate": candidate, "cumulative_cuda_active_seconds": cumulative, "artifact_bytes": _tree_bytes(root)})
+                _budget_check(root, cost_ledger, config)
                 examples = make_pilot(config, family, candidate, forbidden)
                 pilot_examples[(family, candidate)] = examples
                 forbidden.update(row.id for row in examples)
@@ -289,24 +322,37 @@ def _calibrate(root: Path, config: V1Config, config_path: Path, project_root: Pa
                     tokenizer_sha256=str(signatures["tokenizer"]),
                 )
                 _verify_v1_split(split_path, str(split_manifest["sha256"]), len(examples))
-                score_path = root / "scores" / f"pilot-{family}-c{candidate}.jsonl"
-                active_score_path = score_path
-                score_result = score_v1_examples(
-                    model, tokenizer, examples, "single", score_path, signatures,
-                    max_output_tokens=256, max_total_tokens=512, deadline=deadline,
-                )
-                cumulative += float(score_result["cuda_active_seconds"])
-                _append_ledger(root, {"event": "raw_score_file_written", "path": str(score_path.relative_to(root)), "row_count": score_result["validated_count"], "raw_sha256": score_result["raw_sha256"], "phase_cuda_active_seconds": score_result["cuda_active_seconds"], "cumulative_cuda_active_seconds": cumulative, "artifact_bytes": _tree_bytes(root)})
-                summary = _validate_score_file(score_path, examples, score_result)
-                score_manifest[f"pilot-{family}-c{candidate}"] = {
+                score_key = f"pilot-{family}-c{candidate}"
+                score_manifest[score_key] = {
                     "split_sha256": split_manifest["sha256"],
                     "split_manifest_sha256": sha256_file(Path(str(split_path) + ".manifest.json")),
                     "split_count": len(examples),
+                }
+                _append_ledger(root, {"event": "split_frozen", "score_key": score_key, "split_path": str(split_path.relative_to(root)), **score_manifest[score_key]})
+                score_path = root / "scores" / f"pilot-{family}-c{candidate}.jsonl"
+                active_score_path = score_path
+                phase_id = _start_phase(root, "score", str(score_path.relative_to(root)), {"score_key": score_key, "ordered_ids": [row.id for row in examples]})
+                try:
+                    score_result = score_v1_examples(
+                        model, tokenizer, examples, "single", score_path, signatures,
+                        max_output_tokens=256, max_total_tokens=512, deadline=deadline,
+                    )
+                except ScoreExecutionError as error:
+                    outcome = "stopped_resource" if error.deadline_exceeded else "failed_environment"
+                    cost_ledger.record(phase_id, "calibration-pilot", error.cuda_active_seconds, outcome)
+                    _complete_phase(root, phase_id, "calibration-pilot", error.cuda_active_seconds, outcome, {"row_count": error.row_count, "raw_sha256": error.raw_sha256})
+                    raise
+                cost_ledger.record(phase_id, "calibration-pilot", float(score_result["cuda_active_seconds"]), "completed")
+                _complete_phase(root, phase_id, "calibration-pilot", float(score_result["cuda_active_seconds"]), "completed", {"row_count": score_result["validated_count"], "raw_sha256": score_result["raw_sha256"]})
+                cumulative = _calibration_cost_seconds(cost_ledger)
+                summary = _validate_score_file(score_path, examples, score_result)
+                score_manifest[score_key] = {
+                    **score_manifest[score_key],
                     "score_sha256": score_result["raw_sha256"],
                     "score_count": score_result["validated_count"],
                     "summary": summary,
                 }
-                _budget_check(root, cumulative, config)
+                _budget_check(root, cost_ledger, config)
                 table_row = _pilot_summary(family, candidate, summary)
                 pilot_table.append(table_row)
         choices, fallback = _select_pilot_difficulties(pilot_table)
@@ -325,8 +371,7 @@ def _calibrate(root: Path, config: V1Config, config_path: Path, project_root: Pa
         for row in pilot_table:
             row["selected"] = row["candidate"] == choices[str(row["family"])]
             row["selection_kind"] = "selected_first_eligible" if row["family"] not in fallback and row["selected"] else "prespecified_candidate_1_fallback" if row["family"] in fallback and row["selected"] else "not_selected"
-        _budget_check(root, cumulative, config)
-        _append_ledger(root, {"event": "before_development", "cumulative_cuda_active_seconds": cumulative, "artifact_bytes": _tree_bytes(root)})
+        _budget_check(root, cost_ledger, config)
         splits = make_selected_splits(config, choices, forbidden)
         dev_examples = splits["dev"]
         sealed_examples = splits["sealed"]
@@ -337,14 +382,31 @@ def _calibrate(root: Path, config: V1Config, config_path: Path, project_root: Pa
         sealed_manifest = freeze_v1_split(sealed_path, sealed_examples, tokenizer, revision=config.model_revision, tokenizer_sha256=str(signatures["tokenizer"]))
         sealed_meta = {"sha256": sealed_manifest["sha256"], "count": len(sealed_examples)}
         dev_split_evidence = {"sha256": dev_manifest["sha256"], "count": len(dev_examples)}
+        score_manifest["dev-f0"] = {
+            "split_sha256": dev_manifest["sha256"],
+            "split_manifest_sha256": sha256_file(Path(str(dev_path) + ".manifest.json")),
+            "split_count": len(dev_examples),
+        }
+        _append_ledger(root, {"event": "split_frozen", "score_key": "dev-f0", "split_path": str(dev_path.relative_to(root)), **score_manifest["dev-f0"]})
         dev_score_path = root / "scores" / "dev-f0.jsonl"
         active_score_path = dev_score_path
-        dev_result = score_v1_examples(model, tokenizer, dev_examples, "single", dev_score_path, signatures, max_output_tokens=256, max_total_tokens=512, deadline=deadline)
-        cumulative += float(dev_result["cuda_active_seconds"])
-        _append_ledger(root, {"event": "raw_score_file_written", "path": str(dev_score_path.relative_to(root)), "row_count": dev_result["validated_count"], "raw_sha256": dev_result["raw_sha256"], "phase_cuda_active_seconds": dev_result["cuda_active_seconds"], "cumulative_cuda_active_seconds": cumulative, "artifact_bytes": _tree_bytes(root)})
+        phase_id = _start_phase(root, "score", str(dev_score_path.relative_to(root)), {"score_key": "dev-f0", "ordered_ids": [row.id for row in dev_examples]})
+        try:
+            dev_result = score_v1_examples(model, tokenizer, dev_examples, "single", dev_score_path, signatures, max_output_tokens=256, max_total_tokens=512, deadline=deadline)
+        except ScoreExecutionError as error:
+            outcome = "stopped_resource" if error.deadline_exceeded else "failed_environment"
+            cost_ledger.record(phase_id, "calibration-dev", error.cuda_active_seconds, outcome)
+            _complete_phase(root, phase_id, "calibration-dev", error.cuda_active_seconds, outcome, {"row_count": error.row_count, "raw_sha256": error.raw_sha256})
+            raise
+        cost_ledger.record(phase_id, "calibration-dev", float(dev_result["cuda_active_seconds"]), "completed")
+        _complete_phase(root, phase_id, "calibration-dev", float(dev_result["cuda_active_seconds"]), "completed", {"row_count": dev_result["validated_count"], "raw_sha256": dev_result["raw_sha256"]})
+        cumulative = _calibration_cost_seconds(cost_ledger)
         dev_summary = _validate_score_file(dev_score_path, dev_examples, dev_result)
-        score_manifest["dev-f0"] = {"score_sha256": dev_result["raw_sha256"], "score_count": dev_result["validated_count"], "summary": dev_summary}
-        _budget_check(root, cumulative, config)
+        score_manifest["dev-f0"] = {
+            **score_manifest["dev-f0"], "score_sha256": dev_result["raw_sha256"],
+            "score_count": dev_result["validated_count"], "summary": dev_summary,
+        }
+        _budget_check(root, cost_ledger, config)
         selected_gate = _development_gate(dev_summary)
         review = _export_blinded_review(dev_score_path, dev_examples, root)
         status = "passed" if selected_gate["passes"] else "stopped_scientific"
@@ -354,7 +416,7 @@ def _calibrate(root: Path, config: V1Config, config_path: Path, project_root: Pa
             "selected_difficulty": choices, "fallback_families": fallback,
             "dev": {"split_sha256": dev_manifest["sha256"], "split_manifest_sha256": sha256_file(Path(str(dev_path) + ".manifest.json")), "split_count": len(dev_examples), "scores": dev_summary, "gate": selected_gate},
             "sealed": sealed_meta,
-            "resources": {"calibration_cuda_active_seconds": cumulative, "artifact_bytes": _tree_bytes(root), "cuda": _cuda_resource_snapshot(), "wall_safety_deadline_seconds": config.resources.maximum_calibration_cuda_seconds, "maximum_calibration_cuda_seconds": config.resources.maximum_calibration_cuda_seconds, "maximum_study_cuda_seconds": config.resources.maximum_study_cuda_seconds, "maximum_artifact_bytes": config.resources.maximum_artifact_bytes},
+            "resources": {"calibration_cuda_active_seconds": cumulative, "artifact_bytes": _tree_bytes(root), "cuda": _cuda_resource_snapshot(), "wall_safety_deadline_seconds": _WALL_SAFETY_SECONDS, "maximum_calibration_cuda_seconds": config.resources.maximum_calibration_cuda_seconds, "maximum_study_cuda_seconds": config.resources.maximum_study_cuda_seconds, "maximum_artifact_bytes": config.resources.maximum_artifact_bytes},
             "human_review": review, "signatures": signatures,
             "runtime_code_files": runtime_code_files,
             "next_stage": "frozen" if status == "passed" else "report",
@@ -364,30 +426,43 @@ def _calibrate(root: Path, config: V1Config, config_path: Path, project_root: Pa
         status, failure = "stopped_resource", str(error)
     except Exception as error:
         status, failure = "failed_environment", f"{type(error).__name__}: {error}"
+        if isinstance(error, ScoreExecutionError) and error.deadline_exceeded:
+            status = "stopped_resource"
+        if isinstance(error, MeasuredPhaseFailure):
+            cumulative = _calibration_cost_seconds(cost_ledger)
         if isinstance(error, ScoreExecutionError):
-            cumulative += float(error.cuda_active_seconds)
             score_manifest["partial_failure"] = {
                 "path": str(active_score_path.relative_to(root)) if active_score_path is not None else None,
                 "row_count": error.row_count, "raw_sha256": error.raw_sha256,
             }
+            if active_score_path is not None:
+                key = active_score_path.stem
+                if key in score_manifest:
+                    score_manifest[key] = {**_mapping(score_manifest[key], "partial score split evidence"), "score_sha256": error.raw_sha256, "score_count": error.row_count, "partial": True}
             if error.deadline_exceeded:
                 status = "stopped_resource"
-        if isinstance(error, MeasuredPhaseFailure):
-            cumulative += float(error.cuda_active_seconds)
+        if "wall safety deadline" in str(error).lower():
+            status = "stopped_resource"
         if active_score_path is not None and active_score_path.is_file() and "partial_failure" not in score_manifest:
+            key = active_score_path.stem
+            raw_hash, row_count = sha256_file(active_score_path), _raw_line_count(active_score_path)
             score_manifest["partial_failure"] = {
                 "path": str(active_score_path.relative_to(root)),
-                "row_count": _raw_line_count(active_score_path),
-                "raw_sha256": sha256_file(active_score_path),
+                "row_count": row_count,
+                "raw_sha256": raw_hash,
             }
-    _append_ledger(root, {"event": "calibration_failed", "phase_cuda_active_seconds": 0.0, "cumulative_cuda_active_seconds": cumulative, "artifact_bytes": _tree_bytes(root), "status": status, "failure": failure})
+            if key in score_manifest:
+                score_manifest[key] = {**_mapping(score_manifest[key], "partial score split evidence"), "score_sha256": raw_hash, "score_count": row_count, "partial": True}
+    cumulative = _calibration_cost_seconds(_load_cost_ledger(root, float(config.resources.maximum_study_cuda_seconds)))
+    _append_ledger(root, {"event": "calibration_failed", "artifact_bytes": _tree_bytes(root), "status": status, "failure": failure, "resource_bound_fired": "wall_safety_deadline" if status == "stopped_resource" and "wall safety deadline" in str(failure).lower() else "cuda_or_artifact_cap" if status == "stopped_resource" else None})
     result_payload = {
         "run_id": payload.get("run_id"), "status": status, "failure": failure,
         "pilot_table": pilot_table, "pilot_scores": score_manifest,
         "dev": None if dev_summary is None and dev_split_evidence is None else {**(dev_split_evidence or {}), "scores": dev_summary},
-        "sealed": sealed_meta, "resources": {"calibration_cuda_active_seconds": cumulative, "artifact_bytes": _tree_bytes(root), "cuda": _cuda_resource_snapshot()},
+        "sealed": sealed_meta,
         "signatures": signatures, "next_stage": "report",
         "runtime_code_files": _runtime_code_files(project_root),
+        "resources": {"calibration_cuda_active_seconds": cumulative, "artifact_bytes": _tree_bytes(root), "cuda": _cuda_resource_snapshot(), "wall_safety_deadline_seconds": _WALL_SAFETY_SECONDS, "resource_bound_fired": "wall_safety_deadline" if status == "stopped_resource" and "wall safety deadline" in str(failure).lower() else "cuda_or_artifact_cap" if status == "stopped_resource" else None},
     }
     return _finish_calibration(root, result_payload, status)
 
@@ -563,11 +638,16 @@ def _export_blinded_review(score_path: Path, examples: Sequence[Example], root: 
 def _finish_calibration(root: Path, payload: Mapping[str, object], status: str) -> dict[str, object]:
     if status not in _TERMINAL:
         raise ValueError(f"invalid calibration status {status}")
+    ledger = _load_cost_ledger(root, 86400.0)
+    frozen_payload = dict(payload)
+    frozen_payload["cuda_cost_ledger_sha256"] = _optional_sha256(root / "resources" / "cuda-cost.jsonl")
+    frozen_payload["cuda_cost_ledger_total_seconds"] = ledger.total_seconds
+    frozen_payload["calibration_cuda_active_seconds"] = _calibration_cost_seconds(ledger)
     prepare = _read_stage(root / "stages" / "prepare.json", "prepare")
-    record = _stage_record("calibrate", status, dict(payload), {"prepare": str(prepare["stage_sha256"])})
+    record = _stage_record("calibrate", status, frozen_payload, {"prepare": str(prepare["stage_sha256"])})
     _write_new(root / "stages" / "calibrate.json", record)
-    result = dict(payload)
-    result.update({"run_id": payload.get("run_id"), "status": status, "next_stage": payload.get("next_stage", "report"), "run_root": str(root), "stage_sha256": record["stage_sha256"]})
+    result = dict(frozen_payload)
+    result.update({"run_id": frozen_payload.get("run_id"), "status": status, "next_stage": frozen_payload.get("next_stage", "report"), "run_root": str(root), "stage_sha256": record["stage_sha256"]})
     return result
 
 
@@ -576,12 +656,29 @@ def _report(root: Path, config: V1Config, config_path: Path) -> dict[str, object
         record = _read_stage(root / "stages" / "report.json", "report")
         prepare = _read_stage(root / "stages" / "prepare.json", "prepare")
         calibration = _read_stage(root / "stages" / "calibrate.json", "calibrate")
+        _validate_run_binding(root, prepare, config, config_path, Path(__file__).resolve().parents[3])
+        if calibration.get("status") == "passed":
+            raise ValueError("calibration passed; final report is reserved until later study stages complete")
+        _validate_calibration_files(root, _mapping(calibration.get("payload"), "calibration payload"))
+        _verify_calibration_runtime_code(root, Path(__file__).resolve().parents[3])
+        _validate_cost_binding(root, _mapping(calibration.get("payload"), "calibration payload"), config)
+        if payload := _mapping(record.get("payload"), "report payload"):
+            if payload.get("config_sha256") != sha256_file(config_path):
+                raise ValueError("idempotent report config hash changed")
         prerequisites = _mapping(record.get("prerequisite_stage_sha256"), "report prerequisites")
         if prerequisites != {"prepare": prepare.get("stage_sha256"), "calibrate": calibration.get("stage_sha256")}:
             raise ValueError("report prerequisite stage hashes changed")
         return {**_mapping(record.get("payload"), "report payload"), "stage_sha256": record["stage_sha256"], "run_root": str(root)}
     prepare = _read_stage(root / "stages" / "prepare.json", "prepare")
+    if not (root / "stages" / "calibrate.json").exists():
+        _recover_interrupted_calibration(root, config, config_path, Path(__file__).resolve().parents[3])
     calibration = _read_stage(root / "stages" / "calibrate.json", "calibrate")
+    _validate_run_binding(root, prepare, config, config_path, Path(__file__).resolve().parents[3])
+    if calibration.get("status") == "passed":
+        raise ValueError("calibration passed; final report is reserved until later study stages complete")
+    _validate_calibration_files(root, _mapping(calibration.get("payload"), "calibration payload"))
+    _verify_calibration_runtime_code(root, Path(__file__).resolve().parents[3])
+    _validate_cost_binding(root, _mapping(calibration.get("payload"), "calibration payload"), config)
     if calibration.get("status") not in _TERMINAL:
         raise ValueError("report requires a terminal calibration record")
     if calibration.get("status") == "passed":
@@ -593,6 +690,7 @@ def _report(root: Path, config: V1Config, config_path: Path) -> dict[str, object
     payload = {
         "run_id": prepared_payload.get("run_id"), "status": calibration.get("status"),
         "prepare_stage_sha256": prepare["stage_sha256"], "calibration_stage_sha256": calibration["stage_sha256"],
+        "config_sha256": sha256_file(config_path),
         "calibration": dict(cal_payload), "next_stage": "complete" if calibration.get("status") in {"stopped_scientific", "stopped_resource", "failed_environment"} else "frozen",
     }
     record = _stage_record("report", str(calibration.get("status")), payload, {"prepare": str(prepare["stage_sha256"]), "calibrate": str(calibration["stage_sha256"])})
@@ -600,18 +698,260 @@ def _report(root: Path, config: V1Config, config_path: Path) -> dict[str, object
     return {**payload, "stage_sha256": record["stage_sha256"], "run_root": str(root)}
 
 
-def _budget_check(root: Path, cumulative: float, config: V1Config) -> None:
+def _validate_run_binding(
+    root: Path, prepare_record: Mapping[str, object], config: V1Config,
+    config_path: Path, project_root: Path,
+) -> None:
+    payload = _mapping(prepare_record.get("payload"), "prepare payload")
+    signatures = _mapping(payload.get("signatures"), "prepare signatures")
+    normalized = {str(key): str(value) for key, value in signatures.items()}
+    run_id = _derive_run_id(config_path.read_bytes(), normalized)
+    if payload.get("run_id") != run_id:
+        raise ValueError("prepare run ID does not match config and frozen signatures")
+    expected = _resolve(config.data.output_root, project_root) / run_id
+    _assert_no_reparse(root)
+    resolved_root = root.resolve(strict=True)
+    if resolved_root != expected.resolve(strict=True):
+        raise ValueError("run root does not match the configured output root and prepare run ID")
+    if Path(str(payload.get("run_root"))).resolve(strict=True) != resolved_root:
+        raise ValueError("prepare payload run root does not match the active run root")
+    if payload.get("config_sha256") != sha256_file(config_path):
+        raise ValueError("config hash differs from prepare record")
+
+
+def _validate_calibration_files(root: Path, payload: Mapping[str, object]) -> None:
+    """Reauthenticate every stage-bound non-sealed split and score before reporting."""
+    pilot_scores = _mapping(payload.get("pilot_scores", {}), "calibration pilot scores")
+    for key, raw_entry in pilot_scores.items():
+        if key != "dev-f0" and not (isinstance(key, str) and key.startswith("pilot-")):
+            raise ValueError(f"unknown non-sealed calibration evidence key: {key}")
+        entry = _mapping(raw_entry, f"calibration evidence {key}")
+        if key == "dev-f0":
+            split_relative = Path("data/dev.jsonl")
+            score_relative = Path("scores/dev-f0.jsonl")
+        else:
+            split_relative = Path("data") / f"{key}.jsonl"
+            score_relative = Path("scores") / f"{key}.jsonl"
+        split_path = _safe_run_file(root, split_relative)
+        sidecar_path = _safe_run_file(root, Path(str(split_relative) + ".manifest.json"))
+        if sha256_file(split_path) != entry.get("split_sha256"):
+            raise ValueError(f"stage-bound split hash mismatch for {key}")
+        if _raw_line_count(split_path) != entry.get("split_count"):
+            raise ValueError(f"stage-bound split count mismatch for {key}")
+        if sha256_file(sidecar_path) != entry.get("split_manifest_sha256"):
+            raise ValueError(f"stage-bound split sidecar hash mismatch for {key}")
+        manifest = _read_json(sidecar_path)
+        if manifest.get("sha256") != entry.get("split_sha256") or manifest.get("count") != entry.get("split_count"):
+            raise ValueError(f"split sidecar does not match stage binding for {key}")
+        ordered_ids = manifest.get("ordered_ids")
+        if not isinstance(ordered_ids, list) or len(ordered_ids) != entry.get("split_count") or any(not isinstance(identifier, str) for identifier in ordered_ids):
+            raise ValueError(f"split sidecar ordered IDs are invalid for {key}")
+        split_rows = _read_jsonl(split_path)
+        split_ids = [row.get("id") for row in split_rows]
+        if split_ids != ordered_ids or len(set(split_ids)) != len(split_ids):
+            raise ValueError(f"stage-bound split ordered IDs mismatch for {key}")
+        score_hash, score_count = entry.get("score_sha256"), entry.get("score_count")
+        if score_hash is None and score_count is None:
+            continue
+        score_path = _safe_run_file(root, score_relative)
+        if sha256_file(score_path) != score_hash or _raw_line_count(score_path) != score_count:
+            raise ValueError(f"stage-bound score hash/count mismatch for {key}")
+        score_rows = _read_jsonl(score_path)
+        score_ids = [row.get("example_id") for row in score_rows]
+        if entry.get("partial") is True:
+            if score_ids != ordered_ids[:len(score_ids)]:
+                raise ValueError(f"stage-bound partial score ordered IDs mismatch for {key}")
+        elif score_ids != ordered_ids:
+            raise ValueError(f"stage-bound score ordered IDs mismatch for {key}")
+        summary = entry.get("summary")
+        if isinstance(summary, Mapping) and summarize_exact_scores(score_rows) != summary:
+            raise ValueError(f"stage-bound score summary mismatch for {key}")
+    partial = payload.get("partial_failure")
+    if partial is not None:
+        partial = _mapping(partial, "partial score evidence")
+        relative = Path(str(partial.get("path", "")))
+        if not relative.parts or relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("partial score evidence path is unsafe")
+        partial_path = _safe_run_file(root, relative)
+        if sha256_file(partial_path) != partial.get("raw_sha256") or _raw_line_count(partial_path) != partial.get("row_count"):
+            raise ValueError("partial score evidence hash/count mismatch")
+    expected_splits = {"data/dev.jsonl"} if "dev-f0" in pilot_scores else set()
+    expected_scores = set()
+    for key, raw_entry in pilot_scores.items():
+        entry = _mapping(raw_entry, f"calibration evidence {key}")
+        split = "data/dev.jsonl" if key == "dev-f0" else f"data/{key}.jsonl"
+        score = "scores/dev-f0.jsonl" if key == "dev-f0" else f"scores/{key}.jsonl"
+        expected_splits.add(split)
+        if split != "data/sealed.jsonl":
+            expected_splits.add(split + ".manifest.json")
+        if entry.get("score_sha256") is not None:
+            expected_scores.add(score)
+    if isinstance(partial, Mapping) and partial.get("path"):
+        expected_scores.add(str(partial["path"]))
+    for folder, expected in ((root / "data", expected_splits), (root / "scores", expected_scores)):
+        actual: set[str] = set()
+        if folder.exists():
+            for item in folder.rglob("*.jsonl"):
+                relative = item.relative_to(root).as_posix()
+                if relative in {"data/sealed.jsonl", "data/sealed.jsonl.manifest.json"}:
+                    continue
+                actual.add(relative)
+            if folder.name == "data":
+                actual.update(
+                    relative for item in folder.rglob("*.manifest.json")
+                    if (relative := item.relative_to(root).as_posix()) != "data/sealed.jsonl.manifest.json"
+                )
+        if actual != expected:
+            raise ValueError(f"unbound or missing non-sealed calibration files: {sorted(actual ^ expected)[:1]}")
+
+
+def _safe_run_file(root: Path, relative: Path) -> Path:
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("run evidence path escapes the V1 run root")
+    path = root / relative
+    _assert_no_reparse(path)
+    resolved = path.resolve(strict=True)
+    resolved.relative_to(root.resolve(strict=True))
+    if not resolved.is_file():
+        raise ValueError("run evidence path must be a regular file")
+    return resolved
+
+
+def _budget_check(root: Path, ledger: CudaCostLedger, config: V1Config) -> None:
     artifacts = _tree_bytes(root)
-    if cumulative >= config.resources.maximum_calibration_cuda_seconds:
+    if _calibration_cost_seconds(ledger) >= config.resources.maximum_calibration_cuda_seconds:
         raise ResourceLimitReached("calibration CUDA-active time cap reached")
-    if cumulative >= config.resources.maximum_study_cuda_seconds:
+    if ledger.total_seconds >= config.resources.maximum_study_cuda_seconds:
         raise ResourceLimitReached("whole-study CUDA-active time cap reached")
     if artifacts >= config.resources.maximum_artifact_bytes:
         raise ResourceLimitReached("new artifact byte cap reached")
 
 
+def _assert_calibration_not_started(root: Path) -> None:
+    if (root / "stages" / "calibration-attempt.json").exists():
+        raise FileExistsError("calibration attempt already exists; retries require a new run identity")
+
+
+def _write_attempt_marker(root: Path, prepare: Mapping[str, object], config_path: Path) -> None:
+    path = root / "stages" / "calibration-attempt.json"
+    payload = {
+        "run_id": _mapping(prepare.get("payload"), "prepare payload").get("run_id"),
+        "config_sha256": sha256_file(config_path),
+        "started_utc": _utc_now(), "wall_started_monotonic": time.monotonic(),
+        "process_id": os.getpid(),
+    }
+    _write_new(path, _stage_record("calibration-attempt", "running", payload, {"prepare": str(prepare["stage_sha256"])}))
+    _append_ledger(root, {"event": "calibration_attempt_started", **payload})
+
+
+def _start_phase(root: Path, phase: str, path: str | None = None, metadata: Mapping[str, object] | None = None) -> str:
+    phase_id = str(uuid.uuid4())
+    _append_ledger(root, {
+        "event": "phase_started", "phase_id": phase_id, "phase": phase,
+        "process_id": os.getpid(), "wall_started_utc": _utc_now(),
+        "monotonic_started": time.monotonic(), "path": path, **dict(metadata or {}),
+    })
+    return phase_id
+
+
+def _complete_phase(
+    root: Path, phase_id: str, stage: str, cuda_seconds: float, outcome: str,
+    evidence: Mapping[str, object] | None = None,
+) -> None:
+    _append_ledger(root, {
+        "event": "phase_completed", "phase_id": phase_id, "stage": stage,
+        "cuda_active_seconds": float(cuda_seconds), "outcome": outcome,
+        "completed_utc": _utc_now(), **dict(evidence or {}),
+    })
+
+
+def _utc_now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _recover_interrupted_calibration(
+    root: Path, config: V1Config, config_path: Path, project_root: Path,
+) -> dict[str, object]:
+    prepare = _read_stage(root / "stages" / "prepare.json", "prepare")
+    _validate_run_binding(root, prepare, config, config_path, project_root)
+    _assert_no_reparse(root / "resources" / "progress.jsonl")
+    events = _read_jsonl(root / "resources" / "progress.jsonl") if (root / "resources" / "progress.jsonl").exists() else []
+    started = {str(row.get("phase_id")): row for row in events if row.get("event") == "phase_started"}
+    completed = {str(row.get("phase_id")) for row in events if row.get("event") in {"phase_completed", "phase_recovered"}}
+    open_phases = [event for phase_id, event in started.items() if phase_id not in completed]
+    attempt = _read_stage(root / "stages" / "calibration-attempt.json", "calibration-attempt") if (root / "stages" / "calibration-attempt.json").exists() else None
+    if attempt is None and not open_phases:
+        raise FileNotFoundError("no durable calibration attempt exists to recover")
+    if attempt is not None:
+        attempt_payload = _mapping(attempt.get("payload"), "calibration attempt payload")
+        prepare_payload = _mapping(prepare.get("payload"), "prepare payload")
+        if attempt_payload.get("run_id") != prepare_payload.get("run_id") or attempt_payload.get("config_sha256") != sha256_file(config_path):
+            raise ValueError("calibration attempt marker does not bind the prepared run and config")
+        if _mapping(attempt.get("prerequisite_stage_sha256"), "attempt prerequisites") != {"prepare": prepare.get("stage_sha256")}:
+            raise ValueError("calibration attempt marker prerequisite hash changed")
+        pid = int(attempt_payload.get("process_id", -1))
+        if pid != os.getpid() and _process_is_alive(pid):
+            raise RuntimeError("calibration process is still active; report will not race it")
+    ledger = _load_cost_ledger(root, float(config.resources.maximum_study_cuda_seconds))
+    now_mono = time.monotonic()
+    wall_upper = 0.0
+    for event in open_phases:
+        try:
+            wall_upper = max(wall_upper, max(0.0, now_mono - float(event["monotonic_started"])))
+        except (KeyError, TypeError, ValueError):
+            wall_upper = _WALL_SAFETY_SECONDS
+    if attempt is not None:
+        try:
+            wall_upper = max(wall_upper, max(0.0, now_mono - float(_mapping(attempt.get("payload"), "attempt payload")["wall_started_monotonic"])))
+        except (KeyError, TypeError, ValueError):
+            wall_upper = _WALL_SAFETY_SECONDS
+    status = "stopped_resource" if wall_upper >= _WALL_SAFETY_SECONDS else "failed_environment"
+    score_entries: dict[str, object] = {}
+    partial: dict[str, object] | None = None
+    for event in events:
+        if event.get("event") == "split_frozen":
+            key = str(event["score_key"])
+            score_entries[key] = {key_name: event[key_name] for key_name in ("split_sha256", "split_manifest_sha256", "split_count")}
+        if event.get("event") == "phase_started" and event.get("phase") == "score":
+            key, rel = str(event.get("score_key", "")), str(event.get("path", ""))
+            if key and key in score_entries:
+                score_path = root / Path(rel)
+                if score_path.exists():
+                    partial = {"path": rel, "raw_sha256": sha256_file(score_path), "row_count": _raw_line_count(score_path)}
+                    score_entries[key] = {**_mapping(score_entries[key], "split evidence"), "score_sha256": partial["raw_sha256"], "score_count": partial["row_count"], "partial": True}
+    payload: dict[str, object] = {
+        "run_id": _mapping(prepare.get("payload"), "prepare payload").get("run_id"),
+        "status": status, "failure": "process ended before calibration stage was durably completed",
+        "pilot_scores": score_entries, "partial_failure": partial,
+        "resources": {
+            "calibration_cuda_active_seconds": _calibration_cost_seconds(ledger),
+            "cuda_budget_state": "unknown_after_process_loss",
+            "wall_elapsed_upper_bound_seconds": wall_upper,
+            "resource_bound_fired": "wall_safety_deadline" if status == "stopped_resource" else "process_interruption",
+            "artifact_bytes": _tree_bytes(root),
+        }, "next_stage": "report",
+        "runtime_code_files": _runtime_code_files(project_root),
+    }
+    for event in open_phases:
+        _append_ledger(root, {"event": "phase_recovered", "phase_id": event.get("phase_id"), "recovered_utc": _utc_now(), "cuda_budget_state": "unknown_after_process_loss"})
+    return _finish_calibration(root, payload, status)
+
+
+def _process_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def _append_ledger(root: Path, item: Mapping[str, object]) -> None:
-    path = root / "resources" / "ledger.jsonl"
+    path = root / "resources" / "progress.jsonl"
     _assert_no_reparse(path)
     encoded = canonical_json(dict(item))
     with path.open("ab") as stream:
@@ -621,11 +961,37 @@ def _append_ledger(root: Path, item: Mapping[str, object]) -> None:
 
 
 def _ledger_seconds(root: Path) -> float:
-    path = root / "resources" / "ledger.jsonl"
-    if not path.exists():
-        return 0.0
-    rows = _read_jsonl(path)
-    return max((float(row.get("cumulative_cuda_active_seconds", 0.0)) for row in rows), default=0.0)
+    return _calibration_cost_seconds(_load_cost_ledger(root, 86400.0))
+
+
+def _load_cost_ledger(root: Path, cap_seconds: float) -> CudaCostLedger:
+    path = root / "resources" / "cuda-cost.jsonl"
+    _assert_no_reparse(path)
+    ledger = CudaCostLedger.load(path, cap_seconds)
+    if path.exists():
+        encoded = _read_bytes(path)
+        if encoded and not encoded.endswith(b"\n"):
+            raise ValueError("CUDA cost ledger is truncated (missing final newline)")
+    return ledger
+
+
+def _calibration_cost_seconds(ledger: CudaCostLedger) -> float:
+    return sum(entry.elapsed_seconds for entry in ledger.entries if entry.stage.startswith("calibration-"))
+
+
+def _validate_cost_binding(root: Path, payload: Mapping[str, object], config: V1Config) -> None:
+    ledger = _load_cost_ledger(root, float(config.resources.maximum_study_cuda_seconds))
+    expected_hash = payload.get("cuda_cost_ledger_sha256")
+    if expected_hash != _optional_sha256(root / "resources" / "cuda-cost.jsonl"):
+        raise ValueError("anchored CUDA cost ledger hash differs from calibration stage")
+    if float(payload.get("cuda_cost_ledger_total_seconds", -1)) != ledger.total_seconds:
+        raise ValueError("anchored CUDA cost ledger total differs from calibration stage")
+    if float(payload.get("calibration_cuda_active_seconds", -1)) != _calibration_cost_seconds(ledger):
+        raise ValueError("anchored calibration CUDA total differs from calibration stage")
+
+
+def _optional_sha256(path: Path) -> str | None:
+    return sha256_file(path) if path.exists() else None
 
 
 def _tree_bytes(root: Path) -> int:

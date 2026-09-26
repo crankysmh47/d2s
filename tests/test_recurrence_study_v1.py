@@ -120,32 +120,40 @@ def test_prepare_is_exclusive_and_hash_record_is_self_checked(tmp_path: Path) ->
 
 
 def test_budget_stop_is_resource_status_and_artifact_cap_counts_files(tmp_path: Path) -> None:
+    from ppmoe.recurrence.gates import CudaCostLedger
     config = load_v1_config(Path("configs/recurrence-v1.toml"))
     root = tmp_path / "run"
     root.mkdir()
     (root / "evidence.bin").write_bytes(b"evidence")
     limited = replace(config, resources=replace(config.resources, maximum_artifact_bytes=1))
+    ledger = CudaCostLedger.load(root / "resources" / "cuda-cost.jsonl", 86400.0)
     with pytest.raises(ResourceLimitReached, match="artifact byte cap"):
-        _budget_check(root, 0.0, limited)
+        _budget_check(root, ledger, limited)
 
 
 def test_report_waits_until_terminal_no_go_and_never_reads_sealed_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    config_path = Path("configs/recurrence-v1.toml").resolve()
+    from ppmoe.recurrence.study_v1 import _runtime_code_files
+    config_path = tmp_path / "recurrence-v1.toml"
+    config_path.write_bytes(Path("configs/recurrence-v1.toml").read_bytes())
     config = load_v1_config(config_path)
-    root = tmp_path / "run"
+    config = replace(config, data=replace(config.data, output_root=str(tmp_path / "runs")))
+    signatures = {key: chr(97 + index) * 64 for index, key in enumerate(("source", "model", "tokenizer", "train", "dev", "scorer", "generator"))}
+    run_id = _derive_run_id(config_path.read_bytes(), signatures)
+    root = tmp_path / "runs" / run_id
     stages = root / "stages"
     stages.mkdir(parents=True)
     (root / "data").mkdir()
     (root / "data" / "sealed.jsonl").write_bytes(b"poison; must remain unopened")
     config_hash = hashlib.sha256(config_path.read_bytes()).hexdigest()
-    prepare_payload = {"run_id": "run-x", "config_sha256": config_hash}
+    prepare_payload = {"run_id": run_id, "run_root": str(root), "config_sha256": config_hash, "signatures": signatures}
     prepare = _stage_record("prepare", "passed", prepare_payload, {})
     (stages / "prepare.json").write_bytes(canonical_json(prepare))
-    passed = _stage_record("calibrate", "passed", {"run_id": "run-x"}, {"prepare": prepare["stage_sha256"]})
+    passed = _stage_record("calibrate", "passed", {"run_id": run_id}, {"prepare": prepare["stage_sha256"]})
     (stages / "calibrate.json").write_bytes(canonical_json(passed))
     with pytest.raises(ValueError, match="reserved until later study stages"):
         _report(root, config, config_path)
-    stopped = _stage_record("calibrate", "stopped_scientific", {"run_id": "run-x"}, {"prepare": prepare["stage_sha256"]})
+    stopped_payload = {"run_id": run_id, "pilot_scores": {}, "runtime_code_files": _runtime_code_files(Path.cwd()), "cuda_cost_ledger_sha256": None, "cuda_cost_ledger_total_seconds": 0.0, "calibration_cuda_active_seconds": 0.0}
+    stopped = _stage_record("calibrate", "stopped_scientific", stopped_payload, {"prepare": prepare["stage_sha256"]})
     (stages / "calibrate.json").write_bytes(canonical_json(stopped))
     original_open = Path.open
 
@@ -157,6 +165,10 @@ def test_report_waits_until_terminal_no_go_and_never_reads_sealed_file(tmp_path:
     monkeypatch.setattr(Path, "open", guarded_open)
     result = _report(root, config, config_path)
     assert result["status"] == "stopped_scientific"
+    assert _report(root, config, config_path)["stage_sha256"] == result["stage_sha256"]
+    config_path.write_bytes(config_path.read_bytes() + b"\n# drift\n")
+    with pytest.raises(ValueError, match="config hash|run ID"):
+        _report(root, config, config_path)
 
 
 def test_runtime_code_hash_change_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -263,3 +275,131 @@ def test_prepare_verifies_train_dev_but_never_opens_v0_test(tmp_path: Path, monk
     assert result["train_count"] == 8000
     assert result["dev_count"] == 600
     assert len(result["forbidden_ids"]) == 8600
+
+
+def test_snapshot_rejects_unlisted_regular_files(tmp_path: Path) -> None:
+    import hashlib
+    from ppmoe.recurrence.study_v1 import _verify_snapshot
+
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    (snapshot / "weights.safetensors").write_bytes(b"listed")
+    (snapshot / "config.json").write_text("{}", encoding="utf-8")
+    manifest = {"files": [{
+        "relative_path": "weights.safetensors", "bytes": 6,
+        "sha256": hashlib.sha256(b"listed").hexdigest(),
+    }]}
+    with pytest.raises(ValueError, match="inventory differs"):
+        _verify_snapshot(snapshot, manifest)
+
+
+def test_run_root_binding_rejects_copied_prepare_stage(tmp_path: Path) -> None:
+    import hashlib
+    from ppmoe.recurrence.study_v1 import _validate_run_binding
+
+    config_path = Path("configs/recurrence-v1.toml").resolve()
+    config = load_v1_config(config_path)
+    signatures = {key: chr(97 + index) * 64 for index, key in enumerate(("source", "model", "tokenizer", "train", "dev", "scorer", "generator"))}
+    run_id = _derive_run_id(config_path.read_bytes(), signatures)
+    expected = tmp_path / "runs" / run_id
+    expected.mkdir(parents=True)
+    prepare = _stage_record("prepare", "passed", {
+        "run_id": run_id, "run_root": str(expected),
+        "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+        "signatures": signatures,
+    }, {})
+    local_config = replace(config, data=replace(config.data, output_root="runs"))
+    _validate_run_binding(expected, prepare, local_config, config_path, tmp_path)
+    copied = tmp_path / "copied" / run_id
+    copied.mkdir(parents=True)
+    with pytest.raises(ValueError, match="configured output root"):
+        _validate_run_binding(copied, prepare, local_config, config_path, tmp_path)
+
+
+def test_terminal_report_rejects_tampered_score_split_and_sidecar(tmp_path: Path) -> None:
+    import hashlib
+    from ppmoe.recurrence.study_v1 import _validate_calibration_files
+
+    root = tmp_path / "run"
+    data_dir, score_dir = root / "data", root / "scores"
+    data_dir.mkdir(parents=True)
+    score_dir.mkdir()
+    split = data_dir / "pilot-expressions-c1.jsonl"
+    split_raw = b'{"id":"one","split":"pilot","family":"expressions"}\n'
+    split.write_bytes(split_raw)
+    split_sha = hashlib.sha256(split_raw).hexdigest()
+    manifest = {"sha256": split_sha, "count": 1, "ordered_ids": ["one"]}
+    manifest_path = Path(str(split) + ".manifest.json")
+    manifest_path.write_bytes(canonical_json(manifest))
+    manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    score = score_dir / "pilot-expressions-c1.jsonl"
+    score_raw = canonical_json({"example_id": "one", "family": "expressions", "correct": True, "reason_code": "correct"})
+    score.write_bytes(score_raw)
+    summary = {"record_count": 1, "correct": 1, "incorrect": 0, "invalid_format": 0, "pooled_accuracy": 1.0, "global_accuracy": 1.0, "global_invalid_rate": 0.0, "macro_accuracy": 1.0, "families": {"expressions": {"record_count": 1, "correct": 1, "incorrect": 0, "invalid_format": 0, "accuracy": 1.0, "invalid_rate": 0.0, "informative": False}}, "family_order": ["expressions"]}
+    payload = {"pilot_scores": {"pilot-expressions-c1": {
+        "split_sha256": split_sha, "split_count": 1, "split_manifest_sha256": manifest_sha,
+        "score_sha256": hashlib.sha256(score_raw).hexdigest(), "score_count": 1, "summary": summary,
+    }}, "partial_failure": None, "dev": None}
+    (data_dir / "sealed.jsonl").write_bytes(b"sealed payload")
+    (data_dir / "sealed.jsonl.manifest.json").write_bytes(b"sealed manifest")
+    _validate_calibration_files(root, payload)
+    split.write_bytes(b'{"id":"two","split":"pilot","family":"expressions"}\n')
+    manifest_path.write_bytes(canonical_json({"sha256": hashlib.sha256(split.read_bytes()).hexdigest(), "count": 1, "ordered_ids": ["two"]}))
+    with pytest.raises(ValueError, match="stage-bound split hash"):
+        _validate_calibration_files(root, payload)
+
+
+def test_interrupted_phase_report_seals_failure_and_never_resumes(tmp_path: Path) -> None:
+    import hashlib
+    import time
+    from datetime import datetime, timezone
+    from ppmoe.recurrence.study_v1 import _assert_calibration_not_started, _recover_interrupted_calibration
+
+    config_path = Path("configs/recurrence-v1.toml").resolve()
+    config = load_v1_config(config_path)
+    config = replace(config, data=replace(config.data, output_root=str(tmp_path / "runs")))
+    signatures = {key: chr(97 + index) * 64 for index, key in enumerate(("source", "model", "tokenizer", "train", "dev", "scorer", "generator"))}
+    run_id = _derive_run_id(config_path.read_bytes(), signatures)
+    root = tmp_path / "runs" / run_id
+    (root / "stages").mkdir(parents=True)
+    (root / "resources").mkdir()
+    prepare_payload = {"run_id": run_id, "run_root": str(root), "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(), "signatures": signatures}
+    prepare = _stage_record("prepare", "passed", prepare_payload, {})
+    (root / "stages" / "prepare.json").write_bytes(canonical_json(prepare))
+    attempt = _stage_record("calibration-attempt", "running", {
+        "run_id": run_id, "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+        "started_utc": datetime.now(timezone.utc).isoformat(), "wall_started_monotonic": time.monotonic() - 20.0,
+        "process_id": 99999999,
+    }, {"prepare": prepare["stage_sha256"]})
+    (root / "stages" / "calibration-attempt.json").write_bytes(canonical_json(attempt))
+    (root / "resources" / "progress.jsonl").write_bytes(canonical_json({
+        "event": "phase_started", "phase_id": "lost-score", "phase": "score", "process_id": 99999999,
+        "path": "scores/pilot-expressions-c1.jsonl", "wall_started_utc": datetime.now(timezone.utc).isoformat(),
+        "monotonic_started": time.monotonic() - 20.0,
+    }))
+    result = _recover_interrupted_calibration(root, config, config_path, Path.cwd())
+    assert result["status"] in {"failed_environment", "stopped_resource"}
+    assert result["resources"]["cuda_budget_state"] == "unknown_after_process_loss"
+    with pytest.raises(FileExistsError, match="attempt already exists"):
+        _assert_calibration_not_started(root)
+
+
+def test_cuda_budget_ledger_tampering_fails_closed(tmp_path: Path) -> None:
+    from ppmoe.recurrence.gates import CudaCostLedger
+    from ppmoe.recurrence.study_v1 import _load_cost_ledger
+
+    root = tmp_path / "run"
+    root.mkdir()
+    (root / "resources").mkdir()
+    ledger_path = root / "resources" / "cuda-cost.jsonl"
+    ledger = CudaCostLedger.load(ledger_path, 86400.0)
+    ledger.record("attempt-a", "calibration-score", 2.0, "completed")
+    assert _load_cost_ledger(root, 86400.0).total_seconds == pytest.approx(2.0)
+    original = ledger_path.read_bytes()
+    ledger_path.write_bytes(original.replace(b'"elapsed_seconds":2.0', b'"elapsed_seconds":3.0'))
+    with pytest.raises(ValueError, match="integrity|anchor"):
+        _load_cost_ledger(root, 86400.0)
+    ledger_path.write_bytes(original)
+    ledger_path.write_bytes(ledger_path.read_bytes()[:-1])
+    with pytest.raises(ValueError, match="integrity|truncated|anchor"):
+        _load_cost_ledger(root, 86400.0)
