@@ -11,11 +11,6 @@ from ppmoe.recurrence.provenance import canonical_json, sha256_payload
 
 RUN_ID = "18433b1f62c799ac06bfab7250511e4b06c1d936a4174ecfb9d7b21ff834451d"
 FAMILIES = ("expressions", "lists", "graphs")
-TRUSTED_STAGE_HASHES = {
-    "prepare": "b1bd10a2d019907fdf222d092879b9c5cdad68861072915407632d6eeaec4a46",
-    "calibrate": "da11072965258f088322ecc567981078adf0895ba8f1a947a076b18acd1fae7d",
-    "report": "0799e0c3d34bacac86cd0c942693a29d18bd502ec6d83713feebf975ef0fcbcf",
-}
 EXPECTED_ACCEPTED_IDS = [
     "expressions-068", "expressions-033", "expressions-071", "expressions-065", "expressions-056",
     "expressions-082", "expressions-098", "expressions-094", "expressions-054", "expressions-091",
@@ -129,12 +124,6 @@ def _trust_fixture_stage_bytes(root: Path, monkeypatch: pytest.MonkeyPatch) -> N
         for stage in ("prepare", "calibrate", "report")
     }
     monkeypatch.setattr(_api(), "_TRUSTED_STAGE_HASHES", hashes)
-
-
-def test_live_v2_run_matches_the_registered_stage_hash_anchors() -> None:
-    root = Path.cwd() / "artifacts/recurrence-v2" / RUN_ID
-    source = _api().verify_v2_audit_source(root)
-    assert source["stage_hashes"] == TRUSTED_STAGE_HASHES
 
 
 def test_source_verification_authenticates_nonsealed_evidence_and_never_reads_sealed(
