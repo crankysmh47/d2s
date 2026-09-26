@@ -66,8 +66,18 @@ def audit_run(
             elif reason == "wrong_value":
                 wrong_value = _fixture_wrong_value(family, expected)
                 completion_text, parsed_value = f"Final answer: {_fixture_render(wrong_value)}", wrong_value
+                if family == "lists" and index == 50:
+                    completion_text = f"Final answer: The vector is {_fixture_render(wrong_value)}"
+                if family == "lists" and index == 42:
+                    completion_text = r"Final answer: \boxed{[3,3]}"
+                if family == "graphs" and index == 42:
+                    completion_text = "So, the answer is: **Yes**."
             else:
                 completion_text, parsed_value = f"Final answer: {_fixture_render(expected)}", expected
+                if family == "graphs" and index == 69:
+                    completion_text = "Yes"
+                if family == "graphs" and index == 71:
+                    completion_text = "there is **a directed path** from **A** to **C**"
                 if family == "expressions" and index == 68:
                     completion_text = "Reasoning: 69\nFinal answer: 70"
             score_rows.append({
@@ -550,6 +560,32 @@ def test_reconcile_accepts_claim_tied_to_unambiguous_final_cue(audit_run, tmp_pa
     diagnostic = json.loads(Path(result["diagnostic_path"]).read_bytes())
     row = next(item for item in diagnostic["rows"] if item["audit_id"] == audit_id)
     assert row["classification"] == "wrong"
+    assert row["adjudication_required"] is False
+
+
+@pytest.mark.parametrize(("family", "source_id", "claim", "evidence", "classification"), [
+    ("graphs", "graphs-069", "yes", "Yes", "correct"),
+    ("graphs", "graphs-042", "yes", "So, the answer is: **Yes**.", "wrong"),
+    ("graphs", "graphs-071", "yes", "there is **a directed path** from **A** to **C**", "correct"),
+    ("lists", "lists-050", [1, 1], "Final answer: The vector is [1,1]", "wrong"),
+    ("lists", "lists-042", [3, 3], r"Final answer: \boxed{[3,3]}", "wrong"),
+])
+def test_reconcile_accepts_frozen_scorer_final_answer_forms(
+    audit_run, tmp_path: Path, family: str, source_id: str,
+    claim: object, evidence: str, classification: str,
+) -> None:
+    audit_root = _export_fixture_audit(audit_run, tmp_path)
+    _write_review_files(audit_root)
+    audit_id = _source_audit_id(audit_root, source_id)
+    _replace_review_row(audit_root, family, audit_id, {
+        "claimed_value": claim, "evidence_span": evidence,
+    })
+
+    result = _api().reconcile_v2_audit(audit_run[0], audit_root)
+
+    diagnostic = json.loads(Path(result["diagnostic_path"]).read_bytes())
+    row = next(item for item in diagnostic["rows"] if item["audit_id"] == audit_id)
+    assert row["classification"] == classification
     assert row["adjudication_required"] is False
 
 

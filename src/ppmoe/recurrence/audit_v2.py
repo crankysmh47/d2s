@@ -34,17 +34,30 @@ _REVIEW_STATUSES = {"conclusive", "ambiguous", "missing", "truncated"}
 _EXPLANATION_STATUSES = {"valid", "invalid", "indeterminate"}
 _AUDIT_FINAL_CUE = re.compile(
     r"^[ \t]*(?:#{1,6}[ \t]*)?(?:[*_]{1,3})?(?:Final[ \t]+(?:answer|result|list)|Answer|"
-    r"So[ \t]+the[ \t]+final[ \t]+answer[ \t]+is)\b(?:[*_]{1,3})?[ \t]*:?[ \t]*",
+    r"So,[ \t]+the[ \t]+answer[ \t]+is|So[ \t]+the[ \t]+final[ \t]+answer[ \t]+is)\b"
+    r"(?:[*_]{1,3})?[ \t]*:?[ \t]*",
     re.IGNORECASE | re.MULTILINE,
 )
 _AUDIT_BOXED_INTEGER = re.compile(r"^\\boxed\s*\{\s*([+-]?\d+)\s*\}")
 _AUDIT_BARE_INTEGER = re.compile(r"^(?:is\b[ \t]*)?(?:=[ \t]*)?([+-]?\d+)(?![\w+-]|\.\d)", re.IGNORECASE)
-_AUDIT_VECTOR = re.compile(r"^\[\s*[+-]?\d+(?:\s*,\s*[+-]?\d+)*\s*\]")
-_AUDIT_GRAPH_VALUE = re.compile(r"^(?:is\b[ \t]*)?(yes|no)\b", re.IGNORECASE)
-_AUDIT_GRAPH_LEADING = re.compile(r"^[ \t]*(yes|no)\s*\.", re.IGNORECASE)
+_AUDIT_VECTOR = re.compile(r"\[\s*[+-]?\d+(?:\s*,\s*[+-]?\d+)*\s*\]")
+_AUDIT_GRAPH_VALUE = re.compile(
+    r"^(?:is\b[ \t]*)?(?:[*_]{1,3})?(yes|no)(?:[*_]{1,3})?[.!]?[ \t]*$",
+    re.IGNORECASE,
+)
+_AUDIT_GRAPH_LEADING = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]*)?(?:[*_]{1,3})?(yes|no)(?:[*_]{1,3})?[.!]?[ \t]*$",
+    re.IGNORECASE,
+)
+_AUDIT_MARKED_VERTEX = r"(?:\*\*[A-Z]\*\*|__[A-Z]__|\*[A-Z]\*|_[A-Z]_|[A-Z])"
 _AUDIT_GRAPH_CONCLUSION = re.compile(
-    r"\bthere\s+is\s+(?P<negative>no\s+)?(?:(?:direct(?:\s+or\s+indirect)?|indirect)\s+)?path\s+"
-    r"from\s+[A-Z]\s+to\s+[A-Z]\b",
+    rf"\bthere\s+is\s+(?P<claim>[^.!?\n]+?)\s+from\s+"
+    rf"(?P<start>{_AUDIT_MARKED_VERTEX})\s+to\s+(?P<end>{_AUDIT_MARKED_VERTEX})(?![A-Z])",
+    re.IGNORECASE,
+)
+_AUDIT_GRAPH_CLAIM = re.compile(
+    r"(?:(?P<negative>no)\s+)?(?P<article>a\s+)?"
+    r"(?:(?:direct(?:ed)?(?:\s+or\s+indirect)?|indirect)\s+)?path\Z",
     re.IGNORECASE,
 )
 
@@ -326,7 +339,9 @@ def reconcile_v2_audit(run_root: Path, audit_root: Path) -> dict[str, object]:
             claimed = review["claimed_value"]
             adjudication_required = bool(
                 status == "conclusive"
-                and not _claim_has_final_evidence(claimed, family, review["evidence_span"], packet["response"])
+                and not _claim_has_final_evidence(
+                    claimed, family, review["evidence_span"], packet["response"], packet["question"],
+                )
             )
             if status == "conclusive":
                 classification = "ambiguous" if adjudication_required else ("correct" if claimed == expected else "wrong")
@@ -547,9 +562,12 @@ def _validate_review_rows(
     return rows
 
 
-def _claim_has_final_evidence(claimed: object, family: str, evidence: str, response: str) -> bool:
-    evidence_values, evidence_complete = _final_assertions(evidence, family)
-    response_values, response_complete = _final_assertions(response, family)
+def _claim_has_final_evidence(
+    claimed: object, family: str, evidence: str, response: str, question: str,
+) -> bool:
+    query_endpoints = _graph_query_endpoints(question) if family == "graphs" else None
+    evidence_values, evidence_complete = _final_assertions(evidence, family, query_endpoints)
+    response_values, response_complete = _final_assertions(response, family, query_endpoints)
     if not evidence_complete or not response_complete or not evidence_values or not response_values:
         return False
     if not all(_same_answer(value, claimed, family) for value in evidence_values):
@@ -559,7 +577,9 @@ def _claim_has_final_evidence(claimed: object, family: str, evidence: str, respo
     return True
 
 
-def _final_assertions(text: str, family: str) -> tuple[list[object], bool]:
+def _final_assertions(
+    text: str, family: str, query_endpoints: tuple[str, str] | None = None,
+) -> tuple[list[object], bool]:
     values: list[object] = []
     complete = True
     matches = list(_AUDIT_FINAL_CUE.finditer(text))
@@ -575,7 +595,7 @@ def _final_assertions(text: str, family: str) -> tuple[list[object], bool]:
             else:
                 values.append(int(match.group(1)))
         elif family == "lists":
-            match = _AUDIT_VECTOR.match(payload)
+            match = _AUDIT_VECTOR.search(payload)
             if match is None:
                 complete = False
             else:
@@ -592,11 +612,21 @@ def _final_assertions(text: str, family: str) -> tuple[list[object], bool]:
         leading = _AUDIT_GRAPH_LEADING.match(first_line)
         if leading is not None:
             values.append(leading.group(1).casefold())
-        values.extend(
-            "no" if match.group("negative") else "yes"
-            for match in _AUDIT_GRAPH_CONCLUSION.finditer(text)
-        )
+        for match in _AUDIT_GRAPH_CONCLUSION.finditer(text):
+            endpoints = (re.sub(r"[*_]", "", match.group("start")).upper(), re.sub(r"[*_]", "", match.group("end")).upper())
+            if query_endpoints is not None and endpoints != query_endpoints:
+                continue
+            claim = re.sub(r"[*_]", "", match.group("claim")).strip()
+            claim_match = _AUDIT_GRAPH_CLAIM.fullmatch(claim)
+            if claim_match is None or (claim_match.group("negative") and claim_match.group("article")):
+                continue
+            values.append("no" if claim_match.group("negative") else "yes")
     return values, complete
+
+
+def _graph_query_endpoints(question: str) -> tuple[str, str] | None:
+    match = re.search(r"\bpath\s+from\s+([A-Z])\s+to\s+([A-Z])\b", question, re.IGNORECASE)
+    return (match.group(1).upper(), match.group(2).upper()) if match is not None else None
 
 
 def _same_answer(left: object, right: object, family: str) -> bool:
