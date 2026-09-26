@@ -37,15 +37,16 @@ Detailed bounded contract: [recurrence-review-plan.md](docs/recurrence-review-pl
 
 The blank human sheet is [artifacts/recurrence-review-v1/baseline-256/human-review/review.md](artifacts/recurrence-review-v1/baseline-256/human-review/review.md). Edit only the last column. The model-graded comparison is in `luna-review/review.md`. No training has started; the registered V0 stop still applies.
 
-## Authorized V1 study: current execution queue
+## Authorized V1 study: registered calibration stop
 
 Design: [2026-09-26-recurrence-v1-design.md](docs/superpowers/specs/2026-09-26-recurrence-v1-design.md). Detailed sequential contract: [2026-09-26-recurrence-v1-execution.md](docs/superpowers/plans/2026-09-26-recurrence-v1-execution.md). This is a new run; V0 remains terminal.
 
 - [x] Freeze deterministic final-answer scoring and graph explanation audit; prove it on old answers and adversarial cases (23 parsed, 18 correct, five wrong, seven ungradable; SHA256 in V1 spec).
-- [ ] Generate two bounded difficulty pilots per family, select deterministically, and pass a fresh development informativeness gate.
-- [ ] Score F0/F1/F2 on the selected fresh development set and check resource evidence.
-- [ ] If gates pass, run paired A1/A2/A3 LoRA discovery, retention, and timing controls; stop on any no-go.
-- [ ] If discovery passes, run seed-48 confirmation and sealed evaluation, report and push the supported result.
+- [x] Run all six fresh 30-example difficulty pilots and apply the frozen candidate gate. Only expressions qualified; fewer than two families means `stopped_scientific` before development generation.
+- [x] Seal the V1 terminal report and independently check pilot counts, hashes, and the absence of development/sealed/training artifacts. See [V1 calibration report](docs/recurrence-v1-calibration-report.md).
+- [ ] Frozen F0/F1/F2 controls, LoRA discovery, retention/timing, seed-48 confirmation, and sealed evaluation: **not run, and not authorized in this stopped V1 run**.
+
+Next research decision: whether to authorize a separately registered V2 benchmark/calibration protocol that fixes graph final-answer parsing without accepting conflicting answers and disambiguates list instructions. It must use fresh pilot seeds and preserve V1 as a no-go; V1 provides no recurrence-efficacy result.
 
 ## Deferred, not an execution queue
 
