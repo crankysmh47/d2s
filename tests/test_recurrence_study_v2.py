@@ -204,6 +204,19 @@ def test_changed_v1_pilot_prevents_prepare_before_v2_root_creation(v2_source_fix
     assert not (project_root / "artifacts/recurrence-v2").exists()
 
 
+def test_run_prepare_rejects_tampered_v1_pilot_before_creating_v2_root(
+    v2_source_fixture: tuple[object, Path, Path], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, project_root, split = v2_source_fixture
+    split.write_bytes(split.read_bytes() + b" ")
+    config_path = project_root / "configs/recurrence-v2.toml"
+    monkeypatch.setattr(study_v2, "__file__", str(project_root / "src/ppmoe/recurrence/study_v2.py"))
+    monkeypatch.setattr(study_v2, "load_v2_config", lambda _path: config)
+    with pytest.raises(ValueError, match="V1 pilot.*hash"):
+        study_v2.run_v2_stage("prepare", config_path)
+    assert not (project_root / "artifacts/recurrence-v2").exists()
+
+
 def test_verification_never_opens_v0_or_v1_sealed_data(
     v2_source_fixture: tuple[object, Path, Path], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -432,3 +445,32 @@ def test_prepare_failure_after_root_creation_records_failed_environment(tmp_path
     assert result["status"] == "failed_environment"
     record = study_v2.read_v2_stage(Path(str(result["run_root"])) / "stages/prepare.json", "prepare")
     assert record["status"] == "failed_environment"
+
+
+def test_partial_prepare_stage_write_does_not_claim_failure_was_durably_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        load_v2_config(Path("configs/recurrence-v2.toml")),
+        data=replace(load_v2_config(Path("configs/recurrence-v2.toml")).data, output_root=str(tmp_path / "runs")),
+    )
+    _, inputs = _prepare_inputs()
+    monkeypatch.setattr(study_v2, "load_v2_config", lambda _path: config)
+    monkeypatch.setattr(study_v2, "verify_v2_sources", lambda _config, _root: inputs)
+    monkeypatch.setattr(study_v2, "_load_v2_tokenizer", lambda _snapshot, _revision: _TinyTokenizer())
+    original_write = study_v2._write_new
+
+    def fail_after_partial_stage_write(path: Path, raw: bytes) -> None:
+        if path.name == "prepare.json":
+            path.write_bytes(raw[:24])
+            raise OSError("simulated partial prepare stage write")
+        original_write(path, raw)
+
+    monkeypatch.setattr(study_v2, "_write_new", fail_after_partial_stage_write)
+    with pytest.raises(RuntimeError, match="failed_environment.*durably"):
+        study_v2.run_v2_stage("prepare", Path("configs/recurrence-v2.toml"))
+    run_dirs = list((tmp_path / "runs").iterdir())
+    assert len(run_dirs) == 1
+    stage_path = run_dirs[0] / "stages/prepare.json"
+    assert stage_path.read_bytes() != b""
+    assert len(stage_path.read_bytes()) == 24

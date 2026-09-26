@@ -274,8 +274,11 @@ def run_v2_stage(stage: str, config_path: Path, run_root: Path | None = None) ->
             (expected_root / "stages").mkdir(exist_ok=True)
             failure_record = _stage_record("prepare", "failed_environment", failed_payload, {})
             _write_new(expected_root / "stages" / "prepare.json", canonical_json(failure_record))
-        except BaseException:
-            pass
+        except BaseException as record_error:
+            raise RuntimeError(
+                "failed_environment stage could not be durably recorded after "
+                f"prepare failure: {record_error}"
+            ) from record_error
         return {
             "run_id": run_id, "status": "failed_environment", "next_stage": "report",
             "run_root": str(expected_root), "failure": str(error),
