@@ -56,6 +56,15 @@ V1 provides no recurrence-efficacy result. Its no-go motivated the separately re
 - [x] Implement and independently review V2 calibration Tasks 1–5; freeze hashes before output (details in [PROJECT_LOG.md](PROJECT_LOG.md)).
 - [x] Run one V2 production `prepare` and `calibrate`, independently audit the terminal `report`, and follow only the registered gate branch. The development gate failed; see the [V2 calibration report](docs/recurrence-v2-calibration-report.md).
 
+## V2 answer audit: separate diagnostic, not a V2 rescore
+
+Design: [answer-audit design](docs/superpowers/specs/2026-09-27-recurrence-answer-audit-design.md). Execution: [answer-audit plan](docs/superpowers/plans/2026-09-27-recurrence-answer-audit.md).
+
+- [ ] Authenticate the signed V2 development evidence and export gold-free answer packets.
+- [ ] Obtain separate Luna extraction reviews and reconcile them against deterministic answers.
+- [ ] Report parser misses versus wrong or incomplete answers; preserve V2's terminal stop.
+- [ ] Only if a bounded scorer repair is supported, freeze a separate V3 protocol before fresh model outputs. Training remains gated.
+
 ## Deferred, not an execution queue
 
 Phase 1B clustering; sparse expert LoRA recovery; native-MoE diagnostics; MoE-to-dense merging; specialist assembly; adaptive loop selectors; quantization; cached loop deployment; custom pretraining. Offloading belongs to ExpertFlow. These do not start automatically if recurrence stops.
