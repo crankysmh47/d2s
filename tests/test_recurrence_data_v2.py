@@ -58,6 +58,7 @@ def test_v2_config_exposes_registered_values_and_is_distinct_from_v1() -> None:
     assert config.optimizer.accumulation_steps == 8
     assert config.optimizer.warmup_updates == 20
     assert config.resources.maximum_calibration_cuda_seconds == 7200
+    assert config.resources.maximum_calibration_wall_seconds == 7200
     assert config.resources.maximum_study_cuda_seconds == 86400
     assert config.resources.maximum_artifact_bytes == 20 * 1024**3
     assert load_v1_config(V1_CONFIG).data.output_root == "artifacts/recurrence-v1"
@@ -93,6 +94,18 @@ def test_v2_config_rejects_unregistered_or_unsafe_values(tmp_path, old, new, mes
     invalid.write_text(text.replace(old, new, 1), encoding="utf-8")
 
     with pytest.raises(ValueError, match=message):
+        load_v2_config(invalid)
+
+
+@pytest.mark.parametrize("value", ["7201", "true"])
+def test_v2_config_rejects_changed_or_bool_calibration_wall_budget(tmp_path, value) -> None:
+    text = CONFIG.read_text(encoding="utf-8")
+    old = "maximum_calibration_wall_seconds = 7200"
+    assert old in text
+    invalid = tmp_path / "bad-wall-budget.toml"
+    invalid.write_text(text.replace(old, f"maximum_calibration_wall_seconds = {value}", 1), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="wall"):
         load_v2_config(invalid)
 
 

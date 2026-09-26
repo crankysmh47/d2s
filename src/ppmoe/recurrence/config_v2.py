@@ -27,7 +27,10 @@ _SCHEMA: dict[str, object] = {
         "name", "updates", "microbatch_size", "accumulation_steps", "warmup_updates", "learning_rate",
         "beta1", "beta2", "epsilon", "weight_decay", "max_grad_norm",
     },
-    "resources": {"maximum_calibration_cuda_seconds", "maximum_study_cuda_seconds", "maximum_artifact_bytes"},
+    "resources": {
+        "maximum_calibration_cuda_seconds", "maximum_calibration_wall_seconds",
+        "maximum_study_cuda_seconds", "maximum_artifact_bytes",
+    },
 }
 _SUBSCHEMAS = {
     "data.candidates": {"expression_leaf_counts", "list_item_counts", "list_operation_counts", "graph_vertex_counts"},
@@ -83,6 +86,7 @@ class V2OptimizerConfig:
 @dataclass(frozen=True, slots=True)
 class V2ResourceConfig:
     maximum_calibration_cuda_seconds: int
+    maximum_calibration_wall_seconds: int
     maximum_study_cuda_seconds: int
     maximum_artifact_bytes: int
 
@@ -193,8 +197,9 @@ def load_v2_config(path: Path) -> V2Config:
         _number(optimizer, "epsilon"), _number(optimizer, "weight_decay"), _number(optimizer, "max_grad_norm"),
     )
     resource_config = V2ResourceConfig(
-        _integer(resources, "maximum_calibration_cuda_seconds"), _integer(resources, "maximum_study_cuda_seconds"),
-        _integer(resources, "maximum_artifact_bytes"),
+        _integer(resources, "maximum_calibration_cuda_seconds"),
+        _integer(resources, "maximum_calibration_wall_seconds"),
+        _integer(resources, "maximum_study_cuda_seconds"), _integer(resources, "maximum_artifact_bytes"),
     )
     if (
         data_config.pilot_per_candidate, data_config.development_per_family, data_config.sealed_per_family,
@@ -220,10 +225,10 @@ def load_v2_config(path: Path) -> V2Config:
     ) != ("AdamW", 1000, 20, 1e-4, 0.9, 0.95, 1e-8, 0.0, 1.0, 1, 8):
         raise ValueError("optimizer hyperparameters differ from the registered protocol")
     if (
-        resource_config.maximum_calibration_cuda_seconds, resource_config.maximum_study_cuda_seconds,
-        resource_config.maximum_artifact_bytes,
-    ) != (7200, 86400, 20 * 1024**3):
-        raise ValueError("resource limits differ from the registered V2 protocol")
+        resource_config.maximum_calibration_cuda_seconds, resource_config.maximum_calibration_wall_seconds,
+        resource_config.maximum_study_cuda_seconds, resource_config.maximum_artifact_bytes,
+    ) != (7200, 7200, 86400, 20 * 1024**3):
+        raise ValueError("resource limits or calibration wall budget differ from the registered V2 protocol")
     return V2Config(
         source_run, pilot_root, "Qwen/Qwen3-1.7B", revision, dtype, attention, start, stop, cache, thinking,
         greedy, output_tokens, sequence_tokens, data_config, lora_config, optimizer_config, resource_config,
