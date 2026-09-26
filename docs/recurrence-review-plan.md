@@ -127,9 +127,17 @@ alongside separate rationale notes. The blank human copy remains unchanged.
   root-path checks were added. Model identity persistence belongs to Task 3.
 - Task 2: complete, Luna agent `/root/longer_output_probe`; combined focused tests
   56 passed, one skipped. `/root/review_diagnostic_code` approved integration.
-- Task 3: in progress. Full suite 721 passed, three skipped; compileall and diff
+- Task 3: complete. Full suite 721 passed, three skipped; compileall and diff
   checks passed; actual pinned source/development preflight verified 600 records
-  and selected 30. GPU probe and Luna answer grading are next.
+  and selected 30. Probe completed in 104.0746 seconds with 24 EOS and six
+  capped answers. All 30 new outputs fail the strict parser; Luna model review
+  graded 18 good/12 bad (expressions 10/10, graphs 8/10, lists 0/10). The blank
+  human sheet remains ungraded. Evidence hashes and interpretation are in
+  PROJECT_LOG.md and `artifacts/recurrence-review-v1/baseline-256/luna-review/`.
+- Ruling: stop before training. This reused 30-example development calibration
+  does not provide the prespecified two informative families or a reliable
+  semantic objective judge. Cost if wrong: postpones a potentially useful LoRA
+  run; benefit is avoiding an uninterpretable training result.
 - Ruling: use a separate 256-token diagnostic, not a V0 edit; costs additional
   inference time but preserves historical interpretation.
 - Ruling: Luna grades are model labels, not human labels; they can be wrong, so

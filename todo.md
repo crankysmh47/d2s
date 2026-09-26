@@ -31,9 +31,11 @@ Detailed bounded contract: [recurrence-review-plan.md](docs/recurrence-review-pl
 
 - [x] Export editable Markdown `good/bad` review tables with validation and reviewer identity.
 - [x] Implement a separate 256-output-token baseline probe within 512 total tokens; keep V0 unchanged.
-- [ ] Test/review code and run one balanced 30-example development probe.
-- [ ] Have Luna grade a separate copy, explicitly as model review; retain a blank human copy.
-- [ ] Record evidence and decide whether a revised benchmark proposal is justified. No training yet.
+- [x] Test/review code and run one balanced 30-example development probe.
+- [x] Have Luna grade a separate copy, explicitly as model review; retain a blank human copy.
+- [x] Record evidence: 24 EOS / 6 capped; Luna 18 good / 12 bad; strict parser 0/30. A fresh benchmark and revised gates are justified before training.
+
+The blank human sheet is [artifacts/recurrence-review-v1/baseline-256/human-review/review.md](artifacts/recurrence-review-v1/baseline-256/human-review/review.md). Edit only the last column. The model-graded comparison is in `luna-review/review.md`. No training has started; the registered V0 stop still applies.
 
 ## Deferred, not an execution queue
 
