@@ -638,6 +638,45 @@ def test_final_assertions_keep_conflicting_wrapped_final_cues_ambiguous() -> Non
     assert _api()._claim_has_final_evidence(0, "expressions", r"\boxed{0}", response, "") is False
 
 
+@pytest.mark.parametrize("response", [
+    "Final answer: **3** and then **4**",
+    "Final answer: **3** and **",
+])
+def test_final_assertions_reject_non_scalar_or_malformed_wrapped_expression_payload(
+    response: str,
+) -> None:
+    values, complete = _api()._final_assertions(response, "expressions")
+
+    assert complete is False
+    assert values == []
+    assert _api()._claim_has_final_evidence(3, "expressions", "3", response, "") is False
+
+
+@pytest.mark.parametrize("response", [
+    r"Final answer: \boxed{3}",
+    "Final answer:\n$$\n\\boxed{3}\n$$",
+    "Final answer: **3**",
+    "Final answer: $3$",
+])
+def test_final_assertions_accept_exact_boxed_display_bold_and_dollar_scalars(
+    response: str,
+) -> None:
+    values, complete = _api()._final_assertions(response, "expressions")
+
+    assert complete is True
+    assert values == [3]
+
+
+def test_final_assertions_retain_conflicts_across_distinct_final_cues() -> None:
+    response = "Final answer: **3**\nAnswer: $4$"
+
+    values, complete = _api()._final_assertions(response, "expressions")
+
+    assert complete is True
+    assert values == [3, 4]
+    assert _api()._claim_has_final_evidence(3, "expressions", "3", response, "") is False
+
+
 def test_reconcile_recognizes_cued_dollar_integer_final_as_parser_miss(audit_run, tmp_path: Path) -> None:
     audit_root = _export_fixture_audit(audit_run, tmp_path)
     _write_review_files(audit_root)

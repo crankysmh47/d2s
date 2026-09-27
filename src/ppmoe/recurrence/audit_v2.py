@@ -41,7 +41,9 @@ _AUDIT_FINAL_CUE = re.compile(
 )
 _AUDIT_BOXED_INTEGER = re.compile(r"^\\boxed\s*\{\s*([+-]?\d+)\s*\}")
 _AUDIT_DOLLAR_INTEGER = re.compile(r"^\$\s*([+-]?\d+)\s*\$(?![\w])")
-_AUDIT_BARE_INTEGER = re.compile(r"^(?:is\b[ \t]*)?(?:=[ \t]*)?([+-]?\d+)(?![\w+-]|\.\d)", re.IGNORECASE)
+_AUDIT_BARE_INTEGER = re.compile(
+    r"^(?:is\b[ \t]*)?(?:=[ \t]*)?([+-]?\d+)(?:\.)?[ \t]*$", re.IGNORECASE,
+)
 _AUDIT_EVIDENCE_INTEGER = re.compile(r"(?<![\w])([+-]?\d+)(?![\w]|\.\d)")
 _AUDIT_VECTOR = re.compile(r"\[\s*[+-]?\d+(?:\s*,\s*[+-]?\d+)*\s*\]")
 _AUDIT_GRAPH_VALUE = re.compile(
@@ -604,10 +606,14 @@ def _final_assertions(
         window_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         payload = text[cue.end() : min(window_end, cue.end() + 256)].lstrip()
         if family == "expressions":
+            cue_prefix = re.sub(r"^[ \t]*(?:#{1,6}[ \t]*)?", "", cue.group(0))
+            cue_wrapper = next((wrapper for wrapper in ("**", "__", "*", "_") if cue_prefix.startswith(wrapper)), None)
+            if cue_wrapper is not None and payload.rstrip().endswith(cue_wrapper):
+                payload = payload.rstrip()[:-len(cue_wrapper)].rstrip()
             payload = _strip_audit_payload_wrappers(payload)
-            boxed = _AUDIT_BOXED_INTEGER.match(payload)
-            dollar = _AUDIT_DOLLAR_INTEGER.match(payload)
-            bare = _AUDIT_BARE_INTEGER.match(payload)
+            boxed = _AUDIT_BOXED_INTEGER.fullmatch(payload)
+            dollar = _AUDIT_DOLLAR_INTEGER.fullmatch(payload)
+            bare = _AUDIT_BARE_INTEGER.fullmatch(payload)
             match = boxed or dollar or bare
             if match is None:
                 complete = False
