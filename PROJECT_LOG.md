@@ -711,3 +711,8 @@ This file is an append-only record of material project actions, decisions, verif
 ### 2026-09-27 — Separate answer-audit diagnostic authorized
 
 - The user authorized a proper follow-up to the V2 measurement concern. The [answer-audit design](docs/superpowers/specs/2026-09-27-recurrence-answer-audit-design.md) and [implementation plan](docs/superpowers/plans/2026-09-27-recurrence-answer-audit.md) specify authenticated development-only inputs, gold-free Luna review packets, independent deterministic reconciliation, and a report before any V3 scorer or new inference. This is planned diagnostic work, not a change to V2's signed `stopped_scientific` result or evidence that recurrence works.
+
+### 2026-09-27 — Blind V2 answer audit completed
+
+- The authenticated 123-row development-only audit, three separate Luna first-pass reviews, deterministic reconciliation, and four-row independent blind graph re-review are recorded in the [answer-audit report](docs/recurrence-v2-answer-audit-report.md). The audit found 60 correct final answers among 93 V2-invalid responses, but also 23 wrong answers after graph adjudication, three contradictory graph finals, and seven length-capped graph responses. The 30 accepted controls agreed with V2; 177 accepted rows remain unaudited. The final diagnostic SHA-256 is `9f1c32a1d664742d511d12a04650a374a467baca163f9424368aaa7ef44ae30b`. Earlier diagnostic versions are preserved and explicitly superseded after audit-validator repairs.
+- V2's signed scientific stop is unchanged. No frozen controls, LoRA training, sealed scoring, or recurrence-performance claim followed. The audit supports writing a separate V3 scorer/benchmark protocol; it does not authorize a retrospective V2 pass or select a winning model.
