@@ -39,7 +39,9 @@ _AUDIT_FINAL_CUE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _AUDIT_BOXED_INTEGER = re.compile(r"^\\boxed\s*\{\s*([+-]?\d+)\s*\}")
+_AUDIT_DOLLAR_INTEGER = re.compile(r"^\$\s*([+-]?\d+)\s*\$(?![\w])")
 _AUDIT_BARE_INTEGER = re.compile(r"^(?:is\b[ \t]*)?(?:=[ \t]*)?([+-]?\d+)(?![\w+-]|\.\d)", re.IGNORECASE)
+_AUDIT_EVIDENCE_INTEGER = re.compile(r"(?<![\w])([+-]?\d+)(?![\w]|\.\d)")
 _AUDIT_VECTOR = re.compile(r"\[\s*[+-]?\d+(?:\s*,\s*[+-]?\d+)*\s*\]")
 _AUDIT_GRAPH_VALUE = re.compile(
     r"^(?:is\b[ \t]*)?(?:[*_]{1,3})?(yes|no)(?:[*_]{1,3})?[.!]?[ \t]*$",
@@ -566,15 +568,29 @@ def _claim_has_final_evidence(
     claimed: object, family: str, evidence: str, response: str, question: str,
 ) -> bool:
     query_endpoints = _graph_query_endpoints(question) if family == "graphs" else None
-    evidence_values, evidence_complete = _final_assertions(evidence, family, query_endpoints)
+    evidence_values = _evidence_assertions(evidence, family, query_endpoints)
     response_values, response_complete = _final_assertions(response, family, query_endpoints)
-    if not evidence_complete or not response_complete or not evidence_values or not response_values:
+    if not response_complete or not evidence_values or not response_values:
         return False
-    if not all(_same_answer(value, claimed, family) for value in evidence_values):
+    if not any(_same_answer(value, claimed, family) for value in evidence_values):
         return False
     if not all(_same_answer(value, claimed, family) for value in response_values):
         return False
     return True
+
+
+def _evidence_assertions(
+    text: str, family: str, query_endpoints: tuple[str, str] | None = None,
+) -> list[object]:
+    if family == "expressions":
+        return [int(match.group(1)) for match in _AUDIT_EVIDENCE_INTEGER.finditer(text)]
+    if family == "lists":
+        return [
+            [int(part.strip()) for part in match.group(0)[1:-1].split(",")]
+            for match in _AUDIT_VECTOR.finditer(text)
+        ]
+    values, _complete = _final_assertions(text, family, query_endpoints)
+    return values
 
 
 def _final_assertions(
@@ -588,8 +604,9 @@ def _final_assertions(
         payload = text[cue.end() : min(window_end, cue.end() + 256)].lstrip()
         if family == "expressions":
             boxed = _AUDIT_BOXED_INTEGER.match(payload)
+            dollar = _AUDIT_DOLLAR_INTEGER.match(payload)
             bare = _AUDIT_BARE_INTEGER.match(payload)
-            match = boxed or bare
+            match = boxed or dollar or bare
             if match is None:
                 complete = False
             else:

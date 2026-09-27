@@ -63,6 +63,8 @@ def audit_run(
                     completion_text = "Final answer: 2\nFinal answer: 3"
                 if family == "expressions" and index == 2:
                     completion_text = "Intermediate result: 3\n**Final answer: 4.**"
+                if family == "expressions" and index == 3:
+                    completion_text = "### Final Answer: $4$"
             elif reason == "wrong_value":
                 wrong_value = _fixture_wrong_value(family, expected)
                 completion_text, parsed_value = f"Final answer: {_fixture_render(wrong_value)}", wrong_value
@@ -72,6 +74,8 @@ def audit_run(
                     completion_text = r"Final answer: \boxed{[3,3]}"
                 if family == "graphs" and index == 42:
                     completion_text = "So, the answer is: **Yes**."
+                if family == "expressions" and index == 33:
+                    completion_text = f"### Final Answer: \\boxed{{{wrong_value}}}"
             else:
                 completion_text, parsed_value = f"Final answer: {_fixture_render(expected)}", expected
                 if family == "graphs" and index == 69:
@@ -561,6 +565,65 @@ def test_reconcile_accepts_claim_tied_to_unambiguous_final_cue(audit_run, tmp_pa
     row = next(item for item in diagnostic["rows"] if item["audit_id"] == audit_id)
     assert row["classification"] == "wrong"
     assert row["adjudication_required"] is False
+
+
+@pytest.mark.parametrize(("family", "source_id", "claim", "evidence", "classification"), [
+    ("expressions", "expressions-068", 70, "70", "wrong"),
+    ("expressions", "expressions-033", 35, r"\boxed{35}", "wrong"),
+    ("lists", "lists-069", [9, 0], "[9,0]", "correct"),
+])
+def test_reconcile_accepts_value_only_evidence_when_response_final_matches(
+    audit_run, tmp_path: Path, family: str, source_id: str,
+    claim: object, evidence: str, classification: str,
+) -> None:
+    audit_root = _export_fixture_audit(audit_run, tmp_path)
+    _write_review_files(audit_root)
+    audit_id = _source_audit_id(audit_root, source_id)
+    _replace_review_row(audit_root, family, audit_id, {
+        "claimed_value": claim, "evidence_span": evidence,
+    })
+
+    result = _api().reconcile_v2_audit(audit_run[0], audit_root)
+
+    diagnostic = json.loads(Path(result["diagnostic_path"]).read_bytes())
+    row = next(item for item in diagnostic["rows"] if item["audit_id"] == audit_id)
+    assert row["classification"] == classification
+    assert row["adjudication_required"] is False
+
+
+def test_reconcile_still_adjudicates_value_only_evidence_with_conflicting_finals(
+    audit_run, tmp_path: Path,
+) -> None:
+    audit_root = _export_fixture_audit(audit_run, tmp_path)
+    _write_review_files(audit_root)
+    audit_id = _source_audit_id(audit_root, "expressions-001")
+    _replace_review_row(audit_root, "expressions", audit_id, {
+        "claimed_value": 2, "evidence_span": "2",
+    })
+
+    result = _api().reconcile_v2_audit(audit_run[0], audit_root)
+
+    diagnostic = json.loads(Path(result["diagnostic_path"]).read_bytes())
+    row = next(item for item in diagnostic["rows"] if item["audit_id"] == audit_id)
+    assert row["adjudication_required"] is True
+    assert row["classification"] == "ambiguous"
+
+
+def test_reconcile_recognizes_cued_dollar_integer_final_as_parser_miss(audit_run, tmp_path: Path) -> None:
+    audit_root = _export_fixture_audit(audit_run, tmp_path)
+    _write_review_files(audit_root)
+    audit_id = _source_audit_id(audit_root, "expressions-003")
+    _replace_review_row(audit_root, "expressions", audit_id, {
+        "claimed_value": 4, "evidence_span": "### Final Answer: $4$",
+    })
+
+    result = _api().reconcile_v2_audit(audit_run[0], audit_root)
+
+    diagnostic = json.loads(Path(result["diagnostic_path"]).read_bytes())
+    row = next(item for item in diagnostic["rows"] if item["audit_id"] == audit_id)
+    assert row["classification"] == "correct"
+    assert row["adjudication_required"] is False
+    assert row["parser_miss"] is True
 
 
 @pytest.mark.parametrize(("family", "source_id", "claim", "evidence", "classification"), [
