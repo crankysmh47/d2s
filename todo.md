@@ -65,14 +65,14 @@ Design: [answer-audit design](docs/superpowers/specs/2026-09-27-recurrence-answe
 - [x] Report parser misses versus wrong or incomplete answers; preserve V2's terminal stop. See [audit report](docs/recurrence-v2-answer-audit-report.md).
 - [x] The bounded scorer repair supports a separately reviewed V3 protocol, frozen before fresh model outputs. Training remains gated.
 
-## V3 fresh final-answer qualifier (not yet run)
+## V3 fresh final-answer qualifier (terminal pre-GPU stop)
 
 The audit supports one fresh protocol: [V3 design](docs/superpowers/specs/2026-09-27-recurrence-v3-design.md) and [calibration-first plan](docs/superpowers/plans/2026-09-27-recurrence-v3-calibration.md). V2 stays stopped.
 
-- [ ] Implement, blind-check, review and hash-freeze the V3-only scorer.
-- [ ] Implement fresh config/splits and authenticated calibration stages; review and freeze before GPU output.
-- [ ] Run one six-pilot/development qualifier under registered gates, then independently audit its report.
-- [ ] Only a fresh passing gate permits a new frozen-controls/paired-LoRA execution plan.
+- [x] Implement, independently review, test, hash-freeze and push the V3-only scorer and blind-control harness (`01c9744`).
+- [x] Run the one-shot replacement-control qualification. It stopped on review-evidence validation before any V3 scorer pass; see [qualification report](docs/recurrence-v3-scorer-qualification.md). V3 is terminal, not qualified.
+- [ ] Fresh config/splits, GPU calibration, recurrence controls and LoRA: **not run and not authorized in this stopped V3 candidate**.
+- [ ] Decide separately whether a new protocol is scientifically worthwhile or pivot away from recurrence calibration. Do not silently retune/retry V3.
 
 ## Deferred, not an execution queue
 

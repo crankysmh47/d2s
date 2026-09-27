@@ -1,5 +1,7 @@
 # V3 fresh final-answer calibration: execution plan
 
+Execution status (2026-09-27): **terminal pre-GPU qualification stop** after Task 1's one-shot blind-control evidence gate. See [qualification report](../../recurrence-v3-scorer-qualification.md). Tasks 2–5 below are preserved as the preregistered plan, not an active execution queue for V3.
+
 > For implementers: read the [binding V3 design](../specs/2026-09-27-recurrence-v3-design.md) before coding. Execute tasks in order with test-first implementation and an independent Luna code review after each task. This plan stops at the fresh development gate; conditional controls/LoRA receive a separate plan only if that gate passes.
 
 **Goal:** qualify or reject a fresh three-family F0 benchmark with a V3-only scorer, without changing V0/V1/V2 decisions or using V3 sealed values.

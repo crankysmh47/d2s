@@ -1,5 +1,7 @@
 # Pretrained recurrence V3: final-answer qualifier
 
+Execution status (2026-09-27): **terminal pre-GPU stop** at the one-shot replacement-control evidence gate. The original design and pre-output amendments remain below for provenance; see [qualification report](../../recurrence-v3-scorer-qualification.md). This status does not alter V2 or imply a V3 model result.
+
 Date: 2026-09-27. Status: separate post-audit design, before any V3 model output. V0, V1, and V2 remain terminal at their registered stops. The V2 answer audit is diagnostic, not a rescore or proof of recurrence benefit.
 
 ## Objective and single hypothesis
