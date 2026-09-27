@@ -609,6 +609,35 @@ def test_reconcile_still_adjudicates_value_only_evidence_with_conflicting_finals
     assert row["classification"] == "ambiguous"
 
 
+@pytest.mark.parametrize(("family", "claim", "response", "evidence"), [
+    ("expressions", 12, "### Final Answer:\n$$\n\\boxed{12}\n$$", r"\boxed{12}"),
+    ("expressions", 0, "Final result:\n$$\n\\boxed{0}\n$$", r"\boxed{0}"),
+    ("expressions", 379, "### Final Answer:\n**379**", "**379**"),
+    ("expressions", 24, r"Final answer: $ \boxed{24} $", r"\boxed{24}"),
+    ("expressions", 0, "So the final result is:\n\n$$\n\\boxed{0}\n$$", r"\boxed{0}"),
+    ("lists", [6, 10, 4, 9], "So the final list is:\n\n$$\n\\boxed{[6, 10, 4, 9]}\n$$", "[6, 10, 4, 9]"),
+    ("lists", [3, 0, 1, 2], "So the final list after applying ADD1 once is:\n\n$$\n\\boxed{[3, 0, 1, 2]}\n$$", "[3, 0, 1, 2]"),
+])
+def test_final_assertions_recognize_wrapped_final_expression_and_list_shapes(
+    family: str, claim: object, response: str, evidence: str,
+) -> None:
+    values, complete = _api()._final_assertions(response, family)
+
+    assert complete is True
+    assert values == [claim]
+    assert _api()._claim_has_final_evidence(claim, family, evidence, response, "") is True
+
+
+def test_final_assertions_keep_conflicting_wrapped_final_cues_ambiguous() -> None:
+    response = "Final answer:\n$$\n\\boxed{12}\n$$\nSo the final result is:\n$$\n\\boxed{0}\n$$"
+
+    values, complete = _api()._final_assertions(response, "expressions")
+
+    assert complete is True
+    assert values == [12, 0]
+    assert _api()._claim_has_final_evidence(0, "expressions", r"\boxed{0}", response, "") is False
+
+
 def test_reconcile_recognizes_cued_dollar_integer_final_as_parser_miss(audit_run, tmp_path: Path) -> None:
     audit_root = _export_fixture_audit(audit_run, tmp_path)
     _write_review_files(audit_root)

@@ -34,7 +34,8 @@ _REVIEW_STATUSES = {"conclusive", "ambiguous", "missing", "truncated"}
 _EXPLANATION_STATUSES = {"valid", "invalid", "indeterminate"}
 _AUDIT_FINAL_CUE = re.compile(
     r"^[ \t]*(?:#{1,6}[ \t]*)?(?:[*_]{1,3})?(?:Final[ \t]+(?:answer|result|list)|Answer|"
-    r"So,[ \t]+the[ \t]+answer[ \t]+is|So[ \t]+the[ \t]+final[ \t]+answer[ \t]+is)\b"
+    r"So,[ \t]+the[ \t]+answer[ \t]+is|So[ \t]+the[ \t]+final[ \t]+"
+    r"(?:answer|result|list(?:[ \t]+after[ \t]+applying[ \t]+ADD1[ \t]+once)?)[ \t]+is)\b"
     r"(?:[*_]{1,3})?[ \t]*:?[ \t]*",
     re.IGNORECASE | re.MULTILINE,
 )
@@ -603,6 +604,7 @@ def _final_assertions(
         window_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         payload = text[cue.end() : min(window_end, cue.end() + 256)].lstrip()
         if family == "expressions":
+            payload = _strip_audit_payload_wrappers(payload)
             boxed = _AUDIT_BOXED_INTEGER.match(payload)
             dollar = _AUDIT_DOLLAR_INTEGER.match(payload)
             bare = _AUDIT_BARE_INTEGER.match(payload)
@@ -639,6 +641,14 @@ def _final_assertions(
                 continue
             values.append("no" if claim_match.group("negative") else "yes")
     return values, complete
+
+
+def _strip_audit_payload_wrappers(payload: str) -> str:
+    payload = payload.strip()
+    for wrapper in ("$$", "$", "**", "__", "*", "_"):
+        if len(payload) > 2 * len(wrapper) and payload.startswith(wrapper) and payload.endswith(wrapper):
+            return _strip_audit_payload_wrappers(payload[len(wrapper) : -len(wrapper)])
+    return payload
 
 
 def _graph_query_endpoints(question: str) -> tuple[str, str] | None:
