@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import stat
+from types import SimpleNamespace
 
 import pytest
 
@@ -855,3 +858,56 @@ def test_reconcile_rejects_packet_hash_drift_and_cli_prints_compact_json(audit_r
     assert result == 0
     assert " " not in printed.strip()
     assert json.loads(printed)["diagnostic_path"] == str(audit_root / "diagnostic.json")
+
+
+@pytest.mark.parametrize("target_kind", ["manifest", "packet", "review", "review_folder"])
+def test_reconcile_rejects_audit_symlinks_before_reading_targets(
+    audit_run, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target_kind: str,
+) -> None:
+    audit_root = _export_fixture_audit(audit_run, tmp_path)
+    _write_review_files(audit_root)
+    if target_kind == "manifest":
+        link_path = audit_root / "manifest.json"
+        target_path = tmp_path / "synthetic-manifest.json"
+    elif target_kind == "packet":
+        link_path = audit_root / "packets/expressions.jsonl"
+        target_path = tmp_path / "synthetic-expressions.jsonl"
+    elif target_kind == "review":
+        link_path = audit_root / "reviews/expressions-luna.jsonl"
+        target_path = tmp_path / "synthetic-review.jsonl"
+    else:
+        review_folder = audit_root / "reviews"
+        link_path = review_folder
+        target_path = tmp_path / "synthetic-reviews"
+    target_path.mkdir(exist_ok=True) if target_kind == "review_folder" else None
+    target_file = target_path / "expressions-luna.jsonl" if target_kind == "review_folder" else target_path
+    target_file.write_bytes(b"synthetic outside-root symlink target; it must not be opened")
+
+    # Windows developer environments often lack permission to create symlinks.
+    # Simulate the reparse metadata for the link component while retaining a
+    # real outside-root target path that the reader must never open.
+    blocked_path = audit_root / "reviews" if target_kind == "review_folder" else link_path
+    original_lstat = os.lstat
+
+    def synthetic_symlink_lstat(path: os.PathLike[str] | str):
+        if Path(path) == blocked_path:
+            return SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_file_attributes=0)
+        return original_lstat(path)
+
+    monkeypatch.setattr(_api().study_v2.os, "lstat", synthetic_symlink_lstat)
+
+    original_open = Path.open
+    target_reads: list[Path] = []
+
+    def track_target_reads(path: Path, *args: object, **kwargs: object):
+        if path.resolve() == target_file.resolve():
+            target_reads.append(path)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", track_target_reads)
+
+    with pytest.raises(ValueError, match="symlink|reparse|unsafe|regular file"):
+        _api().reconcile_v2_audit(audit_run[0], audit_root)
+
+    assert target_reads == []
+    assert not (audit_root / "diagnostic.json").exists()

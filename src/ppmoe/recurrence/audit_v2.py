@@ -288,7 +288,12 @@ def export_v2_audit(run_root: Path, output_root: Path, seed: int = DEFAULT_SEED)
 def reconcile_v2_audit(run_root: Path, audit_root: Path) -> dict[str, object]:
     """Validate blind reviews against authenticated V2 rows, then exclusively write diagnostics."""
     source = verify_v2_audit_source(run_root)
-    root = Path(audit_root).resolve(strict=True)
+    audit_root_path = Path(audit_root)
+    try:
+        study_v2._assert_no_reparse(audit_root_path)
+        root = audit_root_path.resolve(strict=True)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"V2 audit root path is unsafe or missing: {error}") from error
     if not root.is_dir():
         raise ValueError("V2 audit root must be a directory")
     source_root = Path(run_root).resolve(strict=True)
@@ -299,20 +304,18 @@ def reconcile_v2_audit(run_root: Path, audit_root: Path) -> dict[str, object]:
     else:
         raise ValueError("V2 audit root must be outside the read-only source run")
 
-    manifest_raw = (root / "manifest.json").read_bytes()
+    manifest_raw = _read_audit_file(audit_root_path, Path("manifest.json"), "V2 audit manifest")
     manifest = _parse_object(manifest_raw, "V2 audit manifest")
-    manifest, packets, source_ids = _authenticate_audit_export(source, root, manifest)
+    manifest, packets, source_ids = _authenticate_audit_export(source, audit_root_path, manifest)
     if canonical_json(manifest) != manifest_raw:
         raise ValueError("V2 audit manifest bytes are not canonical")
 
     reviews: dict[str, list[dict[str, object]]] = {}
     review_hashes: dict[str, str] = {}
     for family in FAMILIES:
-        review_path = root / "reviews" / f"{family}-luna.jsonl"
-        try:
-            review_raw = review_path.read_bytes()
-        except OSError as error:
-            raise ValueError(f"missing V2 {family} review file") from error
+        review_raw = _read_audit_file(
+            audit_root_path, Path("reviews") / f"{family}-luna.jsonl", f"V2 {family} review file",
+        )
         review_hashes[family] = hashlib.sha256(review_raw).hexdigest()
         review_rows = _parse_jsonl(review_raw, f"V2 {family} reviews")
         reviews[family] = _validate_review_rows(family, review_rows, packets[family])
@@ -468,11 +471,9 @@ def _authenticate_audit_export(
     for family in FAMILIES:
         raw = b"".join(canonical_json(packet) for packet in packets[family])
         expected_packet_hashes[family] = hashlib.sha256(raw).hexdigest()
-        packet_path = root / "packets" / f"{family}.jsonl"
-        try:
-            packet_raw = packet_path.read_bytes()
-        except OSError as error:
-            raise ValueError(f"missing V2 {family} packet file") from error
+        packet_raw = _read_audit_file(
+            root, Path("packets") / f"{family}.jsonl", f"V2 {family} packet file",
+        )
         if hashlib.sha256(packet_raw).hexdigest() != expected_packet_hashes[family] or packet_raw != raw:
             raise ValueError(f"V2 {family} packet hash or content differs from authenticated selection")
     expected_manifest = {
@@ -490,6 +491,28 @@ def _authenticate_audit_export(
     if dict(manifest) != expected_manifest:
         raise ValueError("V2 audit manifest hashes, packet IDs, or selection mapping drifted")
     return expected_manifest, packets, expected_source_ids
+
+
+def _read_audit_file(root: Path, relative: Path, description: str) -> bytes:
+    """Read one regular audit file after rejecting reparse paths and escapes."""
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"{description} path is unsafe")
+    path = Path(root) / relative
+    try:
+        study_v2._assert_no_reparse(path)
+        resolved_root = Path(root).resolve(strict=True)
+        resolved_path = path.resolve(strict=True)
+        resolved_path.relative_to(resolved_root)
+    except FileNotFoundError as error:
+        raise ValueError(f"missing {description}") from error
+    except (OSError, ValueError) as error:
+        raise ValueError(f"{description} path is unsafe: {error}") from error
+    if not resolved_path.is_file():
+        raise ValueError(f"{description} must be a regular file")
+    try:
+        return resolved_path.read_bytes()
+    except OSError as error:
+        raise ValueError(f"cannot read {description}") from error
 
 
 def _validate_review_rows(
