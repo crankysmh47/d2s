@@ -720,3 +720,8 @@ This file is an append-only record of material project actions, decisions, verif
 ### 2026-09-27 — V3 qualification protocol drafted, before GPU output
 
 - The [V3 design](docs/superpowers/specs/2026-09-27-recurrence-v3-design.md) and [calibration-first plan](docs/superpowers/plans/2026-09-27-recurrence-v3-calibration.md) preserve the three objective task families, V2 prompts/difficulties/training view, Qwen3 snapshot, 256/512 token budget, gate thresholds, and recurrence/LoRA comparison. They change only the prespecified answer grammar and fresh split seeds. This is planned work, not evidence of a passing benchmark or model-performance gain. No V3 inference or training has run.
+
+### 2026-09-27 — V3 scorer control-boundary incident, before freeze or GPU
+
+- The V3 scorer implementer had written scorer/tests and run synthetic verification, then accidentally displayed the combined V2 audit `diagnostic.json` while looking for the invalid-only diagnostic schema. That file also contains some of the original 30 accepted controls. The implementer stopped, reported the breach, and made no subsequent scorer/test edits. No V3 model output or training occurred. The original 30 cannot serve as blind V3 qualification.
+- The V3 design/plan now transparently specify a replacement, nonoverlapping 30-row accepted-control set with fixed selection seed and blind independent Luna review. Its selector and scorer must be frozen before replacement answers are opened. This is a pre-output protocol amendment, not a retrospective change to V2 or evidence of V3 success.
