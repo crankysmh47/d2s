@@ -12,11 +12,11 @@
 
 **Execution plan:** [2026-09-11-pretrained-recurrence-execution.md](docs/superpowers/plans/2026-09-11-pretrained-recurrence-execution.md). It expands this protocol into the only authorized sequential implementation and experiment order.
 
-**Status (2026-09-26):** V0 is implemented and reached the registered G3 benchmark-calibration stop in run `129d39646933`; no LoRA arms trained. Historical protocol below remains unchanged. The separate [longer-output and editable answer-review diagnostic](docs/recurrence-review-plan.md) is complete. The user has authorized the [V1 scorer, benchmark, and conditional adaptation study](docs/superpowers/specs/2026-09-26-recurrence-v1-design.md) under its [sequential execution contract](docs/superpowers/plans/2026-09-26-recurrence-v1-execution.md). V1 has separate artifacts and gates; it does not reopen V0.
+**Status (2026-09-27):** This is the historical recurrence protocol, **not an active execution queue**. V0/V1/V2 stopped at their registered calibration gates; V3 stopped at its pre-GPU review-evidence gate. No recurrence LoRA trained. See [todo.md](todo.md), [PROJECT_LOG.md](PROJECT_LOG.md), and the [V3 qualification report](docs/recurrence-v3-scorer-qualification.md). The new [Option 2 verified-distillation QLoRA plan](docs/superpowers/plans/2026-09-27-verified-distillation-qlora.md) is a separate **draft for review**, not authorization for implementation or training. The historical protocol below remains unchanged.
 
 ## 1. Direction and document precedence
 
-The active hypothesis is that limited adaptation can make existing layers useful when revisited. This changes the objective from sparse efficiency to capability improvement at approximately fixed stored parameters and increased inference computation. Keep this track in the current workspace because the model evaluation/provenance infrastructure is reusable; do not describe it as successful dense-to-sparse conversion.
+The historical hypothesis was that limited adaptation can make existing layers useful when revisited. This changes the objective from sparse efficiency to capability improvement at approximately fixed stored parameters and increased inference computation. Keep this track in the current workspace because the model evaluation/provenance infrastructure is reusable; do not describe it as successful dense-to-sparse conversion.
 
 Select only:
 

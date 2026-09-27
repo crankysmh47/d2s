@@ -1,8 +1,8 @@
 # Current work queue
 
-Updated 2026-09-26. Historical V0 requirements and stop rules: [plan.md](plan.md). This file is a summary, not permission to skip gates.
+Updated 2026-09-27. Historical V0 requirements and stop rules: [plan.md](plan.md). This file is a summary, not permission to skip gates.
 
-Exact sequential execution contract: [docs/superpowers/plans/2026-09-11-pretrained-recurrence-execution.md](docs/superpowers/plans/2026-09-11-pretrained-recurrence-execution.md). Continue automatically through passing gates; pause only for a genuinely human-only blocker.
+Historical recurrence execution contract: [docs/superpowers/plans/2026-09-11-pretrained-recurrence-execution.md](docs/superpowers/plans/2026-09-11-pretrained-recurrence-execution.md). It is not an active queue after V0–V3 stops.
 
 ## Completed research
 
@@ -72,7 +72,16 @@ The audit supports one fresh protocol: [V3 design](docs/superpowers/specs/2026-0
 - [x] Implement, independently review, test, hash-freeze and push the V3-only scorer and blind-control harness (`01c9744`).
 - [x] Run the one-shot replacement-control qualification. It stopped on review-evidence validation before any V3 scorer pass; see [qualification report](docs/recurrence-v3-scorer-qualification.md). V3 is terminal, not qualified.
 - [ ] Fresh config/splits, GPU calibration, recurrence controls and LoRA: **not run and not authorized in this stopped V3 candidate**.
-- [ ] Decide separately whether a new protocol is scientifically worthwhile or pivot away from recurrence calibration. Do not silently retune/retry V3.
+- [x] Decide separately to draft a post-training distillation pivot. Do not silently retune/retry V3.
+
+## Option 2: verified teacher-rationale QLoRA (draft, planning only)
+
+Detailed [Option 2 plan](docs/superpowers/plans/2026-09-27-verified-distillation-qlora.md). This tests a narrow dense-model post-training gain, not MoE-like footprint. It does not reopen recurrence.
+
+- [x] Write a gated plan comparing Qwen3-4B teacher-rationale QLoRA with matched gold-solution QLoRA on Qwen3-1.7B.
+- [ ] User reviews/approves or amends the draft; no implementation, download, or inference before then.
+- [ ] After approval, verify GPU/QLoRA feasibility, source/retention provenance, and scorer quality before generating teacher data or training.
+- [ ] Only if all gates pass: run paired discovery, one confirmation, sealed evaluation, and independent report. Stop on any registered no-go.
 
 ## Deferred, not an execution queue
 
