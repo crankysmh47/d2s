@@ -89,8 +89,8 @@ The run ID binds preparation's active source list. Each later stage additionally
 ### Task 0 — dependency and hardware feasibility
 
 - [x] User authorized revision and execution on 2026-10-03. Freeze this revision before pilot output; no additional approval checkpoint is needed for routine in-scope work.
-- [ ] Read-only verify `exp`, clean tracked worktree, source revisions/licenses/counts, pre-existing FineWeb retention provenance, GPU/driver/BF16/disk; preserve unrelated files. Run `uv run python -c "import torch; print(torch.cuda.get_device_name(0), torch.cuda.is_bf16_supported())"` and record output. No model output yet.
-- [ ] Pin PEFT/bitsandbytes compatible versions and wheel hashes in `pyproject.toml`/`uv.lock`; create an isolated short smoke that loads the student 4-bit, attaches all-linear adapters, performs one backward/update with a padded synthetic 1536-token sequence, unloads, then loads the teacher BF16 and generates **only a synthetic prompt**. Record peak VRAM, model/cache size, versions and exact failure. This smoke is compatibility evidence, not a benchmark. If it cannot run within cap, stop and propose a revised protocol.
+- [x] Read-only verify `exp`, clean tracked worktree, source revisions/licenses/counts, pre-existing FineWeb retention provenance, GPU/driver/BF16/disk; preserve unrelated files. Run `uv run python -c "import torch; print(torch.cuda.get_device_name(0), torch.cuda.is_bf16_supported())"` and record output. No model output yet.
+- [x] Pin PEFT/bitsandbytes compatible versions and wheel hashes in `pyproject.toml`/`uv.lock`; create an isolated short smoke that loads the student 4-bit, attaches all-linear adapters, performs one backward/update with a padded synthetic 1536-token sequence, unloads, then loads the teacher BF16 and generates **only a synthetic prompt**. Record peak VRAM, model/cache size, versions and exact failure. This smoke is compatibility evidence, not a benchmark. If it cannot run within cap, stop and propose a revised protocol.
 
 ### Task 1 — config, source, partitions, and provenance
 

@@ -80,7 +80,10 @@ Detailed [Option 2 plan](docs/superpowers/plans/2026-09-27-verified-distillation
 
 - [x] Write a gated plan comparing Qwen3-4B teacher-rationale QLoRA with matched gold-solution QLoRA on Qwen3-1.7B.
 - [x] User authorized the four revisions and execution; revision 2 separates practical/teacher gains, calibrates token budget, matches tensor work, and allows validated recovery.
-- [ ] After approval, verify GPU/QLoRA feasibility, source/retention provenance, and scorer quality before generating teacher data or training.
+- [x] Verify the pinned GPU/QLoRA recipe with an independently reviewed synthetic smoke; preserve the failed first attempt and recovery costs.
+- [ ] Finish/review deterministic sources, sealed partitions, and authenticated retention provenance (CPU implementation in progress).
+- [ ] Freeze/review the final-answer scorer, calibrate output budget on 60 exclusive questions, and obtain blind Luna extraction reviews before the teacher viability pilot.
+- [ ] Require teacher viability, >=800 matched verified targets, and the independent rationale-quality audit before any study training.
 - [ ] Only if all gates pass: run paired discovery, one confirmation, sealed evaluation, and independent report. Stop on any registered no-go.
 
 ## Deferred, not an execution queue
