@@ -1,0 +1,83 @@
+[student]
+repo_id = "Qwen/Qwen3-1.7B"
+revision = "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"
+license = "Apache-2.0"
+
+[teacher]
+repo_id = "Qwen/Qwen3-4B"
+revision = "1cfa9a7208912126459214e8b04321603b3df60c"
+license = "Apache-2.0"
+
+[gsm8k]
+repo_id = "openai/gsm8k"
+revision = "740312add88f781978c0658806c59bc2815b9866"
+license = "MIT"
+train_file = "main/train-00000-of-00001.parquet"
+test_file = "main/test-00000-of-00001.parquet"
+
+[svamp]
+repo_id = "arkilpatel/SVAMP"
+revision = "78e727689e1c1bebfc4be39c446898e8e10b0518"
+license = "MIT"
+url = "https://raw.githubusercontent.com/arkilpatel/SVAMP/78e727689e1c1bebfc4be39c446898e8e10b0518/SVAMP.json"
+
+[prompt]
+template = "Solve the following problem. Show concise working, then finish with Final answer: <number>.\n\n{question}"
+system_message = ""
+few_shot_examples = 0
+thinking = false
+greedy = true
+candidates = [[256, 768], [512, 1024], [768, 1536]]
+
+[training]
+quantization = "nf4"
+double_quantization = true
+compute_dtype = "bfloat16"
+target_modules = "all-linear"
+gradient_checkpointing = true
+optimizer = "AdamW"
+scheduler = "cosine"
+rank = 16
+alpha = 32
+dropout = 0.0
+learning_rate = 0.0001
+updates = 300
+warmup_updates = 10
+microbatch_size = 1
+accumulation_steps = 8
+seeds = [47, 48]
+
+[partition]
+gsm_train = { calibration = 60, pilot = 120, development = 200, pool = 1200 }
+gsm_test_sealed = 400
+svamp_transfer_development = 200
+svamp_sealed_transfer = 500
+
+[qualification]
+calibration_questions = 60
+minimum_calibration_eos = 57
+pilot_questions = 120
+minimum_teacher_accuracy = 0.60
+minimum_teacher_advantage = 0.05
+generation_pool = 1200
+minimum_accepted = 800
+rationale_audit_size = 60
+rationale_audit_minimum_valid = 54
+maximum_systematic_error_count = 2
+maximum_parser_reviewer_disagreement = 0.05
+maximum_invalid_rate = 0.10
+
+[resources]
+cuda_seconds = 86400
+wall_seconds = 172800
+download_bytes = 21474836480
+artifact_bytes = 21474836480
+vram_reserve_bytes = 2147483648
+phase_retries = 2
+
+[paths]
+data_cache = ".cache/distillation-v1/data"
+retention_manifest = "artifacts/recurrence-v0/129d39646933/retention/retention-manifest.json"
+retention_manifest_sha256 = "52a88366a7402e51848006a2bce13b02fd1db709ed0887a5f25fddd9fc98fbc3"
+retention_chunks = "artifacts/recurrence-v0/129d39646933/retention/retention-chunks.jsonl"
+retention_chunks_sha256 = "84cb2c4ca17ec33884144d30d1a8f1f3c7a454440c108564b67a7fab8de2a991"
