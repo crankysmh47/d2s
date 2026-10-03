@@ -20,6 +20,10 @@ class WorkerOwnershipError(RuntimeError):
     """A spawned model child could not be proven dead; do not retry or release its lease."""
     ownership_uncertain = True
 
+    def __init__(self, message: str, *, ledger: Any | None = None) -> None:
+        super().__init__(message)
+        self.ledger = ledger
+
 
 def candidate_limits(candidate: Sequence[int]) -> tuple[int, int, int]:
     """Return (prompt capacity, max new tokens, total) for the frozen (new,total) pair."""
@@ -166,6 +170,7 @@ def resolve_pinned_snapshot(
 def authenticate_model_snapshot(
     repo_id: str, revision: str, snapshot: Path, inventory_path: Path | None = None, *,
     model_info: Callable[..., Any] | None = None, metadata: Any | None = None,
+    excluded_metadata_subtree: str | None = None,
 ) -> dict[str, Any]:
     """Authenticate local model bytes against the pinned Hub tree and persist inventory."""
     if model_info is None:
@@ -184,7 +189,13 @@ def authenticate_model_snapshot(
     local = Path(snapshot)
     if local.name != revision or not local.is_dir():
         raise ValueError("local model snapshot path does not match its pin")
-    actual_files = {path.relative_to(local).as_posix() for path in local.rglob("*") if path.is_file()}
+    if excluded_metadata_subtree not in (None, ".cache"):
+        raise ValueError("only the known .cache metadata subtree may be excluded")
+    actual_files = {
+        path.relative_to(local).as_posix()
+        for path in local.rglob("*") if path.is_file()
+        and not (excluded_metadata_subtree == ".cache" and path.relative_to(local).parts[0] == ".cache")
+    }
     if actual_files != set(expected):
         raise ValueError("local model file inventory differs from pinned Hub metadata")
     files: list[dict[str, Any]] = []
@@ -203,9 +214,10 @@ def authenticate_model_snapshot(
         blob_id = getattr(metadata_item, "blob_id", None)
         if not blob_id:
             raise ValueError(f"pinned Hub metadata lacks an authenticated blob ID: {name}")
-        blob_digest = _git_blob_sha1(path, size)
-        if blob_digest != blob_id:
-            raise ValueError(f"pinned Hub Git blob content hash mismatch: {name}")
+        if not lfs_sha:
+            blob_digest = _git_blob_sha1(path, size)
+            if blob_digest != blob_id:
+                raise ValueError(f"pinned Hub Git blob content hash mismatch: {name}")
         files.append({"path": name, "size_bytes": size, "sha256": digest, "hub_lfs_sha256": lfs_sha, "hub_blob_id": blob_id})
     inventory = {"repo_id": repo_id, "revision": revision, "resolved_sha": resolved, "files": files}
     if inventory_path is not None:

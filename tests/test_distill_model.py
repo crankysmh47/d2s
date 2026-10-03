@@ -140,6 +140,63 @@ def test_snapshot_authentication_checks_hub_git_blob_sha_for_non_lfs_files(tmp_p
         authenticate_model_snapshot("repo", revision, snapshot, metadata=metadata)
 
 
+def test_lfs_snapshot_uses_materialized_sha256_not_pointer_git_blob_id(tmp_path: Path) -> None:
+    import hashlib
+    from types import SimpleNamespace
+    from ppmoe.distill.model import authenticate_model_snapshot
+
+    revision = "b" * 40
+    snapshot = tmp_path / revision
+    snapshot.mkdir()
+    weight = b"weight-payload"
+    (snapshot / "weights.safetensors").write_bytes(weight)
+    metadata = SimpleNamespace(
+        sha=revision,
+        siblings=[SimpleNamespace(
+            rfilename="weights.safetensors", size=len(weight), blob_id="different-lfs-pointer-blob",
+            lfs=SimpleNamespace(sha256=hashlib.sha256(weight).hexdigest()),
+        )],
+    )
+    inventory = authenticate_model_snapshot("repo", revision, snapshot, metadata=metadata)
+    assert inventory["files"][0]["sha256"] == hashlib.sha256(weight).hexdigest()
+    (snapshot / "weights.safetensors").write_bytes(b"other-payload!")
+    with pytest.raises(ValueError, match="LFS content hash"):
+        authenticate_model_snapshot("repo", revision, snapshot, metadata=metadata)
+
+
+def test_snapshot_auth_ignores_only_explicit_local_cache_metadata(tmp_path: Path) -> None:
+    import hashlib
+    from types import SimpleNamespace
+    from ppmoe.distill.model import authenticate_model_snapshot
+
+    revision = "e" * 40
+    snapshot = tmp_path / revision
+    (snapshot / ".cache" / "metadata").mkdir(parents=True)
+    content = b"{}"
+    (snapshot / "config.json").write_bytes(content)
+    (snapshot / ".cache" / "metadata" / "download.json").write_text("local-only", encoding="utf-8")
+    metadata = SimpleNamespace(
+        sha=revision,
+        siblings=[SimpleNamespace(rfilename="config.json", size=2, blob_id=hashlib.sha1(b"blob 2\0{}").hexdigest(), lfs=None)],
+    )
+    inventory = authenticate_model_snapshot(
+        "repo", revision, snapshot, metadata=metadata, excluded_metadata_subtree=".cache",
+    )
+    assert [entry["path"] for entry in inventory["files"]] == ["config.json"]
+    (snapshot / "rogue.bin").write_bytes(b"x")
+    with pytest.raises(ValueError, match="inventory"):
+        authenticate_model_snapshot(
+            "repo", revision, snapshot, metadata=metadata, excluded_metadata_subtree=".cache",
+        )
+    (snapshot / "rogue.bin").unlink()
+    (snapshot / "nested" / ".cache").mkdir(parents=True)
+    (snapshot / "nested" / ".cache" / "not-snapshot-metadata").write_text("x", encoding="utf-8")
+    with pytest.raises(ValueError, match="inventory"):
+        authenticate_model_snapshot(
+            "repo", revision, snapshot, metadata=metadata, excluded_metadata_subtree=".cache",
+        )
+
+
 @pytest.mark.parametrize(("alive_after_terminate", "error_type"), [(False, RuntimeError), (True, "ownership")])
 def test_startup_timeout_terminates_owned_child_or_reports_uncertain_ownership(monkeypatch, alive_after_terminate, error_type) -> None:
     import ppmoe.distill.model as model_module

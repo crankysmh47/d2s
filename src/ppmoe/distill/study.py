@@ -324,7 +324,7 @@ def run_calibration_stage(
     if not isinstance(expected_ids, list) or len(expected_ids) != 60 or len(set(expected_ids)) != 60:
         raise StageError("prepared calibration ordered-ID map is invalid")
     preflight_disk(root, reserve_bytes=2 * 1024**3)
-    from huggingface_hub import HfApi, snapshot_download
+    from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 
     api = HfApi()
     inventory_directory = safe_output_path(root, root / "calibration" / "model-inventory")
@@ -341,11 +341,34 @@ def run_calibration_stage(
             cache_path = (
                 repo_root / ".cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots" / pin.revision
             )
-            cache_names = {
-                path.relative_to(cache_path).as_posix()
-                for path in cache_path.rglob("*") if path.is_file()
-            } if cache_path.is_dir() else set()
-            if cache_names != expected_names:
+            old_artifact_path = (
+                repo_root / "artifacts/recurrence-v0/129d39646933/source" / pin.revision
+            )
+
+            def local_names(path: Path) -> set[str]:
+                return {
+                    file.relative_to(path).as_posix()
+                    for file in path.rglob("*") if file.is_file()
+                    and file.relative_to(path).parts[0] != ".cache"
+                } if path.is_dir() else set()
+
+            cache_names = local_names(cache_path)
+            artifact_names = local_names(old_artifact_path)
+            use_old_artifact = (
+                artifact_names == expected_names and old_artifact_path.is_dir()
+                and all(
+                    file.relative_to(old_artifact_path).parts[0] == ".cache"
+                    or file.relative_to(old_artifact_path).as_posix() in expected_names
+                    for file in old_artifact_path.rglob("*") if file.is_file()
+                )
+            )
+            if use_old_artifact:
+                snapshot = old_artifact_path
+                excluded_subtree = ".cache"
+            elif cache_names == expected_names:
+                snapshot = cache_path
+                excluded_subtree = None
+            else:
                 estimated = sum(int(getattr(item, "size", 0) or 0) for item in metadata.siblings)
                 if ResourceLedger.initial().download_bytes + downloaded_bytes + estimated > config.resources.download_bytes:
                     raise StageError("pinned student download would exceed the registered download cap")
@@ -361,11 +384,10 @@ def run_calibration_stage(
                     "originating_git_commit": originating_commit,
                     "code_signatures": _file_signatures(repo_root),
                 })
-            snapshot = Path(snapshot_download(
-                repo_id=pin.repo_id, revision=pin.revision, local_files_only=(cache_names == expected_names),
-                cache_dir=str(repo_root / ".cache" / "huggingface" / "hub"),
-            ))
-            if cache_names != expected_names:
+                snapshot = Path(snapshot_download(
+                    repo_id=pin.repo_id, revision=pin.revision, local_files_only=False,
+                    cache_dir=str(repo_root / ".cache" / "huggingface" / "hub"),
+                ))
                 _append_stage_event(reservation_path, {
                     "event_type": "download_complete", "status": "completed",
                     "event_id": uuid4().hex, "stage": "calibrate", "role": role,
@@ -379,8 +401,49 @@ def run_calibration_stage(
             )
             if not snapshot.is_dir():
                 raise StageError("pinned teacher snapshot is unavailable in the registered local cache")
+            expected_by_name = {item.rfilename: item for item in metadata.siblings}
+            actual_names = local_names(snapshot)
+            extras = actual_names - set(expected_by_name)
+            if extras:
+                raise StageError(f"teacher snapshot has undeclared model files: {sorted(extras)[:3]}")
+            missing_names = sorted(set(expected_by_name) - actual_names)
+            if missing_names:
+                estimated = sum(int(getattr(expected_by_name[name], "size", 0) or 0) for name in missing_names)
+                if ResourceLedger.initial().download_bytes + downloaded_bytes + estimated > config.resources.download_bytes:
+                    raise StageError("missing pinned teacher files would exceed the registered download cap")
+                if shutil.disk_usage(repo_root).free < estimated + 2 * 1024**3:
+                    raise StageError("insufficient disk for missing pinned teacher metadata")
+                downloaded_bytes += estimated
+                download_started = _utc_now()
+                _append_stage_event(reservation_path, {
+                    "event_type": "download_reservation", "status": "reserved",
+                    "event_id": uuid4().hex, "stage": "calibrate", "role": role,
+                    "repo_id": pin.repo_id, "revision": pin.revision,
+                    "reserved_bytes": estimated, "missing_files": missing_names,
+                    "started_at_utc": download_started,
+                    "originating_git_commit": originating_commit,
+                    "code_signatures": _file_signatures(repo_root),
+                })
+                for name in missing_names:
+                    fetched = Path(hf_hub_download(
+                        repo_id=pin.repo_id, filename=name, revision=pin.revision,
+                        cache_dir=str(repo_root / ".cache" / "huggingface" / "hub"),
+                    ))
+                    destination = snapshot / Path(name)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if fetched.resolve() != destination.resolve():
+                        shutil.copyfile(fetched, destination)
+                _append_stage_event(reservation_path, {
+                    "event_type": "download_complete", "status": "completed",
+                    "event_id": uuid4().hex, "stage": "calibrate", "role": role,
+                    "repo_id": pin.repo_id, "revision": pin.revision,
+                    "started_at_utc": download_started, "ended_at_utc": _utc_now(),
+                    "originating_git_commit": originating_commit,
+                })
+            excluded_subtree = None
         inventory = authenticate_model_snapshot(
             pin.repo_id, pin.revision, snapshot, metadata=metadata,
+            excluded_metadata_subtree=excluded_subtree,
         )
         snapshot_paths[role] = snapshot
         inventories[role] = inventory
@@ -475,7 +538,12 @@ def run_calibration_stage(
             total += journal.failure_count()
         return total
 
-    recovered_ledger = ResourceLedger.initial()
+    # Reconstruct every previously consumed item before enforcing current caps;
+    # otherwise an over-cap replay would escape without a durable stop record.
+    recovered_ledger = replace(
+        ResourceLedger.initial(), cuda_cap=2**63 - 1, wall_cap=2**63 - 1,
+        download_cap=2**63 - 1, artifact_cap=2**63 - 1,
+    )
     prior_downloads = sum(int(item.get("reserved_bytes", 0)) for item in history if item.get("event_type") == "download_reservation") + downloaded_bytes
     for raw_path in raw_directory.glob("*.jsonl"):
         if raw_path.name.endswith(".attempts.jsonl"):
@@ -507,7 +575,7 @@ def run_calibration_stage(
         for attempt_events in grouped.values():
             if any(event.get("status") == "worker_complete" for event in attempt_events):
                 continue
-            failed = [event for event in attempt_events if event.get("status") in {"failed", "worker_load_failed"}]
+            failed = [event for event in attempt_events if event.get("status") in {"failed", "worker_load_failed", "worker_close_failed"}]
             if failed:
                 event = failed[-1]
                 recovered_ledger = recovered_ledger.charge_worker(
@@ -545,7 +613,21 @@ def run_calibration_stage(
         for path in (base.rglob("*") if base.exists() else ())
         if path.is_file() and (base == root / "calibration" or path.name.startswith("calibrate"))
     )
-    recovered_ledger = replace(recovered_ledger, artifact_bytes=current_artifacts)
+    failure_metadata_reserve = 1024**2
+    operational_artifact_cap = max(0, config.resources.artifact_bytes - failure_metadata_reserve)
+    recovered_ledger = replace(
+        recovered_ledger, artifact_bytes=current_artifacts,
+        cuda_cap=config.resources.cuda_seconds,
+        wall_cap=config.resources.wall_seconds,
+        download_cap=config.resources.download_bytes,
+        artifact_cap=operational_artifact_cap,
+    )
+    replay_over_caps = (
+        recovered_ledger.cuda_seconds > recovered_ledger.cuda_cap
+        or recovered_ledger.wall_seconds > recovered_ledger.wall_cap
+        or recovered_ledger.download_bytes > recovered_ledger.download_cap
+        or recovered_ledger.artifact_bytes > recovered_ledger.artifact_cap
+    )
 
     try:
         with WorkerLease(root / "stages" / "calibrate.worker.lock") as lease:
@@ -556,7 +638,10 @@ def run_calibration_stage(
                     child_started=lease.record_child,
                 )
             )
-            if exhausted_before_worker:
+            if replay_over_caps:
+                result = {"status": "stopped_environment", "candidate": None, "attempts": [],
+                          "reason": "replayed calibration costs exceed a registered resource cap"}
+            elif exhausted_before_worker:
                 result = {"status": "stopped_environment", "candidate": None, "attempts": [], "reason": "aggregate calibration phase retry budget exhausted"}
             else:
                 result = calibrate_candidates(
@@ -573,12 +658,13 @@ def run_calibration_stage(
                     max_retries=config.resources.phase_retries,
                 )
     except (ResourceLimitError, WorkerOwnershipError) as exc:
+        stopped_ledger = getattr(exc, "ledger", None) or recovered_ledger
         result = {
             "status": "stopped_environment", "candidate": None, "attempts": [],
             "reason": f"{type(exc).__name__}: {exc}",
             "resource_ledger": {
-                name: getattr(recovered_ledger, name)
-                for name in recovered_ledger.__dataclass_fields__
+                name: getattr(stopped_ledger, name)
+                for name in stopped_ledger.__dataclass_fields__
             },
         }
     except Exception as exc:
@@ -634,30 +720,40 @@ def run_calibration_stage(
         for path in (base.rglob("*") if base.exists() else ())
         if path.is_file() and (base == root / "calibration" or path.name.startswith("calibrate"))
     )
-    projected = actual_artifacts + len(_canonical_bytes(result)) + 1
-    while True:
-        result["resource_ledger"]["artifact_bytes"] = projected
-        updated = actual_artifacts + len(_canonical_bytes(result)) + 1
-        if updated == projected:
-            break
-        projected = updated
-    if projected > config.resources.artifact_bytes:
-        raise StageError("calibration artifacts exceed the registered artifact-byte cap")
-    if result["resource_ledger"]["cuda_seconds"] > config.resources.cuda_seconds:
-        raise StageError("calibration CUDA use exceeds the registered cap")
-    if result["resource_ledger"]["wall_seconds"] > config.resources.wall_seconds:
-        raise StageError("calibration wall time exceeds the registered cap")
-    if result["resource_ledger"]["download_bytes"] > config.resources.download_bytes:
-        raise StageError("calibration downloads exceed the registered cap")
     if result["status"] != "interrupted":
         ended_at = _utc_now()
-        _append_stage_event(reservation_path, {
+        result["started_at_utc"] = started_at
+        result["ended_at_utc"] = ended_at
+        terminal_event = {
             "status": result["status"], "event_type": "terminal", "event_id": uuid4().hex,
             "stage_signature": stage_signature, "originating_git_commit": originating_commit,
             "started_at_utc": started_at, "ended_at_utc": ended_at,
-        })
-        result["started_at_utc"] = started_at
-        result["ended_at_utc"] = ended_at
+        }
+        other_cap_exceeded = (
+            result["resource_ledger"]["cuda_seconds"] > config.resources.cuda_seconds
+            or result["resource_ledger"]["wall_seconds"] > config.resources.wall_seconds
+            or result["resource_ledger"]["download_bytes"] > config.resources.download_bytes
+        )
+        # Reserve at most 1 MiB inside the hard cap for bounded terminal failure
+        # metadata. Count the terminal event and final stage JSON before writing.
+        def terminal_artifact_total() -> int:
+            total = actual_artifacts + len(_canonical_bytes(terminal_event)) + 1
+            while True:
+                result["resource_ledger"]["artifact_bytes"] = total
+                updated = actual_artifacts + len(_canonical_bytes(terminal_event)) + 1 + len(_canonical_bytes(result)) + 1
+                if updated == total:
+                    return total
+                total = updated
+
+        projected = terminal_artifact_total()
+        if projected > operational_artifact_cap or other_cap_exceeded:
+            result["status"] = "stopped_environment"
+            result["reason"] = result.get("reason") or "calibration resource use reached a registered cap"
+            terminal_event["status"] = "stopped_environment"
+            # The emergency terminal record is bounded; preserve the complete
+            # attempted total, even if the journal was already over the cap.
+            projected = terminal_artifact_total()
+        _append_stage_event(reservation_path, terminal_event)
         atomic_write_json(stage_path(root, "calibrate"), result)
     return result
 

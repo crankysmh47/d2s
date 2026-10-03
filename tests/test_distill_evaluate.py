@@ -232,6 +232,91 @@ def test_resource_ledger_preserves_initial_charges_and_caps() -> None:
         ledger.charge_worker(cuda_seconds=86400, wall_seconds=0, download_bytes=0, artifact_bytes=0)
 
 
+def test_resource_ledger_wall_is_global_elapsed_and_cap_error_carries_attempted_totals() -> None:
+    from datetime import datetime, timezone, timedelta
+
+    started = (datetime.now(timezone.utc) - timedelta(seconds=100)).isoformat().replace("+00:00", "Z")
+    ledger = ResourceLedger(wall_seconds=100, wall_started_utc=started)
+    after_one = ledger.charge_worker(cuda_seconds=0, wall_seconds=40, download_bytes=0, artifact_bytes=0)
+    after_two = after_one.charge_worker(cuda_seconds=0, wall_seconds=40, download_bytes=0, artifact_bytes=0)
+    assert after_one.wall_seconds == after_two.wall_seconds
+
+    capped = ResourceLedger(cuda_seconds=9, cuda_cap=10)
+    with pytest.raises(ResourceLimitError, match="CUDA") as caught:
+        capped.charge_worker(cuda_seconds=2, wall_seconds=2, download_bytes=0, artifact_bytes=5)
+    assert caught.value.ledger.cuda_seconds == 11
+    assert caught.value.ledger.artifact_bytes == 5
+
+
+def test_failed_durable_row_append_retries_same_id_without_advancing_prefix() -> None:
+    generated_ids = []
+    saved = []
+    class Worker:
+        def generate(self, row, candidate):
+            generated_ids.append(row["id"])
+            return {"text": "Final answer: 1", "stop_reason": "eos", "generated_tokens": 2,
+                    "wall_seconds": 0.001, "cuda_seconds": 0}
+
+    failed_once = False
+    def sink(row):
+        nonlocal failed_once
+        if not failed_once:
+            failed_once = True
+            raise OSError("synthetic append failure")
+        saved.append(dict(row))
+
+    result = calibrate_candidates(
+        [{"id": "same-id", "question": "q?"}], candidates=((256, 768),),
+        worker_factory=lambda role, candidate: Worker(), minimum_eos=1,
+        row_sink=sink, max_retries=2,
+    )
+    assert generated_ids == ["same-id", "same-id", "same-id"]
+    assert len(saved) == 2
+    assert result["status"] == "awaiting_review"
+
+
+def test_worker_close_failure_has_no_worker_complete_and_carries_cost() -> None:
+    from ppmoe.distill.model import WorkerOwnershipError
+    attempts = []
+    failures = []
+    class Sink:
+        def record_attempt(self, row): attempts.append(dict(row))
+        def record_failure(self, row): failures.append(dict(row))
+    class Worker:
+        startup_wall_seconds = 0.001
+        def generate(self, row, candidate):
+            return {"text": "Final answer: 1", "stop_reason": "eos", "generated_tokens": 2,
+                    "wall_seconds": 0.001, "cuda_seconds": 0}
+        def close(self): raise RuntimeError("synthetic teardown failure")
+
+    with pytest.raises(WorkerOwnershipError) as caught:
+        calibrate_candidates(
+            [{"id": "x", "question": "q?"}], candidates=((256, 768),),
+            worker_factory=lambda role, candidate: Worker(), minimum_eos=1,
+            failure_sink=Sink(),
+        )
+    assert caught.value.ledger is not None
+    assert not any(item["status"] == "worker_complete" for item in attempts)
+    assert failures[-1]["status"] == "worker_close_failed"
+
+
+def test_last_durable_row_over_artifact_cap_preserves_attempted_total() -> None:
+    saved = []
+    class Worker:
+        def generate(self, row, candidate):
+            return {"text": "Final answer: 1", "stop_reason": "eos", "generated_tokens": 2,
+                    "wall_seconds": 0, "cuda_seconds": 0}
+    ledger = ResourceLedger(artifact_bytes=0, artifact_cap=0)
+    with pytest.raises(ResourceLimitError, match="artifact") as caught:
+        calibrate_candidates(
+            [{"id": "x", "question": "q?"}], candidates=((256, 768),),
+            worker_factory=lambda role, candidate: Worker(), minimum_eos=1,
+            row_sink=lambda row: saved.append(dict(row)), ledger=ledger,
+        )
+    assert len(saved) == 1
+    assert caught.value.ledger.artifact_bytes > caught.value.ledger.artifact_cap
+
+
 def test_worker_lease_reclaims_only_proven_dead_pid_without_signalling(tmp_path: Path, monkeypatch) -> None:
     from ppmoe.distill.evaluate import WorkerLease
 

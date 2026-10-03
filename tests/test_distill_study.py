@@ -295,27 +295,41 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
         role: {"repo_id": role, "revision": f"{role}-pin", "files": [{"path": "config.json", "size_bytes": 1, "sha256": "d" * 64, "hub_blob_id": "blob"}]}
         for role in ("student", "teacher")
     }
-    monkeypatch.setattr(study, "authenticate_model_snapshot", lambda repo, rev, path, metadata=None: inventory_by_role["student" if repo == "student" else "teacher"])
+    authenticated_paths = []
+    def fake_auth(repo, rev, path, metadata=None, **kwargs):
+        authenticated_paths.append((repo, Path(path), kwargs.get("excluded_metadata_subtree")))
+        return inventory_by_role["student" if repo == "student" else "teacher"]
+    monkeypatch.setattr(study, "authenticate_model_snapshot", fake_auth)
     monkeypatch.setattr(study, "pinned_eos_token_ids", lambda path: (2,))
     class FakeApi:
         def model_info(self, repo_id, *, revision, files_metadata):
-            return SimpleNamespace(sha=revision, siblings=[SimpleNamespace(rfilename="config.json", size=1)])
+            names = ["config.json"] if repo_id == "student" else ["config.json", "README.md", ".gitattributes"]
+            sizes = {"config.json": 1, "README.md": 2, ".gitattributes": 3}
+            return SimpleNamespace(sha=revision, siblings=[SimpleNamespace(rfilename=name, size=sizes[name]) for name in names])
     snapshot_calls = []
     def fake_snapshot_download(**kwargs):
         snapshot_calls.append(kwargs["local_files_only"])
         return tmp_path / kwargs["revision"]
-    fake_hub = SimpleNamespace(HfApi=FakeApi, snapshot_download=fake_snapshot_download)
+    def fake_hf_hub_download(**kwargs):
+        assert any(item.get("event_type") == "download_reservation" and item.get("role") == "teacher"
+                   for item in map(json.loads, (root / "stages" / "calibrate-reservations.jsonl").read_text().splitlines()))
+        target = tmp_path / "downloads" / kwargs["filename"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"x" * {"README.md": 2, ".gitattributes": 3}[kwargs["filename"]])
+        return str(target)
+    fake_hub = SimpleNamespace(HfApi=FakeApi, snapshot_download=fake_snapshot_download, hf_hub_download=fake_hf_hub_download)
     import sys
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
-    for role in ("student", "teacher"):
-        pin_dir = tmp_path / f"{role}-pin"
-        pin_dir.mkdir(exist_ok=True)
-        (pin_dir / "config.json").write_text("x", encoding="utf-8")
+    artifact_student = repo_root / "artifacts/recurrence-v0/129d39646933/source/student-pin"
+    (artifact_student / ".cache" / "metadata").mkdir(parents=True)
+    (artifact_student / "config.json").write_text("x", encoding="utf-8")
+    (artifact_student / ".cache" / "metadata" / "local.json").write_text("ignored local metadata", encoding="utf-8")
     teacher_cache = repo_root / ".cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/teacher-pin"
     teacher_cache.mkdir(parents=True)
     student_cache = repo_root / ".cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/student-pin"
     student_cache.mkdir(parents=True)
     (student_cache / "config.json").write_text("x", encoding="utf-8")
+    (teacher_cache / "config.json").write_text("x", encoding="utf-8")
     config = SimpleNamespace(
         resources=SimpleNamespace(vram_reserve_bytes=2 * 1024**3, phase_retries=2, download_bytes=21474836480,
                                   artifact_bytes=21474836480, cuda_seconds=86400, wall_seconds=172800),
@@ -363,7 +377,13 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
     assert '"gold"' not in packet_text and '"role"' not in packet_text and "private" not in packet_text
     assert result["originating_git_commit"] == "c" * 40
     assert result["started_at_utc"] < result["ended_at_utc"]
-    assert snapshot_calls == [True]
+    assert snapshot_calls == []
+    assert ("student", artifact_student, ".cache") in authenticated_paths
+    assert any(repo == "teacher" and path == teacher_cache and excluded is None for repo, path, excluded in authenticated_paths)
+    reservation_events = [json.loads(line) for line in (root / "stages" / "calibrate-reservations.jsonl").read_text().splitlines()]
+    teacher_reservation = next(item for item in reservation_events if item.get("event_type") == "download_reservation" and item.get("role") == "teacher")
+    assert teacher_reservation["reserved_bytes"] == 5
+    assert teacher_reservation["missing_files"] == [".gitattributes", "README.md"]
     with pytest.raises(FileExistsError, match="immutable"):
         study.run_calibration_stage(root, config, repo_root=repo_root, config_path=tmp_path / "config.toml",
                                     worker_loader=lambda role, candidate: pytest.fail("terminal stage must not rerun"))
@@ -381,8 +401,46 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
     )
     assert failed_result["status"] == "stopped_environment"
     assert (failure_root / "stages" / "calibrate.json").is_file()
+    failed_row_paths = [
+        Path(str(path)[:-len(".attempts.jsonl")])
+        for path in (failure_root / "calibration" / "raw").glob("*.attempts.jsonl")
+    ]
+    assert failed_row_paths
+    assert all(not path.exists() or not path.read_text(encoding="utf-8").strip() for path in failed_row_paths)
+    failed_attempts = [
+        json.loads(line)
+        for path in (failure_root / "calibration" / "raw").glob("*.attempts.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(item["status"] == "worker_load_failed" for item in failed_attempts)
+    assert not any(item["status"] == "worker_complete" for item in failed_attempts)
     with pytest.raises(FileExistsError, match="immutable"):
         study.run_calibration_stage(
             failure_root, config, repo_root=repo_root, config_path=tmp_path / "config.toml",
             worker_loader=lambda role, candidate: pytest.fail("terminal failure must not be retried"),
         )
+
+    overcap_root = tmp_path / ("o" * 64)
+    (overcap_root / "stages").mkdir(parents=True)
+    (overcap_root / "data").mkdir()
+    shutil.copyfile(manifest_path, overcap_root / "manifest.json")
+    shutil.copyfile(prepare_path, overcap_root / "stages" / "prepare.json")
+    shutil.copyfile(data_path, overcap_root / "data" / "calibration.jsonl")
+    monkeypatch.setattr(study, "TASK1_RUN_ID", overcap_root.name)
+    overcap_config = SimpleNamespace(**vars(config))
+    overcap_config.resources = SimpleNamespace(**vars(config.resources))
+    overcap_config.resources.artifact_bytes = 1
+    overcap_result = study.run_calibration_stage(
+        overcap_root, overcap_config, repo_root=repo_root, config_path=tmp_path / "config.toml",
+        worker_loader=lambda role, candidate: pytest.fail("replayed artifact cap must stop before model work"),
+    )
+    assert overcap_result["status"] == "stopped_environment"
+    saved_terminal = json.loads((overcap_root / "stages" / "calibrate.json").read_text(encoding="utf-8"))
+    assert saved_terminal["resource_ledger"]["artifact_bytes"] > overcap_config.resources.artifact_bytes
+    measured = sum(
+        path.stat().st_size
+        for base in (overcap_root / "calibration", overcap_root / "stages")
+        for path in (base.rglob("*") if base.exists() else ())
+        if path.is_file() and (base == overcap_root / "calibration" or path.name.startswith("calibrate"))
+    )
+    assert saved_terminal["resource_ledger"]["artifact_bytes"] == measured

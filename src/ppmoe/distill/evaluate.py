@@ -16,10 +16,15 @@ import uuid
 from typing import Any, Callable, Mapping, Sequence
 
 from .answers import extract_final_numeric
+from .model import WorkerOwnershipError
 
 
 class ResourceLimitError(RuntimeError):
     """A registered study resource cap would be exceeded."""
+
+    def __init__(self, message: str, *, ledger: ResourceLedger | None = None) -> None:
+        super().__init__(message)
+        self.ledger = ledger
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,10 +55,9 @@ class ResourceLedger:
         wall_elapsed = max(0, int((datetime.now(timezone.utc) - wall_start).total_seconds()))
         next_ledger = ResourceLedger(
             cuda_seconds=self.cuda_seconds + cuda_charge,
-            wall_seconds=max(
-                self.wall_seconds + int(wall_seconds + 0.999999),
-                wall_elapsed,
-            ),
+            # Global wall is elapsed since the single phase origin. Replayed
+            # historical row charges must not be added a second time.
+            wall_seconds=max(self.wall_seconds, wall_elapsed),
             download_bytes=self.download_bytes + download_bytes,
             artifact_bytes=self.artifact_bytes + artifact_bytes,
             wall_started_utc=self.wall_started_utc,
@@ -63,13 +67,13 @@ class ResourceLedger:
             artifact_cap=self.artifact_cap,
         )
         if next_ledger.cuda_seconds > next_ledger.cuda_cap:
-            raise ResourceLimitError("CUDA resource cap would be exceeded")
+            raise ResourceLimitError("CUDA resource cap would be exceeded", ledger=next_ledger)
         if next_ledger.wall_seconds > next_ledger.wall_cap:
-            raise ResourceLimitError("wall-time resource cap would be exceeded")
+            raise ResourceLimitError("wall-time resource cap would be exceeded", ledger=next_ledger)
         if next_ledger.download_bytes > next_ledger.download_cap:
-            raise ResourceLimitError("download resource cap would be exceeded")
+            raise ResourceLimitError("download resource cap would be exceeded", ledger=next_ledger)
         if next_ledger.artifact_bytes > next_ledger.artifact_cap:
-            raise ResourceLimitError("artifact resource cap would be exceeded")
+            raise ResourceLimitError("artifact resource cap would be exceeded", ledger=next_ledger)
         return next_ledger
 
 
@@ -357,11 +361,6 @@ def calibrate_candidates(
                             )
                             break
                     if len(completed) == len(rows):
-                        if failure_sink is not None:
-                            failure_sink.record_attempt({
-                                **reservation, "status": "worker_complete", "startup_wall_seconds": startup_wall,
-                                "ended_at_utc": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
-                            })
                         break
                 except ResourceLimitError:
                     raise
@@ -389,7 +388,39 @@ def calibrate_candidates(
                 finally:
                     close = getattr(worker, "close", None)
                     if callable(close):
-                        close()
+                        close_started = time.perf_counter()
+                        try:
+                            close()
+                        except Exception as exc:
+                            close_wall = time.perf_counter() - close_started
+                            failed = {
+                                **reservation, "status": "worker_close_failed",
+                                "error_type": type(exc).__name__, "wall_seconds": close_wall,
+                                "cuda_seconds": None,
+                                "ended_at_utc": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                            }
+                            if failure_sink is not None:
+                                failure_sink.record_failure(failed)
+                            try:
+                                current_ledger = current_ledger.charge_worker(
+                                    cuda_seconds=None, wall_seconds=close_wall,
+                                    download_bytes=0, artifact_bytes=0,
+                                )
+                            except ResourceLimitError as limit:
+                                current_ledger = limit.ledger or current_ledger
+                                raise WorkerOwnershipError(
+                                    "worker teardown failed; ownership remains uncertain",
+                                    ledger=current_ledger,
+                                ) from exc
+                            raise WorkerOwnershipError(
+                                "worker teardown failed; ownership remains uncertain",
+                                ledger=current_ledger,
+                            ) from exc
+                    if len(completed) == len(rows) and failure_sink is not None:
+                        failure_sink.record_attempt({
+                            **reservation, "status": "worker_complete", "startup_wall_seconds": startup_wall,
+                            "ended_at_utc": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                        })
             if len(completed) != len(rows):
                 candidate_status = "stopped_environment" if errors > max_retries else "interrupted"
                 break
