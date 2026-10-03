@@ -71,6 +71,8 @@ If discovery passes, train seed 48 for both A1/A2 with identical settings; carry
 
 Hard resource caps for one study: 24 CUDA-active hours across all phases, 48 wall hours after first GPU stage, 16 GiB physical VRAM (record peak and stop on OOM), 20 GiB newly downloaded model/data cache, 20 GiB generated run artifacts excluding shared pre-existing cache. Reserve at least 4 CUDA hours for evaluation before starting training; if estimated remaining budget is insufficient, stop. Scientific gates remain terminal. Infrastructure recovery may resume the same frozen protocol from validated complete checkpoints or completed output rows, at most two recovery attempts per phase. Recheck code/config/model/data/checkpoint hashes and retain all failure records and consumed budget; do not alter hyperparameters, prompt, scorer or selection. Lost/corrupt state, exhausted budget, or a third failure ends as an environment stop. Allow at most two transient download retries per file; no cached-source substitution. Include download size/space preflight before network access.
 
+Apply exact count gates where possible, not differences of rounded accuracies: the 120-row teacher pilot needs >=72 teacher correct and >=6 extra correct vs F0; 200-row discovery needs >=4 extra correct and transfer regression at most 6 answers; 400-row sealed improvement needs >=16 extra correct. Invalid <=10% means at most 20/200 on development. Sealed SVAMP regression at most 3 percentage points means at most 15/500. Confidence-bound predicates remain strict or inclusive as stated above.
+
 ## 2. Repository layout and interfaces
 
 Authorized implementation paths:
