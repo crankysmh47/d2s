@@ -1,6 +1,6 @@
 # Current work queue
 
-Updated 2026-09-27. Historical V0 requirements and stop rules: [plan.md](plan.md). This file is a summary, not permission to skip gates.
+Updated 2026-10-03. Historical V0 requirements and stop rules: [plan.md](plan.md). This file is a summary, not permission to skip gates.
 
 Historical recurrence execution contract: [docs/superpowers/plans/2026-09-11-pretrained-recurrence-execution.md](docs/superpowers/plans/2026-09-11-pretrained-recurrence-execution.md). It is not an active queue after V0–V3 stops.
 
@@ -74,12 +74,12 @@ The audit supports one fresh protocol: [V3 design](docs/superpowers/specs/2026-0
 - [ ] Fresh config/splits, GPU calibration, recurrence controls and LoRA: **not run and not authorized in this stopped V3 candidate**.
 - [x] Decide separately to draft a post-training distillation pivot. Do not silently retune/retry V3.
 
-## Option 2: verified teacher-rationale QLoRA (draft, planning only)
+## Option 2: verified teacher-rationale QLoRA (authorized 2026-10-03)
 
 Detailed [Option 2 plan](docs/superpowers/plans/2026-09-27-verified-distillation-qlora.md). This tests a narrow dense-model post-training gain, not MoE-like footprint. It does not reopen recurrence.
 
 - [x] Write a gated plan comparing Qwen3-4B teacher-rationale QLoRA with matched gold-solution QLoRA on Qwen3-1.7B.
-- [ ] User reviews/approves or amends the draft; no implementation, download, or inference before then.
+- [x] User authorized the four revisions and execution; revision 2 separates practical/teacher gains, calibrates token budget, matches tensor work, and allows validated recovery.
 - [ ] After approval, verify GPU/QLoRA feasibility, source/retention provenance, and scorer quality before generating teacher data or training.
 - [ ] Only if all gates pass: run paired discovery, one confirmation, sealed evaluation, and independent report. Stop on any registered no-go.
 
