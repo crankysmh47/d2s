@@ -14,11 +14,13 @@ Plan: [revision 2](superpowers/plans/2026-09-27-verified-distillation-qlora.md).
 
 | Task | State | Evidence / next action |
 | --- | --- | --- |
-| 0 dependency/GPU feasibility | In progress | CUDA/BF16 available; torch 2.13.0+cu130, Transformers 5.16.1, Python 3.11.9. PEFT/bitsandbytes absent before changes. |
-| 1 source/config/splits | Pending | Starts after feasibility or alongside non-GPU source preflight. |
+| 0 dependency/GPU feasibility | Fix/recovery pending | Code `dadcb87`; post-dependency CPU suite 1,050 passed/4 skipped/3 deselected. First attempt downloaded teacher 8,060,908,199 bytes and reached post-update unload guard; failed on 67,109,888 residual allocated bytes, before teacher generation. Immutable failure at `artifacts/distillation-v1/feasibility-20261003/`. Review found missing cap enforcement/failure environment evidence. Luna fixes are being tested; recovery requires scoped review first. |
+| 1 source/config/splits | In progress (CPU only) | Luna implements pinned sources, strict config, deterministic disjoint splits, retention authentication and minimal stage records. No benchmark outputs authorized before Task 0 passes. |
 | 2 budget/scorer calibration | Pending | 60 exclusive questions; no pilot/held-out outputs yet. |
 | 3 teacher qualification/corpus | Pending | No model benchmark or teacher data yet. |
 | 4 trainer/retention | Pending | No training yet. |
 | 5 discovery/confirmation/report | Pending | Only through passing gates. |
 
 Record exact commands, commits, tests and gate artifacts as each task advances. GPU-active budget is 24 hours; failures/recoveries consume it. No training result is implied by completed code.
+
+First feasibility attempt ran `.venv/Scripts/python.exe scripts/distillation_feasibility.py` in agent-local session 3063/PID 30540; it exited 1. The raw student loss/gradient/peak metrics were not persisted, so only control-flow evidence shows its update guards passed. Attribute no numerical model performance to this attempt. Recovery will use sequential fresh GPU worker processes to guarantee phase teardown without assuming the owner of the residual 64 MiB. The completed teacher cache is reused; original failed artifacts remain immutable.
