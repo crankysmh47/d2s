@@ -18,6 +18,11 @@ dependencies = [
 dev = [
   "pytest>=8,<9",
 ]
+distill = [
+  "accelerate==1.15.0",
+  "bitsandbytes==0.50.2",
+  "peft==0.21.2",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ppmoe"]
