@@ -115,7 +115,7 @@ Implementation freeze boundary: before calibration, finish reusable inference, c
 
 ### Task 3 — teacher viability and verified matched corpus
 
-- [ ] Implement `model.py`, `teacher.py`, `qualify|generate|audit` stages with fake-model RED/GREEN tests for fixed order, EOS, token cap, one completion, exact rational comparison, target fit, partial phase, output hash, and forbidden split access. Review/test/freeze before first pilot inference.
+- [ ] Consume frozen Task 2 `model.py` helpers; implement `teacher.py`, `qualify|generate|audit` stages with fake-model RED/GREEN tests for fixed order, EOS, token cap, one completion, exact rational comparison, target fit, partial phase, output hash, and forbidden split access. Review/test/freeze before first pilot inference.
 - [ ] Run 120 paired T/F0 pilot and stop unless T >=60% and T-F0 >=5 points. Generate one teacher response for each of 1,200 candidate train questions only if passed. Produce immutable accepted/rejected manifests; require >=800 matched IDs. Audit 60 deterministic accepted rationales under the rule above; preserve raw reviewer decisions and stop on quality gate failure. No LoRA before all three checks pass.
 
 ### Task 4 — QLoRA trainer and retention evaluator
