@@ -96,8 +96,8 @@ Implementation freeze boundary: before calibration, finish reusable inference, c
 
 ### Task 1 — config, source, partitions, and provenance
 
-- [ ] Write RED tests for malformed config, revision drift, duplicate/near-duplicate questions, deterministic ordered IDs, exact 60/120/200/1,200/400/200/500 counts, train/test separation, forbidden held-out gold access, tampered bytes, unsafe paths, and insufficient pools. Run `uv run pytest tests/test_distill_config.py tests/test_distill_data.py -q` and confirm failure before implementation.
-- [ ] Implement `config.py`, `data.py`, `configs/distillation-v1.toml` and `preflight|prepare` stage. Pin exact prompts, token budgets, source IDs, seeds, caps and qualification thresholds from section 1; reject unknown config keys. Materialize manifests without opening sealed answers. RED/GREEN focused tests, full CPU suite, Ruff, `compileall`, `git diff --check`, independent code review, then commit/push before model output.
+- [x] Write RED tests for malformed config, revision drift, duplicate/near-duplicate questions, deterministic ordered IDs, exact 60/120/200/1,200/400/200/500 counts, train/test separation, forbidden held-out gold access, tampered bytes, unsafe paths, and insufficient pools. Run `uv run pytest tests/test_distill_config.py tests/test_distill_data.py -q` and confirm failure before implementation.
+- [x] Implement `config.py`, `data.py`, `configs/distillation-v1.toml` and `preflight|prepare` stage. Pin exact prompts, token budgets, source IDs, seeds, caps and qualification thresholds from section 1; reject unknown config keys. Materialize manifests without opening sealed answers. RED/GREEN focused tests, full CPU suite, Ruff, `compileall`, `git diff --check`, independent code review, then commit/push before model output.
 
 ### Task 2 — scorer and blind development calibration
 
