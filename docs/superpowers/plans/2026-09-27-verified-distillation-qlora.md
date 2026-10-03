@@ -84,6 +84,8 @@ Run ID = SHA-256 of canonical config bytes, pinned source revisions, exact packa
 
 The run ID binds preparation's active source list. Each later stage additionally binds its own code/tests and every transitive source it executes; adding a future trainer before training does not invalidate an earlier calibration record. Freeze stage signatures before that stage's first output and recheck at recovery. Changing a scorer/prompt/model/data used by a completed stage invalidates that candidate; newly implemented, previously unused stage code is permitted. Record the initial feasibility smoke as a separate artifact and charge its GPU time to the experiment ledger.
 
+Implementation freeze boundary: before calibration, finish reusable inference, complete-row validation and resource-accounting helpers in `answers.py`, `model.py` and `evaluate.py`. These modules/tests, source/config modules, config bytes and lock then stay immutable. Later `teacher.py`, `train.py` and `gates.py` consume them. `study.py` and CLI can add dispatch for previously unused stages, but cannot change an executed stage's implementation; bind each revision and originating Git commit so additions can be checked. Reopening a run validates its stored preparation signature and run-ID digest, not a new digest incorporating later code. The resource ledger includes the failed/successful feasibility attempts before calibration, never starts fresh at training.
+
 ## 3. Sequential implementation and execution tasks
 
 ### Task 0 — dependency and hardware feasibility
@@ -121,7 +123,7 @@ The run ID binds preparation's active source list. Each later stage additionally
 
 ### Exact command surface for later execution
 
-Implement each command before running it; `--config` and `--run-root` are required, and CLI never silently selects a prior run:
+Implement each command before running it; positional stage and `--config` are required, and every materializing stage requires explicit `--run-root`. Discovery `preflight` alone may omit the run root to print its computed ID/path without creating a run. CLI never silently selects a prior run:
 
 ```
 uv run pytest tests -q

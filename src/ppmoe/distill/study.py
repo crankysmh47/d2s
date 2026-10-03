@@ -134,6 +134,11 @@ def validate_prepared_run(
         raise StageError("prepared run stage schema/status mismatch")
     if manifest.get("run_id") != root.name or stage.get("run_id") != root.name:
         raise StageError("prepared run ID/path mismatch")
+    if not isinstance(manifest.get("source_signature"), dict):
+        raise StageError("prepared source signature is missing")
+    expected_run_id = sha256(_canonical_bytes(manifest["source_signature"])).hexdigest()
+    if expected_run_id != root.name:
+        raise StageError("prepared run ID does not hash its source signature")
     if stage.get("manifest_sha256") != sha256_file(manifest_path):
         raise StageError("prepared manifest bytes changed")
     expected_signature = sha256(_canonical_bytes(manifest.get("source_signature"))).hexdigest()
@@ -269,6 +274,8 @@ def run_stage(
         raise StageError(f"unknown stage {stage}")
     if stage not in IMPLEMENTED_STAGES:
         raise StageError(f"stage {stage} is registered but not implemented")
+    if stage == "prepare" and run_root is None:
+        raise StageError("prepare requires an explicit run-root")
     repo_root = Path(__file__).resolve().parents[3]
     config_path = Path(config_path)
     if not config_path.is_absolute():

@@ -22,6 +22,16 @@ _SOURCE_HASHES = {
     "gsm8k_test": ("ee7b8da9e381df27b9e3f7758a159ab2bdaa4dbaa910546cbbc47e0cb44e4f59", 419088, 1319),
     "svamp": ("5be77703a6d891ae476d7c082787ad361392aa02453b132516cdd5f4e7934e3e", 339970, 1000),
 }
+_OLD_DATA_MANIFEST_PATH = Path("artifacts/recurrence-v0/129d39646933/data/manifest.json")
+_OLD_DATA_STAGE_PATH = Path("artifacts/recurrence-v0/129d39646933/stages/data.json")
+_OLD_SOURCE_MANIFEST_PATH = Path("artifacts/recurrence-v0/129d39646933/source.json")
+_STUDENT_TOKENIZER_PATH = Path(
+    "artifacts/recurrence-v0/129d39646933/source/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e/tokenizer.json"
+)
+_OLD_DATA_MANIFEST_SHA256 = "aafff1f7acffd594c5629fb2e2573a57c7ed3ae776aae61758a77a746a8c291d"
+_OLD_DATA_STAGE_SHA256 = "8750d557bf3175d8893cad6758a134558defc5be1311cbb68d33940f4c56bfc4"
+_OLD_SOURCE_MANIFEST_SHA256 = "5c595758fb082136841498eaad8c6fee5761c5ca5927a0975f1c1c775053f0e2"
+_STUDENT_TOKENIZER_SHA256 = "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
 _GSM_ANSWER = re.compile(r"####\s*([-+]?(?:\d[\d,]*(?:\.\d+)?|\.\d+))\s*\Z", re.MULTILINE)
 _ANNOTATION = re.compile(r"<<.*?>>")
 _SEALED = {"sealed_test", "sealed_transfer"}
@@ -446,28 +456,37 @@ def authenticate_retention(config: DistillConfig, repo_root: Path) -> dict[str, 
         raise ValueError("retention count drift")
     if manifest.get("chunks_sha256") != config.retention_chunks_sha256:
         raise ValueError("retention chunk hash drift")
-    old_data_manifest_path = repo_root / "artifacts/recurrence-v0/129d39646933/data/manifest.json"
+    old_data_manifest_path = repo_root / _OLD_DATA_MANIFEST_PATH
+    stage_path = repo_root / _OLD_DATA_STAGE_PATH
+    source_manifest_path = repo_root / _OLD_SOURCE_MANIFEST_PATH
+    tokenizer_path = repo_root / _STUDENT_TOKENIZER_PATH
+    provenance_pins = (
+        ("prior data manifest", old_data_manifest_path, _OLD_DATA_MANIFEST_SHA256),
+        ("prior data stage", stage_path, _OLD_DATA_STAGE_SHA256),
+        ("prior source manifest", source_manifest_path, _OLD_SOURCE_MANIFEST_SHA256),
+        ("student tokenizer", tokenizer_path, _STUDENT_TOKENIZER_SHA256),
+    )
+    for name, path, expected_sha in provenance_pins:
+        if not path.is_file() or sha256_file(path) != expected_sha:
+            raise ValueError(f"pinned retention provenance hash mismatch: {name}")
     old_data_manifest = json.loads(old_data_manifest_path.read_text(encoding="utf-8"))
     if old_data_manifest.get("tokenizer", {}).get("revision") != config.student.revision:
         raise ValueError("retention tokenizer revision mismatch")
-    stage_path = repo_root / "artifacts/recurrence-v0/129d39646933/stages/data.json"
     old_data_stage = json.loads(stage_path.read_text(encoding="utf-8"))
     if old_data_stage.get("status") != "passed" or not old_data_stage.get("signatures"):
         raise ValueError("retention data-stage provenance is incomplete")
     stage_payload = old_data_stage.get("payload", {})
-    source_manifest_path = repo_root / "artifacts/recurrence-v0/129d39646933/source.json"
     source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
     tokenizer_files = {
         entry["relative_path"]: entry["sha256"]
         for entry in source_manifest.get("files", [])
         if isinstance(entry, dict) and "relative_path" in entry and "sha256" in entry
     }
-    tokenizer_path = (
-        repo_root / "artifacts/recurrence-v0/129d39646933/source"
-        / config.student.revision / "tokenizer.json"
-    )
     tokenizer_sha = old_data_manifest["tokenizer"].get("sha256")
-    if tokenizer_files.get("tokenizer.json") != tokenizer_sha or sha256_file(tokenizer_path) != tokenizer_sha:
+    if (
+        tokenizer_sha != _STUDENT_TOKENIZER_SHA256
+        or tokenizer_files.get("tokenizer.json") != _STUDENT_TOKENIZER_SHA256
+    ):
         raise ValueError("retention tokenizer SHA mismatch")
     data_manifest_sha = sha256_file(old_data_manifest_path)
     if stage_payload.get("manifest_sha256") != data_manifest_sha:

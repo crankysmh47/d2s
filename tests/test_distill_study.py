@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import importlib.util
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
 
 from ppmoe.distill.study import (
     StageError,
+    StageRecord,
     atomic_write_json,
     run_stage,
     safe_output_path,
@@ -23,6 +26,15 @@ def test_stage_paths_and_validation_are_explicit(tmp_path: Path) -> None:
         run_stage("calibrate", tmp_path)
     with pytest.raises(StageError, match="unknown"):
         run_stage("made-up", tmp_path)
+
+
+def test_prepare_requires_explicit_run_root_before_source_scan(monkeypatch) -> None:
+    def source_scan_must_not_run(*args, **kwargs):
+        raise AssertionError("prepare checked source data before validating its required run root")
+
+    monkeypatch.setattr("ppmoe.distill.study._prepared_source", source_scan_must_not_run)
+    with pytest.raises(StageError, match="explicit run-root"):
+        run_stage("prepare", Path("configs/distillation-v1.toml"))
 
 
 def test_atomic_json_writer_creates_once_and_rejects_finalized_overwrite(tmp_path: Path) -> None:
@@ -84,7 +96,8 @@ def test_runtime_identity_binds_python_cuda_device_and_two_gib_reserve() -> None
 
 
 def test_prepared_run_rejects_tampered_split_bytes_without_parsing_labels(tmp_path: Path) -> None:
-    run_id = "a" * 64
+    signature = {"config": "frozen"}
+    run_id = sha256(json.dumps(signature, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     root = tmp_path / run_id
     data = root / "data"
     data.mkdir(parents=True)
@@ -93,7 +106,6 @@ def test_prepared_run_rejects_tampered_split_bytes_without_parsing_labels(tmp_pa
     chunks = root / "retention" / "retention-chunks.jsonl"
     chunks.parent.mkdir()
     chunks.write_bytes(b'{"index":0}\n')
-    signature = {"config": "frozen"}
     manifest = {
         "schema_version": 1,
         "run_id": run_id,
@@ -110,8 +122,6 @@ def test_prepared_run_rejects_tampered_split_bytes_without_parsing_labels(tmp_pa
     }
     manifest_path = root / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
-    from hashlib import sha256
-
     signature_hash = sha256(json.dumps(signature, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     atomic_write_json(
         root / "stages" / "prepare.json",
@@ -129,3 +139,62 @@ def test_prepared_run_rejects_tampered_split_bytes_without_parsing_labels(tmp_pa
     split.write_bytes(b'{"id":"id-1","gold":"tampered"}\n')
     with pytest.raises(StageError, match="bytes changed"):
         validate_prepared_run(root)
+
+
+def test_prepared_run_rejects_directory_id_not_derived_from_signature(tmp_path: Path) -> None:
+    signature = {"config": "frozen"}
+    run_id = "f" * 64
+    root = tmp_path / run_id
+    root.mkdir()
+    manifest = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "source_signature": signature,
+        "retention": {"chunks_sha256": "0" * 64},
+        "splits": {},
+    }
+    manifest_path = root / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    signature_hash = sha256(json.dumps(signature, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    atomic_write_json(
+        root / "stages" / "prepare.json",
+        {
+            "stage": "prepare",
+            "status": "passed",
+            "run_id": run_id,
+            "manifest_sha256": sha256_file(manifest_path),
+            "source_signature_sha256": signature_hash,
+            "retention_chunks_sha256": "0" * 64,
+        },
+    )
+
+    with pytest.raises(StageError, match="run ID.*source signature"):
+        validate_prepared_run(root)
+
+
+def test_cli_accepts_positional_stages_and_rejects_missing_required_options(monkeypatch, capsys) -> None:
+    script_path = Path(__file__).parents[1] / "scripts" / "run_distillation_v1.py"
+    spec = importlib.util.spec_from_file_location("run_distillation_v1_test", script_path)
+    assert spec is not None and spec.loader is not None
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    calls: list[tuple[str, Path, Path | None]] = []
+
+    def fake_run_stage(stage: str, config_path: Path, run_root: Path | None):
+        calls.append((stage, config_path, run_root))
+        return StageRecord(stage, "a" * 64, "computed", "preflight_ok", {}, {}, {})
+
+    monkeypatch.setattr(cli, "run_stage", fake_run_stage)
+    for stage in ("preflight", "prepare"):
+        args = [stage, "--config", "configs/distillation-v1.toml"]
+        if stage == "prepare":
+            args += ["--run-root", "artifacts/distillation-v1/" + "a" * 64]
+        assert cli.main(args) == 0
+    assert '"stage":"preflight"' in capsys.readouterr().out
+    assert [call[0] for call in calls] == ["preflight", "prepare"]
+
+    with pytest.raises(SystemExit):
+        cli.main(["preflight"])
+    with pytest.raises(SystemExit):
+        cli.main(["prepare", "--config", "configs/distillation-v1.toml"])
+    assert len(calls) == 2

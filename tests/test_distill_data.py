@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from hashlib import sha256
+from dataclasses import replace
 import json
 import random
 import string
@@ -18,8 +19,11 @@ from ppmoe.distill.data import (
     normalized_question,
     _gsm_records,
     _svamp_records,
+    authenticate_retention,
     validate_source_bytes,
 )
+from ppmoe.distill import data as distill_data
+from ppmoe.distill.config import load_config
 
 
 def row(dataset: str, split: str, question: str, gold: str = "1") -> Example:
@@ -242,3 +246,55 @@ def test_tampered_pinned_source_bytes_are_rejected(tmp_path: Path) -> None:
     pin = {"sha256": "0" * 64, "size_bytes": len(b"pinned bytes")}
     with pytest.raises(ValueError, match="SHA-256"):
         validate_source_bytes(source, pin)
+
+
+def test_tampered_old_retention_provenance_is_rejected_before_json_read(tmp_path: Path, monkeypatch) -> None:
+    retention_manifest = tmp_path / "retention.json"
+    retention_chunks = tmp_path / "chunks.jsonl"
+    chunks = [
+        {"input_ids": [0] * (512 if index < 39 else 32), "scored_tokens": 511 if index < 39 else 31}
+        for index in range(40)
+    ]
+    retention_chunks.write_text("".join(json.dumps(item) + "\n" for item in chunks), encoding="utf-8")
+    chunks_sha = sha256(retention_chunks.read_bytes()).hexdigest()
+    retention_manifest.write_text(
+        json.dumps({
+            "chunk_count": 40,
+            "scored_tokens": 19960,
+            "valid_source_tokens": 20000,
+            "chunks_sha256": chunks_sha,
+        }),
+        encoding="utf-8",
+    )
+
+    old_data_manifest = tmp_path / "old-data-manifest.json"
+    old_data_stage = tmp_path / "old-data-stage.json"
+    old_source_manifest = tmp_path / "old-source.json"
+    tokenizer = tmp_path / "tokenizer.json"
+    for path in (old_data_manifest, old_data_stage, old_source_manifest, tokenizer):
+        path.write_bytes(b"tampered")
+    monkeypatch.setattr(distill_data, "_OLD_DATA_MANIFEST_PATH", Path("old-data-manifest.json"), raising=False)
+    monkeypatch.setattr(distill_data, "_OLD_DATA_STAGE_PATH", Path("old-data-stage.json"), raising=False)
+    monkeypatch.setattr(distill_data, "_OLD_SOURCE_MANIFEST_PATH", Path("old-source.json"), raising=False)
+    monkeypatch.setattr(distill_data, "_STUDENT_TOKENIZER_PATH", Path("tokenizer.json"), raising=False)
+
+    config = replace(
+        load_config(Path(__file__).parents[1] / "configs" / "distillation-v1.toml"),
+        retention_manifest=str(retention_manifest.relative_to(tmp_path)),
+        retention_manifest_sha256=sha256(retention_manifest.read_bytes()).hexdigest(),
+        retention_chunks=str(retention_chunks.relative_to(tmp_path)),
+        retention_chunks_sha256=chunks_sha,
+    )
+    read_paths: list[Path] = []
+    original_read_text = Path.read_text
+
+    def track_read_text(path: Path, *args, **kwargs):
+        read_paths.append(path)
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", track_read_text)
+
+    with pytest.raises(ValueError, match="pinned retention provenance hash mismatch"):
+        authenticate_retention(config, tmp_path)
+
+    assert old_data_manifest not in read_paths
