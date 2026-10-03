@@ -18,8 +18,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--run-root", type=Path)
     args = parser.parse_args(argv)
-    if args.stage == "prepare" and args.run_root is None:
-        parser.error("--run-root is required for prepare")
+    if args.stage in {"prepare", "calibrate"} and args.run_root is None:
+        parser.error(f"--run-root is required for {args.stage}")
     try:
         record = run_stage(args.stage, args.config, args.run_root)
     except (StageError, ValueError, FileExistsError, RuntimeError) as exc:

@@ -22,10 +22,51 @@ from ppmoe.distill.data import sha256_file
 
 def test_stage_paths_and_validation_are_explicit(tmp_path: Path) -> None:
     assert stage_path(tmp_path, "prepare") == tmp_path / "stages" / "prepare.json"
-    with pytest.raises(StageError, match="not implemented"):
+    with pytest.raises(StageError, match="explicit run-root"):
         run_stage("calibrate", tmp_path)
     with pytest.raises(StageError, match="unknown"):
         run_stage("made-up", tmp_path)
+
+
+def test_calibrate_requires_explicit_run_root_before_authenticating(monkeypatch, tmp_path: Path) -> None:
+    def validation_must_not_run(*args, **kwargs):
+        raise AssertionError("calibrate did not reject a missing run root before validation")
+
+    monkeypatch.setattr("ppmoe.distill.study.run_calibration_stage", validation_must_not_run)
+    with pytest.raises(StageError, match="run-root"):
+        run_stage("calibrate", Path("configs/distillation-v1.toml"))
+
+
+def test_calibration_dispatch_does_not_rederive_prepared_run_id(monkeypatch, tmp_path: Path) -> None:
+    seen = {}
+
+    def fake_calibrate(run_root, config, *, repo_root, config_path, worker_loader=None):
+        seen["root"] = run_root
+        run_root.mkdir(parents=True)
+        (run_root / "manifest.json").write_text(json.dumps({"split_counts": {}, "source_counts": {}, "exclusion_counts": {}}), encoding="utf-8")
+        return {"status": "awaiting_review", "stage_signature": "s" * 64}
+
+    monkeypatch.setattr("ppmoe.distill.study.run_calibration_stage", fake_calibrate)
+    monkeypatch.setattr("ppmoe.distill.study.load_config", lambda path: object())
+    monkeypatch.setattr("ppmoe.distill.study.__file__", str(tmp_path / "a" / "b" / "c" / "study.py"))
+    root = tmp_path / ("a" * 64)
+    record = run_stage("calibrate", tmp_path / "config.toml", root)
+    assert record.status == "awaiting_review"
+    assert seen["root"] == root
+
+
+def test_calibration_code_signature_binds_task1_and_task2_transitive_files(tmp_path: Path) -> None:
+    from ppmoe.distill.study import calibration_stage_signature
+
+    repo_root = Path(__file__).parents[1]
+    signature = calibration_stage_signature(repo_root, source_run_id="r" * 64, manifest_sha256="m" * 64, prepare_sha256="p" * 64)
+    assert signature["stage"] == "calibrate"
+    assert signature["originating_git_commit"] == "4bd6d6ab0a66f4753799d45a6bc6f5bb4fb70c63"
+    assert set(signature["code_signatures"]) >= {
+        "src/ppmoe/distill/config.py", "src/ppmoe/distill/data.py",
+        "src/ppmoe/distill/study.py", "src/ppmoe/distill/model.py",
+        "src/ppmoe/distill/answers.py", "src/ppmoe/distill/evaluate.py", "uv.lock",
+    }
 
 
 def test_prepare_requires_explicit_run_root_before_source_scan(monkeypatch) -> None:
@@ -185,16 +226,18 @@ def test_cli_accepts_positional_stages_and_rejects_missing_required_options(monk
         return StageRecord(stage, "a" * 64, "computed", "preflight_ok", {}, {}, {})
 
     monkeypatch.setattr(cli, "run_stage", fake_run_stage)
-    for stage in ("preflight", "prepare"):
+    for stage in ("preflight", "prepare", "calibrate"):
         args = [stage, "--config", "configs/distillation-v1.toml"]
-        if stage == "prepare":
+        if stage in {"prepare", "calibrate"}:
             args += ["--run-root", "artifacts/distillation-v1/" + "a" * 64]
         assert cli.main(args) == 0
     assert '"stage":"preflight"' in capsys.readouterr().out
-    assert [call[0] for call in calls] == ["preflight", "prepare"]
+    assert [call[0] for call in calls] == ["preflight", "prepare", "calibrate"]
 
     with pytest.raises(SystemExit):
         cli.main(["preflight"])
     with pytest.raises(SystemExit):
         cli.main(["prepare", "--config", "configs/distillation-v1.toml"])
-    assert len(calls) == 2
+    with pytest.raises(SystemExit):
+        cli.main(["calibrate", "--config", "configs/distillation-v1.toml"])
+    assert len(calls) == 3

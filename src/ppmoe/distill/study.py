@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 import json
 import os
@@ -10,16 +10,22 @@ from pathlib import Path
 import shutil
 import stat
 import tempfile
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from .config import canonical_config, load_config
-from .data import _manifest_jsonl, prepare_splits, sha256_file
+from .data import _manifest_jsonl, load_split, prepare_splits, sha256_file
+from .evaluate import (
+    RawRowJournal, ResourceLedger, WorkerLease, calibrate_candidates,
+    export_review_packets, preflight_disk,
+)
+from .model import authenticate_model_snapshot, isolated_worker_factory, pinned_eos_token_ids
+from .model import persist_model_inventory
 
 
 DEFAULT_CONFIG = Path("configs/distillation-v1.toml")
 FEASIBILITY_ROOT = Path("artifacts/distillation-v1/feasibility-20261003-recovery1")
 FEASIBILITY_RESULT_SHA256 = "118a6c6733f5a7fd8fedcc47d2a4952bea6cfe7885059f87816703b560d06f57"
-IMPLEMENTED_STAGES = {"preflight", "prepare"}
+IMPLEMENTED_STAGES = {"preflight", "prepare", "calibrate"}
 KNOWN_STAGES = IMPLEMENTED_STAGES | {
     "calibrate", "qualify", "generate", "audit", "train47", "evaluate47",
     "train48", "evaluate48", "seal", "report",
@@ -37,6 +43,26 @@ ACTIVE_FILES = (
     "pyproject.toml",
     "uv.lock",
 )
+CALIBRATION_FILES = (
+    "src/ppmoe/distill/__init__.py",
+    "src/ppmoe/distill/config.py",
+    "src/ppmoe/distill/data.py",
+    "src/ppmoe/distill/study.py",
+    "src/ppmoe/distill/model.py",
+    "src/ppmoe/distill/answers.py",
+    "src/ppmoe/distill/evaluate.py",
+    "scripts/run_distillation_v1.py",
+    "tests/test_distill_answers.py",
+    "tests/test_distill_model.py",
+    "tests/test_distill_evaluate.py",
+    "tests/test_distill_study.py",
+    "pyproject.toml",
+    "uv.lock",
+)
+TASK1_RUN_ID = "acd8dfc400c8f079d0403da5d4b981b8aac8e94226db8760f632c8307ff785c2"
+TASK1_MANIFEST_SHA256 = "bf0233bc65cd7f6554c7ab5269f17e051c31ff3903751ef7a24297ee203370ed"
+TASK1_PREPARE_SHA256 = "970f1f669326ac26bb08af7c929180a61ba72915e5a1fb081b69914835ccfe9e"
+TASK1_ORIGINATING_COMMIT = "4bd6d6ab0a66f4753799d45a6bc6f5bb4fb70c63"
 
 
 class StageError(RuntimeError):
@@ -52,6 +78,7 @@ class StageRecord:
     split_counts: dict[str, int]
     source_counts: dict[str, int]
     exclusion_counts: dict[str, int]
+    details: dict[str, Any] | None = None
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -174,6 +201,314 @@ def _file_signatures(repo_root: Path) -> dict[str, str]:
     return signatures
 
 
+def calibration_stage_signature(
+    repo_root: Path, *, source_run_id: str, manifest_sha256: str, prepare_sha256: str,
+    model_inventory_sha256: dict[str, str] | None = None,
+    effective_eos_token_ids: Sequence[int] | None = None,
+) -> dict[str, Any]:
+    """Bind Task 2 execution code to the authenticated immutable Task 1 checkpoint."""
+    code_signatures: dict[str, str] = {}
+    for relative in CALIBRATION_FILES:
+        path = Path(repo_root) / relative
+        if not path.is_file():
+            raise StageError(f"calibration source file missing: {relative}")
+        code_signatures[relative] = sha256_file(path)
+    signature: dict[str, Any] = {
+        "stage": "calibrate",
+        "source_run_id": source_run_id,
+        "predecessors": {
+            "prepare_manifest_sha256": manifest_sha256,
+            "prepare_stage_sha256": prepare_sha256,
+        },
+        "model_inventory_sha256": model_inventory_sha256 or {},
+        "effective_eos_token_ids": list(effective_eos_token_ids or ()),
+        "originating_git_commit": TASK1_ORIGINATING_COMMIT,
+        "code_signatures": code_signatures,
+    }
+    signature["stage_signature"] = sha256(_canonical_bytes(signature)).hexdigest()
+    return signature
+
+
+def _append_stage_event(path: Path, event: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("ab") as stream:
+        stream.write(_canonical_bytes(event) + b"\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def run_calibration_stage(
+    run_root: Path, config: Any, *, repo_root: Path, config_path: Path,
+    worker_loader: Any | None = None,
+) -> dict[str, Any]:
+    """Run only the gold-free blind calibration against the reviewed Task 1 run."""
+    root = Path(run_root)
+    if root.name != TASK1_RUN_ID:
+        raise StageError("calibrate requires the reviewed Task 1 prepared run ID")
+    if stage_path(root, "calibrate").exists():
+        raise FileExistsError("calibrate stage is immutable and already exists")
+    # This authenticates bytes against Task 1's stored signature; no source scan
+    # or run ID recomputation from the evolving Task 2 files occurs here.
+    runtime_identity = feasibility_runtime_identity(
+        repo_root, vram_reserve_bytes=config.resources.vram_reserve_bytes
+    )
+    manifest = validate_prepared_run(root, runtime_identity=runtime_identity)
+    manifest_path = root / "manifest.json"
+    prepare_path = stage_path(root, "prepare")
+    manifest_hash = sha256_file(manifest_path)
+    prepare_hash = sha256_file(prepare_path)
+    if manifest_hash != TASK1_MANIFEST_SHA256 or prepare_hash != TASK1_PREPARE_SHA256:
+        raise StageError("calibration Task 1 manifest/prepare hashes do not match reviewed evidence")
+    if manifest.get("config") != canonical_config(config):
+        raise StageError("calibration config differs from prepared Task 1 config")
+    calibration_entry = manifest.get("splits", {}).get("calibration")
+    if not isinstance(calibration_entry, dict) or calibration_entry.get("count") != 60:
+        raise StageError("prepared manifest does not register exactly 60 calibration IDs")
+    expected_ids = calibration_entry.get("ordered_ids")
+    if not isinstance(expected_ids, list) or len(expected_ids) != 60 or len(set(expected_ids)) != 60:
+        raise StageError("prepared calibration ordered-ID map is invalid")
+    preflight_disk(root, reserve_bytes=2 * 1024**3)
+    from huggingface_hub import HfApi, snapshot_download
+
+    api = HfApi()
+    inventory_directory = safe_output_path(root, root / "calibration" / "model-inventory")
+    inventories: dict[str, dict[str, Any]] = {}
+    snapshot_paths: dict[str, Path] = {}
+    inventory_hashes: dict[str, str] = {}
+    downloaded_bytes = 0
+    for role, pin in (("student", config.student), ("teacher", config.teacher)):
+        metadata = api.model_info(pin.repo_id, revision=pin.revision, files_metadata=True)
+        if getattr(metadata, "sha", None) != pin.revision:
+            raise StageError(f"Hub pin authentication failed for {role}")
+        if role == "student":
+            expected_names = {item.rfilename for item in metadata.siblings}
+            cache_path = (
+                repo_root / ".cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots" / pin.revision
+            )
+            cache_names = {
+                path.relative_to(cache_path).as_posix()
+                for path in cache_path.rglob("*") if path.is_file()
+            } if cache_path.is_dir() else set()
+            if cache_names != expected_names:
+                estimated = sum(int(getattr(item, "size", 0) or 0) for item in metadata.siblings)
+                if ResourceLedger.initial().download_bytes + downloaded_bytes + estimated > config.resources.download_bytes:
+                    raise StageError("pinned student download would exceed the registered download cap")
+                if shutil.disk_usage(repo_root).free < estimated + 2 * 1024**3:
+                    raise StageError("insufficient disk for the pinned student model snapshot")
+                downloaded_bytes += estimated
+            snapshot = Path(snapshot_download(
+                repo_id=pin.repo_id, revision=pin.revision, local_files_only=False,
+                cache_dir=str(repo_root / ".cache" / "huggingface" / "hub"),
+            ))
+        else:
+            snapshot = (
+                repo_root / ".cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots" / pin.revision
+            )
+            if not snapshot.is_dir():
+                raise StageError("pinned teacher snapshot is unavailable in the registered local cache")
+        inventory = authenticate_model_snapshot(
+            pin.repo_id, pin.revision, snapshot, metadata=metadata,
+        )
+        snapshot_paths[role] = snapshot
+        inventories[role] = inventory
+        inventory_hashes[role] = sha256(_canonical_bytes(inventory)).hexdigest()
+    eos_ids = pinned_eos_token_ids(snapshot_paths["student"])
+    if pinned_eos_token_ids(snapshot_paths["teacher"]) != eos_ids:
+        raise StageError("student and teacher pinned generation EOS IDs differ")
+    signature_record = calibration_stage_signature(
+        repo_root, source_run_id=TASK1_RUN_ID,
+        manifest_sha256=manifest_hash, prepare_sha256=prepare_hash,
+        model_inventory_sha256=inventory_hashes,
+        effective_eos_token_ids=eos_ids,
+    )
+    stage_signature = signature_record["stage_signature"]
+    free_before = preflight_disk(root, reserve_bytes=2 * 1024**3)
+    rows = load_split(root, "calibration")
+    if len(rows) != 60 or [row["id"] for row in rows] != expected_ids:
+        raise StageError("loaded calibration rows differ from the authenticated manifest ID order")
+    if any(set(row) != {"id", "dataset", "source_split", "question"} for row in rows):
+        raise StageError("calibration loader returned unexpected fields")
+
+    raw_directory = safe_output_path(root, root / "calibration" / "raw")
+    raw_directory.mkdir(parents=True, exist_ok=True)
+    attempts_path = safe_output_path(root, root / "stages" / "calibrate-attempts.jsonl")
+    reservation = {
+        "status": "reserved", "stage": "calibrate", "stage_signature": stage_signature,
+        "predecessor_hashes": signature_record["predecessors"],
+        "reserved_at_utc": "2026-10-03T08:01:07Z",
+        "initial_cuda_seconds": 1168, "initial_download_bytes": 8066699435,
+        "download_bytes": downloaded_bytes,
+        "cuda_cap_seconds": config.resources.cuda_seconds,
+        "wall_cap_seconds": config.resources.wall_seconds,
+        "artifact_cap_bytes": config.resources.artifact_bytes,
+        "disk_free_bytes": free_before,
+    }
+    reservation_path = safe_output_path(root, root / "stages" / "calibrate-reservations.jsonl")
+    prior: list[dict[str, Any]] = []
+    if reservation_path.exists():
+        prior = [json.loads(line) for line in reservation_path.read_text(encoding="utf-8").splitlines()]
+        if any(item.get("stage_signature") != stage_signature for item in prior):
+            raise StageError("calibration recovery stage signature changed")
+    _append_stage_event(reservation_path, reservation)
+    for role, inventory in inventories.items():
+        persist_model_inventory(inventory, inventory_directory / f"{role}.json")
+
+    def journal_for(role: str, candidate: Sequence[int]) -> RawRowJournal:
+        name = f"{int(candidate[0])}-{int(candidate[1])}-{role}.jsonl"
+        return RawRowJournal(
+            raw_directory / name,
+            expected_ids=expected_ids,
+            stage_signature=stage_signature,
+        )
+
+    def row_sink(row: Mapping[str, Any]) -> None:
+        if row.get("status") in {"failed", "worker_load_failed"}:
+            role = str(row.get("role", "worker"))
+            candidate = row.get("candidate", (0, 0))
+            journal_for(role, candidate).record_failure(row)
+        else:
+            journal_for(str(row["role"]), row["candidate"]).append(row)
+
+    def row_loader(role: str, candidate: Sequence[int]):
+        return journal_for(role, candidate).read()
+
+    def failure_count_loader(role: str, candidate: Sequence[int]) -> int:
+        return journal_for(role, candidate).failure_count()
+
+    recovered_ledger = ResourceLedger.initial()
+    prior_downloads = sum(int(item.get("download_bytes", 0)) for item in prior) + downloaded_bytes
+    for raw_path in raw_directory.glob("*.jsonl"):
+        if raw_path.name.endswith(".attempts.jsonl"):
+            continue
+        for line in raw_path.read_text(encoding="utf-8").splitlines():
+            raw = json.loads(line)
+            startup = float(raw.get("worker_startup_wall_seconds", 0.0))
+            if startup:
+                recovered_ledger = recovered_ledger.charge_worker(
+                    cuda_seconds=None, wall_seconds=startup, download_bytes=0, artifact_bytes=0,
+                )
+            recovered_ledger = recovered_ledger.charge_worker(
+                cuda_seconds=raw.get("cuda_seconds"),
+                wall_seconds=float(raw.get("wall_seconds", 0.0)),
+                download_bytes=0,
+                artifact_bytes=len(line.encode("utf-8")) + 1,
+            )
+    for attempt_path in raw_directory.glob("*.attempts.jsonl"):
+        for line in attempt_path.read_text(encoding="utf-8").splitlines():
+            attempt = json.loads(line)
+            recovered_ledger = recovered_ledger.charge_worker(
+                cuda_seconds=attempt.get("cuda_seconds"),
+                wall_seconds=float(attempt.get("wall_seconds", 0.0)),
+                download_bytes=0, artifact_bytes=0,
+            )
+    recovered_ledger = recovered_ledger.charge_worker(
+        cuda_seconds=0, wall_seconds=0, download_bytes=prior_downloads, artifact_bytes=0,
+    )
+    current_artifacts = sum(
+        path.stat().st_size
+        for base in (root / "calibration", root / "stages")
+        for path in (base.rglob("*") if base.exists() else ())
+        if path.is_file() and (base == root / "calibration" or path.name.startswith("calibrate"))
+    )
+    recovered_ledger = replace(recovered_ledger, artifact_bytes=current_artifacts)
+
+    loader = worker_loader or (
+        lambda role, candidate: isolated_worker_factory(
+            role, config, repo_root=repo_root, snapshot_path=snapshot_paths[role],
+            tokenizer_snapshot_path=snapshot_paths["student"], eos_token_ids=eos_ids,
+        )
+    )
+    try:
+        if len(prior) > config.resources.phase_retries:
+            result = {
+                "status": "stopped_resource", "candidate": None, "attempts": [],
+                "reason": "calibration phase retry budget was exhausted after interrupted reservations",
+            }
+        else:
+            with WorkerLease(root / "stages" / "calibrate.worker.lock"):
+                result = calibrate_candidates(
+                    rows,
+                    candidates=config.prompt.candidates,
+                    worker_factory=loader,
+                    minimum_eos=config.qualification.minimum_calibration_eos,
+                    stage_signature=stage_signature,
+                    row_sink=row_sink,
+                    row_loader=row_loader,
+                    failure_count_loader=failure_count_loader,
+                    ledger=recovered_ledger,
+                    max_retries=max(0, config.resources.phase_retries - len(prior)),
+                )
+    except Exception as exc:
+        _append_stage_event(attempts_path, {
+            "status": "failed", "stage_signature": stage_signature,
+            "error_type": type(exc).__name__,
+        })
+        raise
+
+    attempts_metadata = []
+    for attempt in result.get("attempts", []):
+        candidate = attempt["candidate"]
+        role_rows = []
+        for role in ("student", "teacher"):
+            journal = journal_for(role, candidate)
+            if journal.path.exists():
+                role_rows.append({"role": role, "path": str(journal.path.relative_to(root)), "sha256": sha256_file(journal.path), "count": len(journal.read())})
+        attempts_metadata.append({key: value for key, value in attempt.items() if key != "rows"} | {"raw_rows": role_rows})
+    result["attempts"] = attempts_metadata
+    result["stage_signature"] = stage_signature
+    result["signature"] = signature_record
+    result["task1_originating_commit"] = TASK1_ORIGINATING_COMMIT
+    result["effective_eos_token_ids"] = list(eos_ids)
+    result["resource_caps"] = {
+        "cuda_seconds": config.resources.cuda_seconds,
+        "wall_seconds": config.resources.wall_seconds,
+        "download_bytes": config.resources.download_bytes,
+        "artifact_bytes": config.resources.artifact_bytes,
+    }
+    _append_stage_event(attempts_path, {
+        "status": result["status"], "stage_signature": stage_signature,
+        "attempt_count": len(attempts_metadata),
+    })
+    if result["status"] == "awaiting_review" and result.get("candidate"):
+        selected_rows = []
+        for role in ("student", "teacher"):
+            selected_rows.extend(journal_for(role, result["candidate"]).read())
+        review_directory = safe_output_path(root, root / "calibration" / "review")
+        review = export_review_packets(rows, selected_rows, review_directory, seed=stage_signature)
+        result["review_packet"] = str(Path(review["packets"][0]).relative_to(root))
+        result["review_packet_sha256"] = review["packet_sha256"]
+        result["private_review_map"] = str(Path(review["private_map"]).relative_to(root))
+    if "resource_ledger" not in result:
+        result["resource_ledger"] = {
+            name: getattr(recovered_ledger, name)
+            for name in recovered_ledger.__dataclass_fields__
+        }
+    actual_artifacts = sum(
+        path.stat().st_size
+        for base in (root / "calibration", root / "stages")
+        for path in (base.rglob("*") if base.exists() else ())
+        if path.is_file() and (base == root / "calibration" or path.name.startswith("calibrate"))
+    )
+    projected = actual_artifacts + len(_canonical_bytes(result)) + 1
+    while True:
+        result["resource_ledger"]["artifact_bytes"] = projected
+        updated = actual_artifacts + len(_canonical_bytes(result)) + 1
+        if updated == projected:
+            break
+        projected = updated
+    if projected > config.resources.artifact_bytes:
+        raise StageError("calibration artifacts exceed the registered artifact-byte cap")
+    if result["resource_ledger"]["cuda_seconds"] > config.resources.cuda_seconds:
+        raise StageError("calibration CUDA use exceeds the registered cap")
+    if result["resource_ledger"]["wall_seconds"] > config.resources.wall_seconds:
+        raise StageError("calibration wall time exceeds the registered cap")
+    if result["resource_ledger"]["download_bytes"] > config.resources.download_bytes:
+        raise StageError("calibration downloads exceed the registered cap")
+    if result["status"] != "interrupted":
+        atomic_write_json(stage_path(root, "calibrate"), result)
+    return result
+
+
 def validate_runtime_metadata(
     environment: dict[str, Any], preflight: dict[str, Any], *, vram_reserve_bytes: int
 ) -> dict[str, Any]:
@@ -280,6 +615,23 @@ def run_stage(
     config_path = Path(config_path)
     if not config_path.is_absolute():
         config_path = repo_root / config_path
+    if stage == "calibrate":
+        if run_root is None:
+            raise StageError("calibrate requires an explicit run-root")
+        selected_root = Path(run_root)
+        if not selected_root.is_absolute():
+            selected_root = repo_root / selected_root
+        selected_root = safe_output_path(selected_root.parent, selected_root)
+        config = load_config(config_path)
+        result = run_calibration_stage(
+            selected_root, config, repo_root=repo_root, config_path=config_path,
+        )
+        manifest = json.loads((selected_root / "manifest.json").read_text(encoding="utf-8"))
+        return StageRecord(
+            stage, selected_root.name, str(selected_root), result["status"],
+            manifest.get("split_counts", {}), manifest.get("source_counts", {}),
+            manifest.get("exclusion_counts", {}), result,
+        )
     run_id, signature, source_metadata, splits = _prepared_source(config_path, repo_root)
     default_root = repo_root / "artifacts" / "distillation-v1" / run_id
     selected_root = Path(run_root) if run_root is not None else default_root
