@@ -9,16 +9,19 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import subprocess
 import tempfile
+from datetime import datetime, timezone
+from uuid import uuid4
 from typing import Any, Mapping, Sequence
 
 from .config import canonical_config, load_config
 from .data import _manifest_jsonl, load_split, prepare_splits, sha256_file
 from .evaluate import (
-    RawRowJournal, ResourceLedger, WorkerLease, calibrate_candidates,
+    RawRowJournal, ResourceLedger, ResourceLimitError, WorkerLease, calibrate_candidates,
     export_review_packets, preflight_disk,
 )
-from .model import authenticate_model_snapshot, isolated_worker_factory, pinned_eos_token_ids
+from .model import WorkerOwnershipError, authenticate_model_snapshot, isolated_worker_factory, pinned_eos_token_ids
 from .model import persist_model_inventory
 
 
@@ -51,6 +54,7 @@ CALIBRATION_FILES = (
     "src/ppmoe/distill/model.py",
     "src/ppmoe/distill/answers.py",
     "src/ppmoe/distill/evaluate.py",
+    "configs/distillation-v1.toml",
     "scripts/run_distillation_v1.py",
     "tests/test_distill_answers.py",
     "tests/test_distill_model.py",
@@ -205,6 +209,7 @@ def calibration_stage_signature(
     repo_root: Path, *, source_run_id: str, manifest_sha256: str, prepare_sha256: str,
     model_inventory_sha256: dict[str, str] | None = None,
     effective_eos_token_ids: Sequence[int] | None = None,
+    originating_git_commit: str | None = None,
 ) -> dict[str, Any]:
     """Bind Task 2 execution code to the authenticated immutable Task 1 checkpoint."""
     code_signatures: dict[str, str] = {}
@@ -222,11 +227,42 @@ def calibration_stage_signature(
         },
         "model_inventory_sha256": model_inventory_sha256 or {},
         "effective_eos_token_ids": list(effective_eos_token_ids or ()),
-        "originating_git_commit": TASK1_ORIGINATING_COMMIT,
+        "task1_originating_git_commit": TASK1_ORIGINATING_COMMIT,
+        "originating_git_commit": originating_git_commit or _git_commit(repo_root),
         "code_signatures": code_signatures,
     }
     signature["stage_signature"] = sha256(_canonical_bytes(signature)).hexdigest()
     return signature
+
+
+def _git_commit(repo_root: Path) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_root, check=True,
+        capture_output=True, text=True,
+    )
+    commit = result.stdout.strip()
+    if len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit.lower()):
+        raise StageError("current Git commit identity is invalid")
+    return commit
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _authenticated_private_gold(root: Path, manifest: Mapping[str, Any], expected_ids: Sequence[str]) -> dict[str, str]:
+    """Read calibration labels only after budget selection, from authenticated prepared bytes."""
+    entry = manifest.get("splits", {}).get("calibration", {})
+    relative = Path(str(entry.get("path", "")))
+    path = safe_output_path(root, root / relative)
+    if not path.is_file() or sha256_file(path) != entry.get("sha256"):
+        raise StageError("authenticated calibration source bytes changed before private gold mapping")
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    if [record.get("id") for record in records] != list(expected_ids):
+        raise StageError("private calibration gold IDs differ from authenticated ID order")
+    if any(not isinstance(record.get("gold"), str) for record in records):
+        raise StageError("authenticated calibration source lacks private gold values")
+    return {str(record["id"]): str(record["gold"]) for record in records}
 
 
 def _append_stage_event(path: Path, event: dict[str, Any]) -> None:
@@ -247,6 +283,26 @@ def run_calibration_stage(
         raise StageError("calibrate requires the reviewed Task 1 prepared run ID")
     if stage_path(root, "calibrate").exists():
         raise FileExistsError("calibrate stage is immutable and already exists")
+    reservation_path = safe_output_path(root, root / "stages" / "calibrate-reservations.jsonl")
+    history: list[dict[str, Any]] = []
+    prior = []
+    if reservation_path.exists():
+        history = [json.loads(line) for line in reservation_path.read_text(encoding="utf-8").splitlines()]
+        if any(item.get("event_type") not in {"reservation", "terminal", "download_reservation", "download_complete"} for item in history):
+            raise StageError("calibration reservation journal has an invalid event")
+        prior = [item for item in history if item.get("event_type") == "reservation"]
+        if len(prior) > config.resources.phase_retries:
+            # A terminal stop is still persisted below; no worker is loaded.
+            exhausted_before_worker = True
+        else:
+            exhausted_before_worker = False
+    else:
+        exhausted_before_worker = False
+    origin_event = next((item for item in history if item.get("originating_git_commit")), None)
+    originating_commit = origin_event.get("originating_git_commit") if origin_event else _git_commit(repo_root)
+    if not isinstance(originating_commit, str):
+        raise StageError("calibration originating Git commit is missing")
+    started_at = _utc_now()
     # This authenticates bytes against Task 1's stored signature; no source scan
     # or run ID recomputation from the evolving Task 2 files occurs here.
     runtime_identity = feasibility_runtime_identity(
@@ -296,10 +352,27 @@ def run_calibration_stage(
                 if shutil.disk_usage(repo_root).free < estimated + 2 * 1024**3:
                     raise StageError("insufficient disk for the pinned student model snapshot")
                 downloaded_bytes += estimated
+                download_started = _utc_now()
+                _append_stage_event(reservation_path, {
+                    "event_type": "download_reservation", "status": "reserved",
+                    "event_id": uuid4().hex, "stage": "calibrate", "role": role,
+                    "repo_id": pin.repo_id, "revision": pin.revision,
+                    "reserved_bytes": estimated, "started_at_utc": download_started,
+                    "originating_git_commit": originating_commit,
+                    "code_signatures": _file_signatures(repo_root),
+                })
             snapshot = Path(snapshot_download(
-                repo_id=pin.repo_id, revision=pin.revision, local_files_only=False,
+                repo_id=pin.repo_id, revision=pin.revision, local_files_only=(cache_names == expected_names),
                 cache_dir=str(repo_root / ".cache" / "huggingface" / "hub"),
             ))
+            if cache_names != expected_names:
+                _append_stage_event(reservation_path, {
+                    "event_type": "download_complete", "status": "completed",
+                    "event_id": uuid4().hex, "stage": "calibrate", "role": role,
+                    "repo_id": pin.repo_id, "revision": pin.revision,
+                    "started_at_utc": download_started, "ended_at_utc": _utc_now(),
+                    "originating_git_commit": originating_commit,
+                })
         else:
             snapshot = (
                 repo_root / ".cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots" / pin.revision
@@ -320,7 +393,23 @@ def run_calibration_stage(
         manifest_sha256=manifest_hash, prepare_sha256=prepare_hash,
         model_inventory_sha256=inventory_hashes,
         effective_eos_token_ids=eos_ids,
+        originating_git_commit=originating_commit,
     )
+    current_active_signatures = _file_signatures(repo_root)
+    for event in history:
+        frozen_active = event.get("code_signatures")
+        if isinstance(frozen_active, dict) and frozen_active != current_active_signatures:
+            raise StageError("calibration active code/config bytes drifted from the first durable reservation")
+    if prior:
+        frozen_signature = prior[0].get("signature")
+        if not isinstance(frozen_signature, dict):
+            raise StageError("calibration recovery lacks its frozen source signature")
+        if frozen_signature.get("code_signatures") != signature_record.get("code_signatures"):
+            raise StageError("calibration source/config bytes drifted from first reservation")
+        if frozen_signature.get("model_inventory_sha256") != signature_record.get("model_inventory_sha256"):
+            raise StageError("calibration pinned model bytes drifted from first reservation")
+        if frozen_signature.get("stage_signature") != signature_record.get("stage_signature"):
+            raise StageError("calibration recovery signature differs from first reservation")
     stage_signature = signature_record["stage_signature"]
     free_before = preflight_disk(root, reserve_bytes=2 * 1024**3)
     rows = load_split(root, "calibration")
@@ -333,9 +422,11 @@ def run_calibration_stage(
     raw_directory.mkdir(parents=True, exist_ok=True)
     attempts_path = safe_output_path(root, root / "stages" / "calibrate-attempts.jsonl")
     reservation = {
-        "status": "reserved", "stage": "calibrate", "stage_signature": stage_signature,
+        "status": "reserved", "event_type": "reservation", "event_id": uuid4().hex, "stage": "calibrate", "stage_signature": stage_signature,
         "predecessor_hashes": signature_record["predecessors"],
-        "reserved_at_utc": "2026-10-03T08:01:07Z",
+        "started_at_utc": started_at,
+        "originating_git_commit": originating_commit,
+        "signature": signature_record,
         "initial_cuda_seconds": 1168, "initial_download_bytes": 8066699435,
         "download_bytes": downloaded_bytes,
         "cuda_cap_seconds": config.resources.cuda_seconds,
@@ -343,12 +434,6 @@ def run_calibration_stage(
         "artifact_cap_bytes": config.resources.artifact_bytes,
         "disk_free_bytes": free_before,
     }
-    reservation_path = safe_output_path(root, root / "stages" / "calibrate-reservations.jsonl")
-    prior: list[dict[str, Any]] = []
-    if reservation_path.exists():
-        prior = [json.loads(line) for line in reservation_path.read_text(encoding="utf-8").splitlines()]
-        if any(item.get("stage_signature") != stage_signature for item in prior):
-            raise StageError("calibration recovery stage signature changed")
     _append_stage_event(reservation_path, reservation)
     for role, inventory in inventories.items():
         persist_model_inventory(inventory, inventory_directory / f"{role}.json")
@@ -369,14 +454,29 @@ def run_calibration_stage(
         else:
             journal_for(str(row["role"]), row["candidate"]).append(row)
 
+    class FailureSink:
+        def record_attempt(self, row: Mapping[str, Any]) -> None:
+            role = str(row["role"])
+            journal_for(role, row["candidate"]).record_attempt(row)
+
+        def record_failure(self, row: Mapping[str, Any]) -> None:
+            role = str(row.get("role", "worker"))
+            candidate = row.get("candidate", (0, 0))
+            journal_for(role, candidate).record_failure(row)
+
     def row_loader(role: str, candidate: Sequence[int]):
         return journal_for(role, candidate).read()
 
     def failure_count_loader(role: str, candidate: Sequence[int]) -> int:
-        return journal_for(role, candidate).failure_count()
+        # Retry budget is aggregate per role over all candidates and recovery.
+        total = 0
+        for path in raw_directory.glob(f"*-*-{role}.jsonl"):
+            journal = RawRowJournal(path, expected_ids=expected_ids, stage_signature=stage_signature)
+            total += journal.failure_count()
+        return total
 
     recovered_ledger = ResourceLedger.initial()
-    prior_downloads = sum(int(item.get("download_bytes", 0)) for item in prior) + downloaded_bytes
+    prior_downloads = sum(int(item.get("reserved_bytes", 0)) for item in history if item.get("event_type") == "download_reservation") + downloaded_bytes
     for raw_path in raw_directory.glob("*.jsonl"):
         if raw_path.name.endswith(".attempts.jsonl"):
             continue
@@ -394,13 +494,48 @@ def run_calibration_stage(
                 artifact_bytes=len(line.encode("utf-8")) + 1,
             )
     for attempt_path in raw_directory.glob("*.attempts.jsonl"):
-        for line in attempt_path.read_text(encoding="utf-8").splitlines():
-            attempt = json.loads(line)
-            recovered_ledger = recovered_ledger.charge_worker(
-                cuda_seconds=attempt.get("cuda_seconds"),
-                wall_seconds=float(attempt.get("wall_seconds", 0.0)),
-                download_bytes=0, artifact_bytes=0,
-            )
+        raw_path = Path(str(attempt_path)[:-len(".attempts.jsonl")])
+        parts = raw_path.stem.split("-")
+        if len(parts) < 3 or parts[-1] not in {"student", "teacher"}:
+            raise StageError("calibration attempt journal filename is invalid")
+        candidate = [int(parts[0]), int(parts[1])]
+        journal = RawRowJournal(raw_path, expected_ids=expected_ids, stage_signature=stage_signature)
+        events = journal.attempts()
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for index, event in enumerate(events):
+            grouped.setdefault(str(event.get("attempt_id", f"legacy-{index}")), []).append(event)
+        for attempt_events in grouped.values():
+            if any(event.get("status") == "worker_complete" for event in attempt_events):
+                continue
+            failed = [event for event in attempt_events if event.get("status") in {"failed", "worker_load_failed"}]
+            if failed:
+                event = failed[-1]
+                recovered_ledger = recovered_ledger.charge_worker(
+                    cuda_seconds=event.get("cuda_seconds"),
+                    wall_seconds=float(event.get("worker_startup_wall_seconds", 0.0)) + float(event.get("wall_seconds", 0.0)),
+                    download_bytes=0, artifact_bytes=0,
+                )
+                continue
+            reservation_event = next((event for event in attempt_events if event.get("status") == "worker_reserved"), None)
+            if reservation_event is None:
+                raise StageError("incomplete calibration attempt lacks a durable reservation")
+            reserved = datetime.fromisoformat(str(reservation_event["reserved_at_utc"]).replace("Z", "+00:00"))
+            elapsed = max(0.0, (datetime.now(timezone.utc) - reserved).total_seconds())
+            known = 0.0
+            raw_startup = 0.0
+            for raw in journal.read():
+                if raw.get("attempt_id") == reservation_event.get("attempt_id"):
+                    raw_startup += float(raw.get("worker_startup_wall_seconds", 0.0))
+                    known += float(raw.get("wall_seconds", 0.0))
+            known += raw_startup
+            if not raw_startup:
+                known += sum(float(event.get("startup_wall_seconds", 0.0)) for event in attempt_events if event.get("status") == "worker_started")
+            uncommitted = max(0.0, elapsed - known)
+            if uncommitted:
+                recovered_ledger = recovered_ledger.charge_worker(
+                    cuda_seconds=None, wall_seconds=uncommitted,
+                    download_bytes=0, artifact_bytes=0,
+                )
     recovered_ledger = recovered_ledger.charge_worker(
         cuda_seconds=0, wall_seconds=0, download_bytes=prior_downloads, artifact_bytes=0,
     )
@@ -412,20 +547,18 @@ def run_calibration_stage(
     )
     recovered_ledger = replace(recovered_ledger, artifact_bytes=current_artifacts)
 
-    loader = worker_loader or (
-        lambda role, candidate: isolated_worker_factory(
-            role, config, repo_root=repo_root, snapshot_path=snapshot_paths[role],
-            tokenizer_snapshot_path=snapshot_paths["student"], eos_token_ids=eos_ids,
-        )
-    )
     try:
-        if len(prior) > config.resources.phase_retries:
-            result = {
-                "status": "stopped_resource", "candidate": None, "attempts": [],
-                "reason": "calibration phase retry budget was exhausted after interrupted reservations",
-            }
-        else:
-            with WorkerLease(root / "stages" / "calibrate.worker.lock"):
+        with WorkerLease(root / "stages" / "calibrate.worker.lock") as lease:
+            loader = worker_loader or (
+                lambda role, candidate: isolated_worker_factory(
+                    role, config, repo_root=repo_root, snapshot_path=snapshot_paths[role],
+                    tokenizer_snapshot_path=snapshot_paths["student"], eos_token_ids=eos_ids,
+                    child_started=lease.record_child,
+                )
+            )
+            if exhausted_before_worker:
+                result = {"status": "stopped_environment", "candidate": None, "attempts": [], "reason": "aggregate calibration phase retry budget exhausted"}
+            else:
                 result = calibrate_candidates(
                     rows,
                     candidates=config.prompt.candidates,
@@ -435,9 +568,19 @@ def run_calibration_stage(
                     row_sink=row_sink,
                     row_loader=row_loader,
                     failure_count_loader=failure_count_loader,
+                    failure_sink=FailureSink(),
                     ledger=recovered_ledger,
-                    max_retries=max(0, config.resources.phase_retries - len(prior)),
+                    max_retries=config.resources.phase_retries,
                 )
+    except (ResourceLimitError, WorkerOwnershipError) as exc:
+        result = {
+            "status": "stopped_environment", "candidate": None, "attempts": [],
+            "reason": f"{type(exc).__name__}: {exc}",
+            "resource_ledger": {
+                name: getattr(recovered_ledger, name)
+                for name in recovered_ledger.__dataclass_fields__
+            },
+        }
     except Exception as exc:
         _append_stage_event(attempts_path, {
             "status": "failed", "stage_signature": stage_signature,
@@ -458,6 +601,7 @@ def run_calibration_stage(
     result["stage_signature"] = stage_signature
     result["signature"] = signature_record
     result["task1_originating_commit"] = TASK1_ORIGINATING_COMMIT
+    result["originating_git_commit"] = originating_commit
     result["effective_eos_token_ids"] = list(eos_ids)
     result["resource_caps"] = {
         "cuda_seconds": config.resources.cuda_seconds,
@@ -474,7 +618,8 @@ def run_calibration_stage(
         for role in ("student", "teacher"):
             selected_rows.extend(journal_for(role, result["candidate"]).read())
         review_directory = safe_output_path(root, root / "calibration" / "review")
-        review = export_review_packets(rows, selected_rows, review_directory, seed=stage_signature)
+        private_gold = _authenticated_private_gold(root, manifest, expected_ids)
+        review = export_review_packets(rows, selected_rows, review_directory, seed=stage_signature, private_gold_by_id=private_gold)
         result["review_packet"] = str(Path(review["packets"][0]).relative_to(root))
         result["review_packet_sha256"] = review["packet_sha256"]
         result["private_review_map"] = str(Path(review["private_map"]).relative_to(root))
@@ -505,6 +650,14 @@ def run_calibration_stage(
     if result["resource_ledger"]["download_bytes"] > config.resources.download_bytes:
         raise StageError("calibration downloads exceed the registered cap")
     if result["status"] != "interrupted":
+        ended_at = _utc_now()
+        _append_stage_event(reservation_path, {
+            "status": result["status"], "event_type": "terminal", "event_id": uuid4().hex,
+            "stage_signature": stage_signature, "originating_git_commit": originating_commit,
+            "started_at_utc": started_at, "ended_at_utc": ended_at,
+        })
+        result["started_at_utc"] = started_at
+        result["ended_at_utc"] = ended_at
         atomic_write_json(stage_path(root, "calibrate"), result)
     return result
 

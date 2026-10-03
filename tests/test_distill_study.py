@@ -61,9 +61,10 @@ def test_calibration_code_signature_binds_task1_and_task2_transitive_files(tmp_p
     repo_root = Path(__file__).parents[1]
     signature = calibration_stage_signature(repo_root, source_run_id="r" * 64, manifest_sha256="m" * 64, prepare_sha256="p" * 64)
     assert signature["stage"] == "calibrate"
-    assert signature["originating_git_commit"] == "4bd6d6ab0a66f4753799d45a6bc6f5bb4fb70c63"
+    assert len(signature["originating_git_commit"]) == 40
+    assert signature["task1_originating_git_commit"] == "4bd6d6ab0a66f4753799d45a6bc6f5bb4fb70c63"
     assert set(signature["code_signatures"]) >= {
-        "src/ppmoe/distill/config.py", "src/ppmoe/distill/data.py",
+        "src/ppmoe/distill/config.py", "src/ppmoe/distill/data.py", "configs/distillation-v1.toml",
         "src/ppmoe/distill/study.py", "src/ppmoe/distill/model.py",
         "src/ppmoe/distill/answers.py", "src/ppmoe/distill/evaluate.py", "uv.lock",
     }
@@ -241,3 +242,147 @@ def test_cli_accepts_positional_stages_and_rejects_missing_required_options(monk
     with pytest.raises(SystemExit):
         cli.main(["calibrate", "--config", "configs/distillation-v1.toml"])
     assert len(calls) == 3
+
+
+def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_terminal(monkeypatch, tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    from datetime import datetime, timezone
+    from hashlib import sha256
+    import json
+    import ppmoe.distill.study as study
+    from ppmoe.distill.evaluate import RawRowJournal
+
+    repo_root = tmp_path / "repo"
+    import shutil
+    source_repo = Path(__file__).parents[1]
+    for relative in set(study.CALIBRATION_FILES) | set(study.ACTIVE_FILES):
+        source = source_repo / relative
+        target = repo_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+    root = tmp_path / ("r" * 64)
+    root.mkdir()
+    ids = [f"cal-{index:03}" for index in range(60)]
+    questions = [{"id": row_id, "dataset": "synthetic", "source_split": "calibration", "question": f"Question {index}?"} for index, row_id in enumerate(ids)]
+    full_rows = [dict(row, gold=str(index), solution=f"private {index}") for index, row in enumerate(questions)]
+    data_path = root / "data" / "calibration.jsonl"
+    data_path.parent.mkdir()
+    data_path.write_text("".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in full_rows), encoding="utf-8")
+    split_hash = sha256_file(data_path)
+    config_value = {"synthetic": "frozen"}
+    manifest = {
+        "config": config_value,
+        "splits": {"calibration": {"path": "data/calibration.jsonl", "sha256": split_hash, "count": 60, "ordered_ids": ids}},
+        "split_counts": {"calibration": 60}, "source_counts": {}, "exclusion_counts": {},
+    }
+    manifest_path = root / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    prepare_path = root / "stages" / "prepare.json"
+    prepare_path.parent.mkdir()
+    prepare_path.write_text('{"status":"passed"}\n', encoding="utf-8")
+    manifest_digest, prepare_digest = sha256_file(manifest_path), sha256_file(prepare_path)
+    (root / "stages" / "calibrate").unlink(missing_ok=True)
+    monkeypatch.setattr(study, "TASK1_RUN_ID", root.name)
+    monkeypatch.setattr(study, "TASK1_MANIFEST_SHA256", manifest_digest)
+    monkeypatch.setattr(study, "TASK1_PREPARE_SHA256", prepare_digest)
+    monkeypatch.setattr(study, "_git_commit", lambda path: "c" * 40)
+    monkeypatch.setattr(study, "feasibility_runtime_identity", lambda *args, **kwargs: {"synthetic": True})
+    monkeypatch.setattr(study, "validate_prepared_run", lambda *args, **kwargs: manifest)
+    monkeypatch.setattr(study, "canonical_config", lambda config: config_value)
+    monkeypatch.setattr(study, "preflight_disk", lambda *args, **kwargs: 20 * 1024**3)
+    monkeypatch.setattr(study, "load_split", lambda *args, **kwargs: questions)
+    inventory_by_role = {
+        role: {"repo_id": role, "revision": f"{role}-pin", "files": [{"path": "config.json", "size_bytes": 1, "sha256": "d" * 64, "hub_blob_id": "blob"}]}
+        for role in ("student", "teacher")
+    }
+    monkeypatch.setattr(study, "authenticate_model_snapshot", lambda repo, rev, path, metadata=None: inventory_by_role["student" if repo == "student" else "teacher"])
+    monkeypatch.setattr(study, "pinned_eos_token_ids", lambda path: (2,))
+    class FakeApi:
+        def model_info(self, repo_id, *, revision, files_metadata):
+            return SimpleNamespace(sha=revision, siblings=[SimpleNamespace(rfilename="config.json", size=1)])
+    snapshot_calls = []
+    def fake_snapshot_download(**kwargs):
+        snapshot_calls.append(kwargs["local_files_only"])
+        return tmp_path / kwargs["revision"]
+    fake_hub = SimpleNamespace(HfApi=FakeApi, snapshot_download=fake_snapshot_download)
+    import sys
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+    for role in ("student", "teacher"):
+        pin_dir = tmp_path / f"{role}-pin"
+        pin_dir.mkdir(exist_ok=True)
+        (pin_dir / "config.json").write_text("x", encoding="utf-8")
+    teacher_cache = repo_root / ".cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/teacher-pin"
+    teacher_cache.mkdir(parents=True)
+    student_cache = repo_root / ".cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/student-pin"
+    student_cache.mkdir(parents=True)
+    (student_cache / "config.json").write_text("x", encoding="utf-8")
+    config = SimpleNamespace(
+        resources=SimpleNamespace(vram_reserve_bytes=2 * 1024**3, phase_retries=2, download_bytes=21474836480,
+                                  artifact_bytes=21474836480, cuda_seconds=86400, wall_seconds=172800),
+        prompt=SimpleNamespace(candidates=((256, 768), (512, 1024), (768, 1536))),
+        qualification=SimpleNamespace(minimum_calibration_eos=57),
+        student=SimpleNamespace(repo_id="student", revision="student-pin"),
+        teacher=SimpleNamespace(repo_id="teacher", revision="teacher-pin"),
+    )
+    original_signature = study.calibration_stage_signature
+    # Seed a digest-authenticated single-row completed prefix to model crash recovery.
+    student_inventory_hash = sha256(json.dumps(inventory_by_role["student"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    teacher_inventory_hash = sha256(json.dumps(inventory_by_role["teacher"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    prepared_signature = original_signature(
+        repo_root, source_run_id=root.name, manifest_sha256=manifest_digest, prepare_sha256=prepare_digest,
+        model_inventory_sha256={"student": student_inventory_hash, "teacher": teacher_inventory_hash},
+        effective_eos_token_ids=(2,), originating_git_commit="c" * 40,
+    )
+    stage_signature = prepared_signature["stage_signature"]
+    candidates = (256, 768)
+    journal = RawRowJournal(root / "calibration" / "raw" / "256-768-student.jsonl", expected_ids=ids, stage_signature=stage_signature)
+    journal.append({"source_id": ids[0], "role": "student", "candidate": list(candidates), "question": questions[0]["question"],
+                    "text": "Final answer: 0", "stop_reason": "eos", "generated_tokens": 2, "wall_seconds": 0.01,
+                    "cuda_seconds": 0.01, "worker_startup_wall_seconds": 0.01, "attempt_id": "old-attempt", "stage_signature": stage_signature})
+    reserved_at = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    journal.record_attempt({"attempt_id": "old-attempt", "status": "worker_reserved", "role": "student", "candidate": list(candidates),
+                            "stage_signature": stage_signature, "reserved_at_utc": reserved_at})
+    journal.record_attempt({"attempt_id": "old-attempt", "status": "worker_started", "role": "student", "candidate": list(candidates),
+                            "stage_signature": stage_signature, "startup_wall_seconds": 0.01, "reserved_at_utc": reserved_at})
+    generated = {"student": 0, "teacher": 0}
+    class FakeWorker:
+        startup_wall_seconds = 0.02
+        def __init__(self, role): self.role = role
+        def generate(self, row, candidate):
+            assert "gold" not in row and "solution" not in row
+            generated[self.role] += 1
+            return {"text": "Work 1+2. Final answer: 0", "stop_reason": "eos", "generated_tokens": 4,
+                    "wall_seconds": 0.01, "cuda_seconds": 0.01, "peak_allocated_bytes": 100, "peak_reserved_bytes": 200}
+        def close(self): pass
+    result = study.run_calibration_stage(root, config, repo_root=repo_root, config_path=tmp_path / "config.toml",
+                                         worker_loader=lambda role, candidate: FakeWorker(role))
+    assert result["status"] == "awaiting_review"
+    assert generated == {"student": 59, "teacher": 60}
+    packet = root / result["review_packet"]
+    packet_text = packet.read_text(encoding="utf-8")
+    assert '"gold"' not in packet_text and '"role"' not in packet_text and "private" not in packet_text
+    assert result["originating_git_commit"] == "c" * 40
+    assert result["started_at_utc"] < result["ended_at_utc"]
+    assert snapshot_calls == [True]
+    with pytest.raises(FileExistsError, match="immutable"):
+        study.run_calibration_stage(root, config, repo_root=repo_root, config_path=tmp_path / "config.toml",
+                                    worker_loader=lambda role, candidate: pytest.fail("terminal stage must not rerun"))
+
+    failure_root = tmp_path / ("f" * 64)
+    (failure_root / "stages").mkdir(parents=True)
+    (failure_root / "data").mkdir()
+    shutil.copyfile(manifest_path, failure_root / "manifest.json")
+    shutil.copyfile(prepare_path, failure_root / "stages" / "prepare.json")
+    shutil.copyfile(data_path, failure_root / "data" / "calibration.jsonl")
+    monkeypatch.setattr(study, "TASK1_RUN_ID", failure_root.name)
+    failed_result = study.run_calibration_stage(
+        failure_root, config, repo_root=repo_root, config_path=tmp_path / "config.toml",
+        worker_loader=lambda role, candidate: (_ for _ in ()).throw(RuntimeError("synthetic startup failure")),
+    )
+    assert failed_result["status"] == "stopped_environment"
+    assert (failure_root / "stages" / "calibrate.json").is_file()
+    with pytest.raises(FileExistsError, match="immutable"):
+        study.run_calibration_stage(
+            failure_root, config, repo_root=repo_root, config_path=tmp_path / "config.toml",
+            worker_loader=lambda role, candidate: pytest.fail("terminal failure must not be retried"),
+        )

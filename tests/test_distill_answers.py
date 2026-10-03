@@ -25,6 +25,12 @@ def test_extracts_exact_single_numeric_answer(text: str, expected: str) -> None:
     assert result.evidence is not None and result.evidence in text
 
 
+def test_accepts_bold_wrapping_the_entire_final_assertion() -> None:
+    text = "**Final answer: 5**"
+    result = extract_final_numeric(text, "eos")
+    assert (result.status, result.value, result.evidence) == ("valid", "5", text)
+
+
 def test_ignores_intermediate_numbers_and_accepts_final_cue_after_them() -> None:
     result = extract_final_numeric(r"First 3, then \boxed{9}. Final answer: 12", "eos")
     assert result.value == "12"
@@ -89,3 +95,15 @@ def test_equal_repeated_final_cues_are_accepted() -> None:
 def test_later_alternate_assertion_invalidates_an_earlier_numeric_cue() -> None:
     result = extract_final_numeric("Final answer: 5. Actually the answer is seven.", "eos")
     assert result.status == "invalid"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Final answer: 5. Actually, the answer is 7.",
+        "Final answer: 5. Actually, the answer is",
+        "**Final answer: 5** Actually, 7 is correct.",
+    ],
+)
+def test_rejects_later_conflicting_or_incomplete_alternate_assertion(text: str) -> None:
+    assert extract_final_numeric(text, "eos").status == "invalid"

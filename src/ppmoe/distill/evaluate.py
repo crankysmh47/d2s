@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import shutil
 import time
+import uuid
 from typing import Any, Callable, Mapping, Sequence
 
 from .answers import extract_final_numeric
@@ -85,6 +86,7 @@ class WorkerLease:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self._fd: int | None = None
+        self._child_pids: set[int] = set()
 
     def __enter__(self) -> "WorkerLease":
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -94,18 +96,38 @@ class WorkerLease:
             try:
                 reservation = json.loads(self.path.read_text(encoding="utf-8"))
                 pid = reservation.get("pid")
+                children = reservation.get("child_pids", [])
             except (OSError, ValueError, AttributeError):
                 raise ResourceLimitError("an unreadable model-worker reservation already exists") from None
-            if not isinstance(pid, int) or pid <= 0 or _pid_is_alive(pid):
+            if (
+                not isinstance(pid, int) or pid <= 0 or _pid_is_alive(pid)
+                or not isinstance(children, list)
+                or any(not isinstance(child, int) or child <= 0 or _pid_is_alive(child) for child in children)
+            ):
                 raise ResourceLimitError("a simultaneous live model worker is already reserved") from None
             self.path.unlink(missing_ok=True)
             try:
                 self._fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             except FileExistsError:
                 raise ResourceLimitError("a simultaneous live model worker is already reserved") from None
-        os.write(self._fd, json.dumps({"pid": os.getpid(), "reserved_ns": time.time_ns()}).encode())
-        os.fsync(self._fd)
+        self._save()
         return self
+
+    def record_child(self, pid: int) -> None:
+        if pid <= 0:
+            raise ValueError("child PID must be positive")
+        self._child_pids.add(pid)
+        self._save()
+
+    def _save(self) -> None:
+        payload = json.dumps({"pid": os.getpid(), "child_pids": sorted(self._child_pids), "reserved_ns": time.time_ns()})
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+        with self.path.open("w", encoding="utf-8") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
 
     def __exit__(self, exc_type, exc, traceback) -> None:
         if self._fd is not None:
@@ -127,6 +149,8 @@ def validate_calibration_rows(
     for row in rows:
         if row.get("stage_signature") != stage_signature:
             raise ValueError("calibration row stage signature mismatch")
+        if not _has_valid_payload_digest(row):
+            raise ValueError("calibration row payload digest is missing or invalid")
         source_id = row.get("source_id")
         if not isinstance(source_id, str):
             raise ValueError("calibration row source ID is invalid")
@@ -159,8 +183,9 @@ class RawRowJournal:
         if row.get("stage_signature") != self.stage_signature:
             raise ValueError("calibration row stage signature mismatch")
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = _with_payload_digest(row)
         with self.path.open("ab") as stream:
-            stream.write(json.dumps(dict(row), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+            stream.write(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode() + b"\n")
             stream.flush()
             os.fsync(stream.fileno())
 
@@ -168,21 +193,58 @@ class RawRowJournal:
         """Persist cost/error attempts separately so incomplete rows never count as completed."""
         if attempt.get("stage_signature") != self.stage_signature:
             raise ValueError("calibration failure attempt stage signature mismatch")
+        payload = _with_payload_digest(attempt)
+        self._append_event(payload)
+
+    def record_attempt(self, attempt: Mapping[str, Any]) -> None:
+        if attempt.get("stage_signature") != self.stage_signature:
+            raise ValueError("calibration attempt stage signature mismatch")
+        self._append_event(_with_payload_digest(attempt))
+
+    def _append_event(self, payload: Mapping[str, Any]) -> None:
         path = self.path.with_suffix(self.path.suffix + ".attempts.jsonl")
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("ab") as stream:
-            stream.write(json.dumps(dict(attempt), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+            stream.write(json.dumps(dict(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode() + b"\n")
             stream.flush()
             os.fsync(stream.fileno())
 
     def failure_count(self) -> int:
+        attempts = self.attempts()
+        grouped: dict[str, list[Mapping[str, Any]]] = {}
+        for index, item in enumerate(attempts):
+            grouped.setdefault(str(item.get("attempt_id", f"legacy-{index}")), []).append(item)
+        return sum(
+            not any(item.get("status") == "worker_complete" for item in events)
+            for events in grouped.values()
+        )
+
+    def attempts(self) -> list[dict[str, Any]]:
         path = self.path.with_suffix(self.path.suffix + ".attempts.jsonl")
         if not path.exists():
-            return 0
+            return []
         attempts = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
         if any(item.get("stage_signature") != self.stage_signature for item in attempts):
             raise ValueError("calibration failure attempt stage signature mismatch")
-        return len(attempts)
+        if any(not _has_valid_payload_digest(item) for item in attempts):
+            raise ValueError("calibration failure payload digest is missing or invalid")
+        return attempts
+
+
+def _payload_digest(row: Mapping[str, Any]) -> str:
+    payload = {key: value for key, value in row.items() if key != "payload_sha256"}
+    return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _with_payload_digest(row: Mapping[str, Any]) -> dict[str, Any]:
+    payload = {key: value for key, value in row.items() if key != "payload_sha256"}
+    payload["payload_sha256"] = _payload_digest(payload)
+    return payload
+
+
+def _has_valid_payload_digest(row: Mapping[str, Any]) -> bool:
+    digest = row.get("payload_sha256")
+    return isinstance(digest, str) and hmac.compare_digest(digest, _payload_digest(row))
 
 
 def calibrate_candidates(
@@ -192,6 +254,7 @@ def calibrate_candidates(
     row_loader: Callable[[str, Sequence[int]], Sequence[Mapping[str, Any]]] | None = None,
     failure_count_loader: Callable[[str, Sequence[int]], int] | None = None,
     ledger: ResourceLedger | None = None, max_retries: int = 2,
+    failure_sink: Any | None = None,
 ) -> dict[str, Any]:
     """Try the registered budgets in order, student then teacher, without exposing gold."""
     if not rows or len({row["id"] for row in rows}) != len(rows):
@@ -216,9 +279,20 @@ def calibrate_candidates(
             while errors <= max_retries and len(completed) < len(rows):
                 worker = None
                 worker_started = time.perf_counter()
+                attempt_id = uuid.uuid4().hex
+                reservation = {
+                    "attempt_id": attempt_id, "status": "worker_reserved",
+                    "role": role, "candidate": pair, "stage_signature": stage_signature,
+                    "reserved_at_utc": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                }
+                if failure_sink is not None:
+                    failure_sink.record_attempt(reservation)
                 try:
                     worker = worker_factory(role, pair)
                     startup_wall = float(getattr(worker, "startup_wall_seconds", 0.0))
+                    worker_rows = 0
+                    if failure_sink is not None:
+                        failure_sink.record_attempt({**reservation, "status": "worker_started", "startup_wall_seconds": startup_wall})
                     if startup_wall:
                         current_ledger = current_ledger.charge_worker(
                             cuda_seconds=None, wall_seconds=startup_wall,
@@ -233,7 +307,7 @@ def calibrate_candidates(
                             output = worker.generate(exposed, pair)
                             wall = float(output.get("wall_seconds", time.perf_counter() - started))
                             cuda = output.get("cuda_seconds")
-                            serialized_bytes = len(json.dumps(raw := {
+                            raw = {
                                 "opaque_id": hmac.new(
                                     stage_signature.encode(),
                                     f"{candidate[0]}:{candidate[1]}\0{role}\0{source['id']}".encode(),
@@ -244,38 +318,50 @@ def calibrate_candidates(
                                 "stop_reason": str(output.get("stop_reason", "error")),
                                 "generated_tokens": int(output.get("generated_tokens", 0)),
                                 "wall_seconds": wall, "cuda_seconds": cuda,
-                                "worker_startup_wall_seconds": startup_wall if not completed else 0.0,
+                                "worker_startup_wall_seconds": startup_wall if worker_rows == 0 else 0.0,
+                                "attempt_id": attempt_id,
                                 "peak_allocated_bytes": output.get("peak_allocated_bytes"),
                                 "peak_reserved_bytes": output.get("peak_reserved_bytes"),
                                 "free_device_bytes": output.get("free_device_bytes"),
                                 "stage_signature": stage_signature,
-                            }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()) + 1
+                            }
+                            raw = _with_payload_digest(raw)
+                            serialized_bytes = len(json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()) + 1
+                            if row_sink is not None:
+                                row_sink(raw)
+                            completed.append(raw)
+                            worker_rows += 1
                             current_ledger = current_ledger.charge_worker(
                                 cuda_seconds=None if cuda is None else float(cuda),
                                 wall_seconds=wall, download_bytes=0, artifact_bytes=serialized_bytes,
                             )
-                            completed.append(raw)
-                            if row_sink is not None:
-                                row_sink(raw)
                         except ResourceLimitError:
                             raise
                         except Exception as exc:
                             errors += 1
                             failed_wall = time.perf_counter() - started
-                            current_ledger = current_ledger.charge_worker(
-                                cuda_seconds=None, wall_seconds=failed_wall,
-                                download_bytes=0, artifact_bytes=0,
-                            )
                             failed = {
                                 "source_id": source["id"], "role": role,
                                 "candidate": pair, "status": "failed",
                                 "error_type": type(exc).__name__, "wall_seconds": failed_wall,
                                 "cuda_seconds": None, "stage_signature": stage_signature,
+                                "attempt_id": attempt_id,
+                                "worker_startup_wall_seconds": startup_wall if worker_rows == 0 else 0.0,
+                                "ended_at_utc": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
                             }
-                            if row_sink is not None and hasattr(row_sink, "record_failure"):
-                                row_sink.record_failure(failed)
+                            if failure_sink is not None:
+                                failure_sink.record_failure(failed)
+                            current_ledger = current_ledger.charge_worker(
+                                cuda_seconds=None, wall_seconds=failed_wall,
+                                download_bytes=0, artifact_bytes=0,
+                            )
                             break
                     if len(completed) == len(rows):
+                        if failure_sink is not None:
+                            failure_sink.record_attempt({
+                                **reservation, "status": "worker_complete", "startup_wall_seconds": startup_wall,
+                                "ended_at_utc": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                            })
                         break
                 except ResourceLimitError:
                     raise
@@ -286,9 +372,18 @@ def calibrate_candidates(
                         "role": role, "candidate": pair, "status": "worker_load_failed",
                         "error_type": type(exc).__name__, "wall_seconds": failed_wall,
                         "cuda_seconds": None, "stage_signature": stage_signature,
+                        "attempt_id": attempt_id,
+                        "worker_startup_wall_seconds": 0.0,
+                        "ended_at_utc": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
                     }
-                    if row_sink is not None and hasattr(row_sink, "record_failure"):
-                        row_sink.record_failure(failed)
+                    if failure_sink is not None:
+                        failure_sink.record_failure(failed)
+                    current_ledger = current_ledger.charge_worker(
+                        cuda_seconds=None, wall_seconds=failed_wall,
+                        download_bytes=0, artifact_bytes=0,
+                    )
+                    if getattr(exc, "ownership_uncertain", False):
+                        raise
                     if errors > max_retries:
                         break
                 finally:
@@ -296,7 +391,7 @@ def calibrate_candidates(
                     if callable(close):
                         close()
             if len(completed) != len(rows):
-                candidate_status = "stopped_resource" if errors > max_retries else "interrupted"
+                candidate_status = "stopped_environment" if errors > max_retries else "interrupted"
                 break
             eos = sum(item["stop_reason"] == "eos" for item in completed)
             overflow = sum(item["stop_reason"] == "budget_overflow" for item in completed)
@@ -326,9 +421,9 @@ def calibrate_candidates(
             }
         if candidate_status == "interrupted":
             return {"status": "interrupted", "candidate": None, "attempts": attempt_records}
-        if candidate_status == "stopped_resource":
+        if candidate_status == "stopped_environment":
             return {
-                "status": "stopped_resource", "candidate": None,
+                "status": "stopped_environment", "candidate": None,
                 "attempts": attempt_records,
                 "reason": "bounded worker retries were exhausted; partial raw rows are preserved",
                 "resource_ledger": attempt_records[-1]["resource_ledger"],
@@ -341,18 +436,23 @@ def calibrate_candidates(
 
 def export_review_packets(
     source_rows: Sequence[Mapping[str, str]], raw_rows: Sequence[Mapping[str, Any]],
-    directory: Path, *, seed: str,
+    directory: Path, *, seed: str, private_gold_by_id: Mapping[str, str],
 ) -> dict[str, Any]:
     """Write an arm-blind packet and a separate private source/role/gold mapping."""
     root = Path(directory)
     packet_dir, private_dir = root / "packets", root / "private"
     packet_dir.mkdir(parents=True, exist_ok=True)
     private_dir.mkdir(parents=True, exist_ok=True)
-    gold_by_id = {row["id"]: row["gold"] for row in source_rows}
+    gold_by_id = dict(private_gold_by_id)
+    source_ids = {str(row["id"]) for row in source_rows}
+    if set(gold_by_id) != source_ids:
+        raise ValueError("private gold map IDs do not exactly match authenticated source rows")
     packet_rows: list[dict[str, str]] = []
     private_rows: list[dict[str, str]] = []
     for raw in raw_rows:
         source_id = str(raw["source_id"])
+        if source_id not in gold_by_id:
+            raise ValueError("raw review row has no authenticated private gold mapping")
         opaque = str(raw.get("opaque_id") or hmac.new(seed.encode(), f"{raw['role']}\0{source_id}".encode(), sha256).hexdigest()[:20])
         packet_rows.append({
             "row_id": opaque,
@@ -483,7 +583,8 @@ def _pid_is_alive(pid: int) -> bool:
     kernel32.OpenProcess.restype = wintypes.HANDLE
     handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
     if not handle:
-        return ctypes.get_last_error() == 5  # access denied: conservatively treat as live
+        error = ctypes.get_last_error()
+        return error != 87  # invalid PID is dead; all other errors conservatively block
     try:
         exit_code = wintypes.DWORD()
         if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):

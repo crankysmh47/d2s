@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import gc
+import hashlib
 import json
 import multiprocessing
 from pathlib import Path
@@ -13,6 +14,39 @@ from typing import Any, Callable, Mapping, Sequence
 
 class GenerationBudgetError(ValueError):
     """The registered prompt/output budgets cannot hold a rendered prompt."""
+
+
+class WorkerOwnershipError(RuntimeError):
+    """A spawned model child could not be proven dead; do not retry or release its lease."""
+    ownership_uncertain = True
+
+
+def candidate_limits(candidate: Sequence[int]) -> tuple[int, int, int]:
+    """Return (prompt capacity, max new tokens, total) for the frozen (new,total) pair."""
+    if len(candidate) != 2:
+        raise ValueError("candidate must be the registered (new_tokens, total_tokens) pair")
+    max_new, total = map(int, candidate)
+    prompt_capacity = total - max_new
+    if max_new <= 0 or prompt_capacity <= 0:
+        raise ValueError("candidate total must exceed its positive new-token budget")
+    return prompt_capacity, max_new, total
+
+
+def validate_cuda_memory(*, allocated: int, reserved: int, memory_cap: int) -> None:
+    """Reject either CUDA allocator peak crossing the registered physical cap."""
+    if allocated > memory_cap:
+        raise ValueError(f"CUDA peak allocated bytes {allocated} exceed cap {memory_cap}")
+    if reserved > memory_cap:
+        raise ValueError(f"CUDA peak reserved bytes {reserved} exceed cap {memory_cap}")
+
+
+def validate_cuda_placement(model: Any) -> None:
+    """Reject Transformers CPU/disk offload, which is outside this study's contract."""
+    device_map = getattr(model, "hf_device_map", None)
+    if not isinstance(device_map, Mapping) or not device_map:
+        raise ValueError("model device placement is unavailable for offload validation")
+    if any(str(device).lower() in {"cpu", "disk", "meta"} for device in device_map.values()):
+        raise ValueError("CPU/disk offload is not permitted for calibration")
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,7 +200,13 @@ def authenticate_model_snapshot(
         lfs_sha = getattr(lfs, "sha256", None) if lfs else None
         if lfs_sha and digest != lfs_sha:
             raise ValueError(f"pinned Hub LFS content hash mismatch: {name}")
-        files.append({"path": name, "size_bytes": size, "sha256": digest, "hub_lfs_sha256": lfs_sha})
+        blob_id = getattr(metadata_item, "blob_id", None)
+        if not blob_id:
+            raise ValueError(f"pinned Hub metadata lacks an authenticated blob ID: {name}")
+        blob_digest = _git_blob_sha1(path, size)
+        if blob_digest != blob_id:
+            raise ValueError(f"pinned Hub Git blob content hash mismatch: {name}")
+        files.append({"path": name, "size_bytes": size, "sha256": digest, "hub_lfs_sha256": lfs_sha, "hub_blob_id": blob_id})
     inventory = {"repo_id": repo_id, "revision": revision, "resolved_sha": resolved, "files": files}
     if inventory_path is not None:
         persist_model_inventory(inventory, inventory_path)
@@ -211,6 +251,14 @@ def _sha256_file(path: Path) -> str:
     from hashlib import sha256
 
     digest = sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _git_blob_sha1(path: Path, size: int) -> str:
+    digest = hashlib.sha1(f"blob {size}\0".encode())
     with Path(path).open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
@@ -275,9 +323,15 @@ def load_hf_worker(
         tokenizer_snapshot_path or snapshot, local_files_only=True,
     )
     model.eval()
+    validate_cuda_placement(model)
+    validate_cuda_memory(
+        allocated=int(torch.cuda.max_memory_allocated()),
+        reserved=int(torch.cuda.max_memory_reserved()),
+        memory_cap=memory_cap,
+    )
     if role == "student":
         verify_student_is_frozen(model)
-    return HuggingFaceWorker(role, model, tokenizer, config.prompt, torch, eos_token_ids=eos_token_ids)
+    return HuggingFaceWorker(role, model, tokenizer, config.prompt, torch, eos_token_ids=eos_token_ids, memory_cap_bytes=memory_cap)
 
 
 class HuggingFaceWorker:
@@ -286,6 +340,7 @@ class HuggingFaceWorker:
     def __init__(
         self, role: str, model: Any, tokenizer: Any, prompt_config: Any, torch: Any,
         *, eos_token_ids: Sequence[int] | None = None,
+        memory_cap_bytes: int | None = None,
     ) -> None:
         self.role = role
         self.model = model
@@ -293,11 +348,12 @@ class HuggingFaceWorker:
         self.prompt_config = prompt_config
         self.torch = torch
         self.eos_token_ids = tuple(eos_token_ids) if eos_token_ids is not None else None
+        self.memory_cap_bytes = memory_cap_bytes
 
     def generate(self, row: Mapping[str, str], candidate: Sequence[int]) -> dict[str, Any]:
-        max_prompt, max_new = map(int, candidate)
+        max_prompt, max_new, total_tokens = candidate_limits(candidate)
         prompt_ids = build_prompt_ids(self.tokenizer, self.prompt_config, row["question"])
-        if len(prompt_ids) > max_prompt or max_prompt + max_new > 4096:
+        if len(prompt_ids) > max_prompt or max_prompt + max_new > total_tokens:
             return {
                 "text": "", "stop_reason": "budget_overflow", "generated_tokens": 0,
                 "prompt_tokens": len(prompt_ids), "wall_seconds": 0.0, "cuda_seconds": 0.0,
@@ -324,6 +380,8 @@ class HuggingFaceWorker:
             cuda_seconds: float | None = time.perf_counter() - started
             allocated = int(torch.cuda.max_memory_allocated())
             reserved = int(torch.cuda.max_memory_reserved())
+            if self.memory_cap_bytes is not None:
+                validate_cuda_memory(allocated=allocated, reserved=reserved, memory_cap=self.memory_cap_bytes)
             free_after, _ = torch.cuda.mem_get_info()
         else:
             cuda_seconds, allocated, reserved, free_after = None, None, None, None
@@ -402,6 +460,7 @@ class IsolatedModelWorker:
     def __init__(
         self, role: str, config: Any, *, repo_root: Path, snapshot_path: Path,
         tokenizer_snapshot_path: Path, eos_token_ids: Sequence[int], timeout: float = 900,
+        child_started: Callable[[int], None] | None = None,
     ) -> None:
         context = multiprocessing.get_context("spawn")
         self._requests = context.Queue()
@@ -412,15 +471,26 @@ class IsolatedModelWorker:
             daemon=False,
         )
         self._process.start()
+        if child_started is not None:
+            child_started(int(self._process.pid))
         try:
             message = self._responses.get(timeout=timeout)
         except Exception:
-            self._process.join(timeout=1)
+            self._stop_owned_child()
             raise RuntimeError("isolated model worker startup timed out") from None
         self.startup_wall_seconds = float(message.get("startup_wall_seconds", 0.0))
         if not message.get("ok"):
-            self._process.join(timeout=1)
+            self._stop_owned_child()
             raise RuntimeError(f"isolated model worker failed: {message.get('error_type')}: {message.get('error')}")
+
+    def _stop_owned_child(self) -> None:
+        """Terminate only this owned child and retain its handle until exit is observed."""
+        self._process.join(timeout=1)
+        if self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=30)
+        if self._process.is_alive():
+            raise WorkerOwnershipError("timed-out model worker remains live; worker lease must be retained")
 
     def generate(self, row: Mapping[str, str], candidate: Sequence[int]) -> dict[str, Any]:
         self._requests.put({"op": "generate", "row": dict(row), "candidate": list(candidate)})
@@ -445,10 +515,12 @@ class IsolatedModelWorker:
 def isolated_worker_factory(
     role: str, config: Any, *, repo_root: Path, snapshot_path: Path,
     tokenizer_snapshot_path: Path, eos_token_ids: Sequence[int],
+    child_started: Callable[[int], None] | None = None,
 ) -> IsolatedModelWorker:
     return IsolatedModelWorker(
         role, config, repo_root=repo_root, snapshot_path=snapshot_path,
         tokenizer_snapshot_path=tokenizer_snapshot_path, eos_token_ids=eos_token_ids,
+        child_started=child_started,
     )
 
 
@@ -457,4 +529,5 @@ __all__ = [
     "IsolatedModelWorker", "authenticate_model_snapshot", "generate_one", "generation_stop_reason", "isolated_worker_factory",
     "load_hf_worker", "pinned_eos_token_ids", "resolve_pinned_snapshot", "verify_student_is_frozen",
     "persist_model_inventory",
+    "candidate_limits", "validate_cuda_memory", "validate_cuda_placement", "WorkerOwnershipError",
 ]

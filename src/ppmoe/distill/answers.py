@@ -22,7 +22,7 @@ class Score:
     correct: bool
 
 
-_CUE = re.compile(r"(?i)(?:\*\*\s*final\s+answer\s*:\s*\*\*|final\s+answer\s*:)")
+_CUE = re.compile(r"(?i)(?:\*\*\s*final\s+answer\s*:\s*\*\*|\*\*\s*final\s+answer\s*:|final\s+answer\s*:)")
 _NUMBER = re.compile(
     r"(?P<currency>\$)?\s*(?P<number>[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|[+-]?\.\d+|[+-]?\d+\s*/\s*[+-]?\d+)"
     r"(?:\s*(?P<unit>%|[A-Za-z][A-Za-z0-9%°-]*(?:\s+[A-Za-z][A-Za-z0-9%°-]*)*))?"
@@ -66,6 +66,8 @@ def _parse_payload(payload: str) -> tuple[str, Fraction] | None:
     candidate = payload.strip()
     if candidate.startswith("**") and candidate.endswith("**") and len(candidate) >= 4:
         candidate = candidate[2:-2].strip()
+    elif candidate.endswith("**"):
+        candidate = candidate[:-2].strip()
     if "\\boxed" in candidate:
         match = _BOX.fullmatch(candidate)
         if match is None or "{" in match.group("inside") or "}" in match.group("inside"):

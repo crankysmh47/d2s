@@ -13,6 +13,9 @@ from ppmoe.distill.model import (
     generation_stop_reason,
     pinned_eos_token_ids,
     verify_student_is_frozen,
+    candidate_limits,
+    validate_cuda_memory,
+    validate_cuda_placement,
 )
 
 
@@ -77,6 +80,28 @@ def test_generation_uses_greedy_settings_and_no_prompt_truncation() -> None:
     assert "truncation" not in model.generation_kwargs
 
 
+def test_candidate_pair_means_new_tokens_then_total_and_derives_prompt_capacity() -> None:
+    assert candidate_limits((256, 768)) == (512, 256, 768)
+    assert candidate_limits((512, 1024)) == (512, 512, 1024)
+    assert candidate_limits((768, 1536)) == (768, 768, 1536)
+
+
+def test_memory_cap_checks_allocated_and_reserved_peaks() -> None:
+    validate_cuda_memory(allocated=10, reserved=20, memory_cap=20)
+    with pytest.raises(ValueError, match="allocated"):
+        validate_cuda_memory(allocated=21, reserved=22, memory_cap=20)
+    with pytest.raises(ValueError, match="reserved"):
+        validate_cuda_memory(allocated=10, reserved=21, memory_cap=20)
+
+
+def test_model_placement_rejects_cpu_or_disk_offload() -> None:
+    class Placed:
+        hf_device_map = {"model.embed_tokens": 0, "lm_head": "cpu"}
+
+    with pytest.raises(ValueError, match="offload"):
+        validate_cuda_placement(Placed())
+
+
 def test_student_base_must_have_no_trainable_parameters() -> None:
     verify_student_is_frozen(FakeModel())
     with pytest.raises(ValueError, match="trainable"):
@@ -92,3 +117,66 @@ def test_effective_alternate_eos_wins_at_exact_generation_budget_boundary() -> N
 def test_pinned_generation_config_accepts_multiple_effective_eos_ids(tmp_path: Path) -> None:
     (tmp_path / "generation_config.json").write_text(json.dumps({"eos_token_id": [9, 3, 9]}), encoding="utf-8")
     assert pinned_eos_token_ids(tmp_path) == (3, 9)
+
+
+def test_snapshot_authentication_checks_hub_git_blob_sha_for_non_lfs_files(tmp_path: Path) -> None:
+    import hashlib
+    from types import SimpleNamespace
+    from ppmoe.distill.model import authenticate_model_snapshot
+
+    revision = "a" * 40
+    snapshot = tmp_path / revision
+    snapshot.mkdir()
+    data = b"one"
+    (snapshot / "config.json").write_bytes(data)
+    blob = hashlib.sha1(b"blob 3\0one").hexdigest()
+    metadata = SimpleNamespace(
+        sha=revision,
+        siblings=[SimpleNamespace(rfilename="config.json", size=3, blob_id=blob, lfs=None)],
+    )
+    assert authenticate_model_snapshot("repo", revision, snapshot, metadata=metadata)["files"][0]["path"] == "config.json"
+    (snapshot / "config.json").write_bytes(b"two")
+    with pytest.raises(ValueError, match="blob"):
+        authenticate_model_snapshot("repo", revision, snapshot, metadata=metadata)
+
+
+@pytest.mark.parametrize(("alive_after_terminate", "error_type"), [(False, RuntimeError), (True, "ownership")])
+def test_startup_timeout_terminates_owned_child_or_reports_uncertain_ownership(monkeypatch, alive_after_terminate, error_type) -> None:
+    import ppmoe.distill.model as model_module
+
+    callbacks = []
+    class Queue:
+        def get(self, timeout): raise TimeoutError
+        def close(self): pass
+    class Process:
+        pid = 321
+        def __init__(self, *args, **kwargs):
+            self.alive = True
+            self.terminated = False
+
+        def start(self): pass
+
+        def join(self, timeout):
+            if self.terminated and not alive_after_terminate:
+                self.alive = False
+
+        def is_alive(self): return self.alive
+        def terminate(self): self.terminated = True
+    class Context:
+        def Queue(self): return Queue()
+        def Process(self, *args, **kwargs):
+            self.process = Process(*args, **kwargs)
+            return self.process
+    context = Context()
+    monkeypatch.setattr(model_module.multiprocessing, "get_context", lambda name: context)
+    args = dict(role="student", config=object(), repo_root=Path("."), snapshot_path=Path("."),
+                tokenizer_snapshot_path=Path("."), eos_token_ids=(2,), timeout=0.01,
+                child_started=callbacks.append)
+    if error_type == "ownership":
+        with pytest.raises(model_module.WorkerOwnershipError):
+            model_module.IsolatedModelWorker(**args)
+    else:
+        with pytest.raises(RuntimeError, match="startup timed out"):
+            model_module.IsolatedModelWorker(**args)
+    assert callbacks == [321]
+    assert context.process.terminated
