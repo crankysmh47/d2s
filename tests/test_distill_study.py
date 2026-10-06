@@ -290,6 +290,12 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
     monkeypatch.setattr(study, "validate_prepared_run", lambda *args, **kwargs: manifest)
     monkeypatch.setattr(study, "canonical_config", lambda config: config_value)
     monkeypatch.setattr(study, "preflight_disk", lambda *args, **kwargs: 20 * 1024**3)
+    from ppmoe.distill.evaluate import ResourceLedger
+    simulated_origin = study._utc_now()
+    monkeypatch.setattr(
+        study, "_initial_resource_ledger",
+        lambda: ResourceLedger(wall_seconds=0, wall_started_utc=simulated_origin), raising=False,
+    )
     monkeypatch.setattr(study, "load_split", lambda *args, **kwargs: questions)
     inventory_by_role = {
         role: {"repo_id": role, "revision": f"{role}-pin", "files": [{"path": "config.json", "size_bytes": 1, "sha256": "d" * 64, "hub_blob_id": "blob"}]}
@@ -358,6 +364,13 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
                             "stage_signature": stage_signature, "reserved_at_utc": reserved_at})
     journal.record_attempt({"attempt_id": "old-attempt", "status": "worker_started", "role": "student", "candidate": list(candidates),
                             "stage_signature": stage_signature, "startup_wall_seconds": 0.01, "reserved_at_utc": reserved_at})
+    reservation_history = root / "stages" / "calibrate-reservations.jsonl"
+    reservation_history.write_text(json.dumps({
+        "event_type": "reservation", "status": "reserved", "stage": "calibrate",
+        "stage_signature": stage_signature, "signature": prepared_signature,
+        "code_signatures": study._file_signatures(repo_root),
+        "originating_git_commit": "c" * 40, "started_at_utc": reserved_at,
+    }, sort_keys=True) + "\n", encoding="utf-8")
     generated = {"student": 0, "teacher": 0}
     class FakeWorker:
         startup_wall_seconds = 0.02
@@ -444,3 +457,206 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
         if path.is_file() and (base == overcap_root / "calibration" or path.name.startswith("calibrate"))
     )
     assert saved_terminal["resource_ledger"]["artifact_bytes"] == measured
+
+
+def _early_resource_stage(monkeypatch, tmp_path: Path):
+    from types import SimpleNamespace
+    import shutil
+    import ppmoe.distill.study as study
+
+    repo_root = tmp_path / "repo"
+    source_repo = Path(__file__).parents[1]
+    for relative in set(study.CALIBRATION_FILES) | set(study.ACTIVE_FILES):
+        source = source_repo / relative
+        target = repo_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+    root = tmp_path / ("e" * 64)
+    (root / "stages").mkdir(parents=True)
+    ids = [f"early-{i:03}" for i in range(60)]
+    config_value = {"synthetic": "signed"}
+    manifest = {"config": config_value, "splits": {"calibration": {"count": 60, "ordered_ids": ids}}}
+    manifest_path = root / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    prepare_path = root / "stages" / "prepare.json"
+    prepare_path.write_text('{"status":"passed"}\n', encoding="utf-8")
+    monkeypatch.setattr(study, "TASK1_RUN_ID", root.name)
+    monkeypatch.setattr(study, "TASK1_MANIFEST_SHA256", sha256(manifest_path.read_bytes()).hexdigest())
+    monkeypatch.setattr(study, "TASK1_PREPARE_SHA256", sha256(prepare_path.read_bytes()).hexdigest())
+    monkeypatch.setattr(study, "_git_commit", lambda path: "f" * 40)
+    monkeypatch.setattr(study, "feasibility_runtime_identity", lambda *args, **kwargs: {"synthetic": True})
+    monkeypatch.setattr(study, "validate_prepared_run", lambda *args, **kwargs: manifest)
+    monkeypatch.setattr(study, "canonical_config", lambda config: config_value)
+    config = SimpleNamespace(
+        resources=SimpleNamespace(
+            vram_reserve_bytes=2 * 1024**3, phase_retries=2,
+            download_bytes=21474836480, artifact_bytes=21474836480,
+            cuda_seconds=86400, wall_seconds=172800,
+        ),
+        student=SimpleNamespace(repo_id="student", revision="student-test-pin"),
+        teacher=SimpleNamespace(repo_id="teacher", revision="teacher-test-pin"),
+        prompt=SimpleNamespace(candidates=((256, 768),)),
+        qualification=SimpleNamespace(minimum_calibration_eos=57),
+    )
+    return study, repo_root, root, config
+
+
+def test_expired_wall_persists_premodel_stop_without_hub_disk_or_worker(monkeypatch, tmp_path: Path) -> None:
+    import sys
+    from ppmoe.distill.evaluate import ResourceLedger
+    from ppmoe.distill.evaluate import RawRowJournal
+
+    study, repo_root, root, config = _early_resource_stage(monkeypatch, tmp_path)
+    # Use the frozen production origin; on the current date it is genuinely expired.
+    assert ResourceLedger.initial().wall_seconds > config.resources.wall_seconds
+    history_path = root / "stages" / "calibrate-reservations.jsonl"
+    history_path.write_text(json.dumps({
+        "event_type": "download_reservation", "status": "reserved", "reserved_bytes": 321,
+        "originating_git_commit": "c" * 40,
+    }) + "\n", encoding="utf-8")
+    manifest_hash = sha256((root / "manifest.json").read_bytes()).hexdigest()
+    prepare_hash = sha256((root / "stages" / "prepare.json").read_bytes()).hexdigest()
+    prior_signature = study.calibration_stage_signature(
+        repo_root, source_run_id=root.name, manifest_sha256=manifest_hash,
+        prepare_sha256=prepare_hash, originating_git_commit="c" * 40,
+    )
+    stage_signature = prior_signature["stage_signature"]
+    raw_journal = RawRowJournal(
+        root / "calibration" / "raw" / "256-768-student.jsonl",
+        expected_ids=[f"early-{i:03}" for i in range(60)], stage_signature=stage_signature,
+    )
+    raw_journal.append({
+        "source_id": "early-000", "role": "student", "candidate": [256, 768],
+        "question": "synthetic", "text": "not inspected", "stop_reason": "eos",
+        "generated_tokens": 1, "wall_seconds": 2.0, "cuda_seconds": 7.5,
+        "worker_startup_wall_seconds": 3.0, "attempt_id": "old-complete",
+        "stage_signature": stage_signature,
+    })
+    old_started = study._utc_now()
+    for state, extras in (
+        ("worker_reserved", {"reserved_at_utc": old_started}),
+        ("worker_started", {"startup_wall_seconds": 3.0}),
+        ("worker_complete", {"startup_wall_seconds": 3.0}),
+    ):
+        raw_journal.record_attempt({
+            "attempt_id": "old-complete", "status": state, "role": "student",
+            "candidate": [256, 768], "stage_signature": stage_signature, **extras,
+        })
+    history_path.write_text(history_path.read_text(encoding="utf-8") + json.dumps({
+        "event_type": "reservation", "status": "reserved", "stage_signature": stage_signature,
+        "signature": prior_signature, "originating_git_commit": "c" * 40,
+        "code_signatures": study._file_signatures(repo_root),
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(study, "preflight_disk", lambda *args, **kwargs: pytest.fail("expired stop checked disk"))
+    class PoisonHub:
+        def __getattr__(self, name):
+            raise AssertionError(f"expired stop accessed Hub API {name}")
+    monkeypatch.setitem(sys.modules, "huggingface_hub", PoisonHub())
+
+    result = study.run_calibration_stage(
+        root, config, repo_root=repo_root, config_path=tmp_path / "config.toml",
+        worker_loader=lambda *args: pytest.fail("expired stop constructed worker"),
+    )
+    saved = json.loads((root / "stages" / "calibrate.json").read_text(encoding="utf-8"))
+    events = [json.loads(line) for line in history_path.read_text(encoding="utf-8").splitlines()]
+    assert result["status"] == saved["status"] == "stopped_environment"
+    assert "wall" in saved["reason"].lower() or "expired" in saved["reason"].lower()
+    assert saved["phase_state"] == "pre_model_stopped"
+    assert saved["model_inventory_status"] == "not_authenticated"
+    assert "model_inventory" not in saved
+    assert saved["resource_ledger"]["wall_seconds"] > config.resources.wall_seconds
+    assert saved["resource_ledger"]["download_bytes"] == 8066699435 + 321
+    assert saved["resource_ledger"]["cuda_seconds"] == 1179
+    assert saved["originating_git_commit"] == "c" * 40
+    assert saved["started_at_utc"] < saved["ended_at_utc"]
+    assert any(item.get("event_type") == "terminal" and item.get("status") == "stopped_environment" for item in events)
+    with pytest.raises(FileExistsError, match="immutable"):
+        study.run_calibration_stage(root, config, repo_root=repo_root, config_path=tmp_path / "config.toml")
+
+
+def test_low_disk_persists_premodel_stop_before_hub_or_worker(monkeypatch, tmp_path: Path) -> None:
+    import sys
+    from ppmoe.distill.evaluate import ResourceLedger, ResourceLimitError
+
+    study, repo_root, root, config = _early_resource_stage(monkeypatch, tmp_path)
+    now = study._utc_now()
+    monkeypatch.setattr(study, "_initial_resource_ledger", lambda: ResourceLedger(wall_seconds=0, wall_started_utc=now), raising=False)
+    monkeypatch.setattr(study, "preflight_disk", lambda *args, **kwargs: (_ for _ in ()).throw(ResourceLimitError("insufficient free disk: need 10, have 2")))
+    class PoisonHub:
+        def __getattr__(self, name): raise AssertionError(f"low-disk stop accessed Hub API {name}")
+    monkeypatch.setitem(sys.modules, "huggingface_hub", PoisonHub())
+
+    result = study.run_calibration_stage(
+        root, config, repo_root=repo_root, config_path=tmp_path / "config.toml",
+        worker_loader=lambda *args: pytest.fail("low-disk stop constructed worker"),
+    )
+    saved = json.loads((root / "stages" / "calibrate.json").read_text(encoding="utf-8"))
+    assert result["status"] == saved["status"] == "stopped_environment"
+    assert "disk" in saved["reason"].lower()
+    assert saved["resource_ledger"]["download_bytes"] == ResourceLedger.initial().download_bytes
+    assert saved["model_inventory_status"] == "not_authenticated"
+
+
+@pytest.mark.parametrize("over_role", ["student", "teacher"])
+def test_projected_download_overcap_stops_without_materializing_or_changing_sources(monkeypatch, tmp_path: Path, over_role: str) -> None:
+    import sys
+    from types import SimpleNamespace
+    from ppmoe.distill.evaluate import ResourceLedger
+
+    study, repo_root, root, config = _early_resource_stage(monkeypatch, tmp_path)
+    now = study._utc_now()
+    base_download = ResourceLedger.initial().download_bytes
+    monkeypatch.setattr(study, "_initial_resource_ledger", lambda: ResourceLedger(wall_seconds=0, wall_started_utc=now), raising=False)
+    config.resources.download_bytes = base_download + 5
+    monkeypatch.setattr(study, "preflight_disk", lambda *args, **kwargs: 16 * 1024**3)
+    original_bytes: dict[Path, bytes] = {}
+    if over_role == "teacher":
+        student_source = repo_root / "artifacts/recurrence-v0/129d39646933/source" / config.student.revision
+        student_source.mkdir(parents=True)
+        student_file = student_source / "config.json"
+        student_file.write_bytes(b"{}")
+        original_bytes[student_file] = student_file.read_bytes()
+        teacher_snapshot = repo_root / ".cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots" / config.teacher.revision
+        teacher_snapshot.mkdir(parents=True)
+        teacher_file = teacher_snapshot / "config.json"
+        teacher_file.write_bytes(b"{}")
+        original_bytes[teacher_file] = teacher_file.read_bytes()
+    else:
+        student_snapshot = repo_root / ".cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots" / config.student.revision
+        student_snapshot.mkdir(parents=True)
+        student_file = student_snapshot / "existing-cache-bytes.bin"
+        student_file.write_bytes(b"keep this pre-existing cache content unchanged")
+        original_bytes[student_file] = student_file.read_bytes()
+
+    class FakeApi:
+        def model_info(self, repo_id, *, revision, files_metadata):
+            names = ["config.json"]
+            if over_role == "teacher" and repo_id == config.teacher.repo_id:
+                names.append("missing.bin")
+            return SimpleNamespace(
+                sha=revision,
+                siblings=[SimpleNamespace(rfilename=name, size=10) for name in names],
+            )
+    class PoisonDownload:
+        def __call__(self, **kwargs):
+            raise AssertionError("over-cap estimate materialized model files")
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(
+        HfApi=FakeApi, snapshot_download=PoisonDownload(), hf_hub_download=PoisonDownload(),
+    ))
+    monkeypatch.setattr(study, "authenticate_model_snapshot", lambda *args, **kwargs: {"files": []})
+    monkeypatch.setattr(study, "pinned_eos_token_ids", lambda *args: (2,))
+
+    result = study.run_calibration_stage(
+        root, config, repo_root=repo_root, config_path=tmp_path / "config.toml",
+        worker_loader=lambda *args: pytest.fail("over-cap estimate constructed worker"),
+    )
+    saved = json.loads((root / "stages" / "calibrate.json").read_text(encoding="utf-8"))
+    assert result["status"] == saved["status"] == "stopped_environment"
+    assert over_role in saved["reason"]
+    assert saved["resource_ledger"]["download_bytes"] == base_download + 10
+    assert all(path.read_bytes() == content for path, content in original_bytes.items())
+    stop_event = next(
+        json.loads(line) for line in (root / "stages" / "calibrate-reservations.jsonl").read_text().splitlines()
+        if json.loads(line).get("event_type") == "resource_stop"
+    )
+    assert stop_event["attempted_download_bytes"] == saved["resource_ledger"]["download_bytes"]

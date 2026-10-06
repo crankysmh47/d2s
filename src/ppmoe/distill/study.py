@@ -273,6 +273,229 @@ def _append_stage_event(path: Path, event: dict[str, Any]) -> None:
         os.fsync(stream.fileno())
 
 
+def _initial_resource_ledger() -> ResourceLedger:
+    """Return the ledger anchored to the frozen feasibility wall origin."""
+    return ResourceLedger.initial()
+
+
+def _calibration_artifact_bytes(root: Path) -> int:
+    return sum(
+        path.stat().st_size
+        for base in (root / "calibration", root / "stages")
+        for path in (base.rglob("*") if base.exists() else ())
+        if path.is_file() and (base == root / "calibration" or path.name.startswith("calibrate"))
+    )
+
+
+def _replay_calibration_resources(
+    root: Path, history: Sequence[Mapping[str, Any]], *, expected_ids: Sequence[str],
+    stage_signature: str | None, config: Any, additional_download_bytes: int = 0,
+) -> ResourceLedger:
+    """Rebuild durable charges once without enforcing caps mid-replay."""
+    ledger = replace(
+        _initial_resource_ledger(), cuda_cap=2**63 - 1, wall_cap=2**63 - 1,
+        download_cap=2**63 - 1, artifact_cap=2**63 - 1,
+    )
+    raw_directory = root / "calibration" / "raw"
+    raw_paths = sorted(path for path in raw_directory.glob("*.jsonl") if not path.name.endswith(".attempts.jsonl")) if raw_directory.exists() else []
+    if raw_paths and not stage_signature:
+        raise StageError("calibration raw journals lack a frozen stage signature")
+    journals: dict[Path, RawRowJournal] = {}
+    for raw_path in raw_paths:
+        parts = raw_path.stem.split("-")
+        if len(parts) < 3 or parts[-1] not in {"student", "teacher"}:
+            raise StageError("calibration raw journal filename is invalid")
+        journal = RawRowJournal(raw_path, expected_ids=expected_ids, stage_signature=str(stage_signature))
+        journals[raw_path] = journal
+        for raw in journal.read():
+            startup = float(raw.get("worker_startup_wall_seconds", 0.0))
+            if startup:
+                ledger = ledger.charge_worker(
+                    cuda_seconds=None, wall_seconds=startup,
+                    download_bytes=0, artifact_bytes=0,
+                )
+            encoded_size = len(_canonical_bytes(raw)) + 1
+            ledger = ledger.charge_worker(
+                cuda_seconds=raw.get("cuda_seconds"),
+                wall_seconds=float(raw.get("wall_seconds", 0.0)),
+                download_bytes=0, artifact_bytes=encoded_size,
+            )
+    for attempt_path in sorted(raw_directory.glob("*.attempts.jsonl")) if raw_directory.exists() else []:
+        raw_path = Path(str(attempt_path)[:-len(".attempts.jsonl")])
+        parts = raw_path.stem.split("-")
+        if len(parts) < 3 or parts[-1] not in {"student", "teacher"}:
+            raise StageError("calibration attempt journal filename is invalid")
+        if not stage_signature:
+            raise StageError("calibration attempt journal lacks a frozen stage signature")
+        journal = journals.get(raw_path) or RawRowJournal(
+            raw_path, expected_ids=expected_ids, stage_signature=stage_signature,
+        )
+        events = journal.attempts()
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for index, event in enumerate(events):
+            grouped.setdefault(str(event.get("attempt_id", f"legacy-{index}")), []).append(event)
+        for attempt_events in grouped.values():
+            if any(event.get("status") == "worker_complete" for event in attempt_events):
+                continue
+            failed = [
+                event for event in attempt_events
+                if event.get("status") in {"failed", "worker_load_failed", "worker_close_failed"}
+            ]
+            if failed:
+                event = failed[-1]
+                ledger = ledger.charge_worker(
+                    cuda_seconds=event.get("cuda_seconds"),
+                    wall_seconds=float(event.get("worker_startup_wall_seconds", 0.0)) + float(event.get("wall_seconds", 0.0)),
+                    download_bytes=0, artifact_bytes=0,
+                )
+                continue
+            reservation_event = next((event for event in attempt_events if event.get("status") == "worker_reserved"), None)
+            if reservation_event is None:
+                raise StageError("incomplete calibration attempt lacks a durable reservation")
+            reserved = datetime.fromisoformat(str(reservation_event["reserved_at_utc"]).replace("Z", "+00:00"))
+            elapsed = max(0.0, (datetime.now(timezone.utc) - reserved).total_seconds())
+            known = raw_startup = 0.0
+            for raw in journal.read():
+                if raw.get("attempt_id") == reservation_event.get("attempt_id"):
+                    raw_startup += float(raw.get("worker_startup_wall_seconds", 0.0))
+                    known += float(raw.get("wall_seconds", 0.0))
+            known += raw_startup
+            if not raw_startup:
+                known += sum(
+                    float(event.get("startup_wall_seconds", 0.0))
+                    for event in attempt_events if event.get("status") == "worker_started"
+                )
+            uncommitted = max(0.0, elapsed - known)
+            if uncommitted:
+                ledger = ledger.charge_worker(
+                    cuda_seconds=None, wall_seconds=uncommitted,
+                    download_bytes=0, artifact_bytes=0,
+                )
+    prior_downloads = sum(
+        int(item.get("reserved_bytes", 0))
+        for item in history if item.get("event_type") == "download_reservation"
+    )
+    ledger = ledger.charge_worker(
+        cuda_seconds=0, wall_seconds=0,
+        download_bytes=prior_downloads + additional_download_bytes, artifact_bytes=0,
+    )
+    return replace(
+        ledger,
+        artifact_bytes=_calibration_artifact_bytes(root),
+        cuda_cap=config.resources.cuda_seconds,
+        wall_cap=config.resources.wall_seconds,
+        download_cap=config.resources.download_bytes,
+        artifact_cap=max(0, config.resources.artifact_bytes - 1024**2),
+    )
+
+
+def _resource_limit_reason(ledger: ResourceLedger) -> str | None:
+    if ledger.wall_seconds > ledger.wall_cap:
+        return "global wall-time budget expired"
+    if ledger.cuda_seconds > ledger.cuda_cap:
+        return "cumulative CUDA budget exceeded"
+    if ledger.download_bytes > ledger.download_cap:
+        return "cumulative download budget exceeded"
+    if ledger.artifact_bytes > ledger.artifact_cap:
+        return "cumulative artifact budget exceeded"
+    return None
+
+
+def _persist_calibration_terminal(
+    root: Path, reservation_path: Path, result: dict[str, Any], *,
+    started_at: str, artifact_cap: int,
+) -> dict[str, Any]:
+    """Commit one immutable terminal record, including its event/stage bytes."""
+    ended_at = _utc_now()
+    result["started_at_utc"] = started_at
+    result["ended_at_utc"] = ended_at
+    terminal_event = {
+        "status": result["status"], "event_type": "terminal", "event_id": uuid4().hex,
+        "stage_signature": result.get("stage_signature"),
+        "originating_git_commit": result.get("originating_git_commit"),
+        "started_at_utc": started_at, "ended_at_utc": ended_at,
+    }
+    operational_cap = max(0, artifact_cap - 1024**2)
+    artifacts_before_terminal = _calibration_artifact_bytes(root)
+
+    def projected_total() -> int:
+        total = artifacts_before_terminal + len(_canonical_bytes(terminal_event)) + 1
+        while True:
+            result["resource_ledger"]["artifact_bytes"] = total
+            updated = (
+                artifacts_before_terminal + len(_canonical_bytes(terminal_event)) + 1
+                + len(_canonical_bytes(result)) + 1
+            )
+            if updated == total:
+                return total
+            total = updated
+
+    projected = projected_total()
+    if projected > operational_cap:
+        result["status"] = "stopped_environment"
+        result["reason"] = result.get("reason") or "projected calibration artifacts exceed registered cap"
+        terminal_event["status"] = result["status"]
+        projected_total()
+    _append_stage_event(reservation_path, terminal_event)
+    atomic_write_json(stage_path(root, "calibrate"), result)
+    return result
+
+
+def _persist_pre_model_stop(
+    root: Path, reservation_path: Path, *, config: Any, manifest_hash: str,
+    prepare_hash: str, originating_commit: str, started_at: str,
+    signature_record: Mapping[str, Any], ledger: ResourceLedger,
+    reason: str, detail: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    stage_signature = str(signature_record["stage_signature"])
+    inventory_status = str((detail or {}).get("model_inventory_status", "not_authenticated"))
+    if not any(item.get("event_type") == "reservation" for item in _read_stage_events(reservation_path)):
+        _append_stage_event(reservation_path, {
+            "status": "reserved", "event_type": "reservation", "event_id": uuid4().hex,
+            "stage": "calibrate", "stage_signature": stage_signature,
+            "predecessor_hashes": signature_record["predecessors"],
+            "started_at_utc": started_at, "originating_git_commit": originating_commit,
+            "signature": dict(signature_record),
+            "config": canonical_config(config), "phase_state": "pre_model",
+            "model_inventory_status": inventory_status,
+        })
+    _append_stage_event(reservation_path, {
+        "status": "stopped_environment", "event_type": "resource_stop", "event_id": uuid4().hex,
+        "stage": "calibrate", "stage_signature": stage_signature,
+        "originating_git_commit": originating_commit, "started_at_utc": started_at,
+        "reason": reason, "attempted_download_bytes": ledger.download_bytes,
+        "resource_ledger": {name: getattr(ledger, name) for name in ledger.__dataclass_fields__},
+        "details": dict(detail or {}),
+    })
+    result: dict[str, Any] = {
+        "stage": "calibrate", "run_id": root.name, "status": "stopped_environment",
+        "phase_state": "pre_model_stopped", "model_inventory_status": inventory_status,
+        "reason": reason, "attempts": [], "stage_signature": stage_signature,
+        "signature": dict(signature_record), "task1_originating_commit": TASK1_ORIGINATING_COMMIT,
+        "originating_git_commit": originating_commit,
+        "task1_manifest_sha256": manifest_hash, "task1_prepare_sha256": prepare_hash,
+        "resource_caps": {
+            "cuda_seconds": config.resources.cuda_seconds,
+            "wall_seconds": config.resources.wall_seconds,
+            "download_bytes": config.resources.download_bytes,
+            "artifact_bytes": config.resources.artifact_bytes,
+        },
+        "resource_ledger": {name: getattr(ledger, name) for name in ledger.__dataclass_fields__},
+    }
+    if (detail or {}).get("authenticated_model_inventory_sha256"):
+        result["authenticated_model_inventory_sha256"] = dict(detail["authenticated_model_inventory_sha256"])
+    return _persist_calibration_terminal(
+        root, reservation_path, result, started_at=started_at,
+        artifact_cap=config.resources.artifact_bytes,
+    )
+
+
+def _read_stage_events(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
 def run_calibration_stage(
     run_root: Path, config: Any, *, repo_root: Path, config_path: Path,
     worker_loader: Any | None = None,
@@ -288,7 +511,7 @@ def run_calibration_stage(
     prior = []
     if reservation_path.exists():
         history = [json.loads(line) for line in reservation_path.read_text(encoding="utf-8").splitlines()]
-        if any(item.get("event_type") not in {"reservation", "terminal", "download_reservation", "download_complete"} for item in history):
+        if any(item.get("event_type") not in {"reservation", "terminal", "download_reservation", "download_complete", "resource_stop"} for item in history):
             raise StageError("calibration reservation journal has an invalid event")
         prior = [item for item in history if item.get("event_type") == "reservation"]
         if len(prior) > config.resources.phase_retries:
@@ -323,7 +546,63 @@ def run_calibration_stage(
     expected_ids = calibration_entry.get("ordered_ids")
     if not isinstance(expected_ids, list) or len(expected_ids) != 60 or len(set(expected_ids)) != 60:
         raise StageError("prepared calibration ordered-ID map is invalid")
-    preflight_disk(root, reserve_bytes=2 * 1024**3)
+    existing_signature = prior[0].get("signature") if prior else None
+    if prior and not isinstance(existing_signature, dict):
+        raise StageError("calibration recovery lacks its frozen source signature")
+    pre_model_signature = calibration_stage_signature(
+        repo_root, source_run_id=TASK1_RUN_ID,
+        manifest_sha256=manifest_hash, prepare_sha256=prepare_hash,
+        originating_git_commit=originating_commit,
+    )
+    signature_record = existing_signature or pre_model_signature
+    current_active_signatures = _file_signatures(repo_root)
+    for event in history:
+        frozen_active = event.get("code_signatures")
+        if isinstance(frozen_active, dict) and frozen_active != current_active_signatures:
+            raise StageError("calibration active code/config bytes drifted from the first durable reservation")
+    if prior:
+        frozen_code = existing_signature.get("code_signatures")
+        if frozen_code != pre_model_signature.get("code_signatures"):
+            raise StageError("calibration source/config bytes drifted from first reservation")
+        if existing_signature.get("stage_signature") is None:
+            raise StageError("calibration recovery signature is missing")
+
+    pre_model_ledger = _replay_calibration_resources(
+        root, history, expected_ids=expected_ids,
+        stage_signature=signature_record.get("stage_signature"), config=config,
+    )
+    resource_reason = _resource_limit_reason(pre_model_ledger)
+    if resource_reason:
+        return _persist_pre_model_stop(
+            root, reservation_path, config=config, manifest_hash=manifest_hash,
+            prepare_hash=prepare_hash, originating_commit=originating_commit,
+            started_at=started_at, signature_record=signature_record,
+            ledger=pre_model_ledger, reason=resource_reason,
+            detail={"phase": "preflight", "model_inventory_status": "not_authenticated"},
+        )
+    pre_model_ledger = pre_model_ledger.charge_worker(
+        cuda_seconds=0, wall_seconds=0, download_bytes=0, artifact_bytes=0,
+    )
+    resource_reason = _resource_limit_reason(pre_model_ledger)
+    if resource_reason:
+        return _persist_pre_model_stop(
+            root, reservation_path, config=config, manifest_hash=manifest_hash,
+            prepare_hash=prepare_hash, originating_commit=originating_commit,
+            started_at=started_at, signature_record=signature_record,
+            ledger=pre_model_ledger, reason=resource_reason,
+            detail={"phase": "disk_preflight", "model_inventory_status": "not_authenticated"},
+        )
+    try:
+        free_before = preflight_disk(root, reserve_bytes=2 * 1024**3)
+    except ResourceLimitError as exc:
+        attempted_ledger = getattr(exc, "ledger", None) or pre_model_ledger
+        return _persist_pre_model_stop(
+            root, reservation_path, config=config, manifest_hash=manifest_hash,
+            prepare_hash=prepare_hash, originating_commit=originating_commit,
+            started_at=started_at, signature_record=signature_record,
+            ledger=attempted_ledger, reason=str(exc),
+            detail={"phase": "disk_preflight", "model_inventory_status": "not_authenticated"},
+        )
     from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 
     api = HfApi()
@@ -336,6 +615,19 @@ def run_calibration_stage(
         metadata = api.model_info(pin.repo_id, revision=pin.revision, files_metadata=True)
         if getattr(metadata, "sha", None) != pin.revision:
             raise StageError(f"Hub pin authentication failed for {role}")
+        pre_model_ledger = pre_model_ledger.charge_worker(
+            cuda_seconds=0, wall_seconds=0, download_bytes=0, artifact_bytes=0,
+        )
+        resource_reason = _resource_limit_reason(pre_model_ledger)
+        if resource_reason:
+            return _persist_pre_model_stop(
+                root, reservation_path, config=config, manifest_hash=manifest_hash,
+                prepare_hash=prepare_hash, originating_commit=originating_commit,
+                started_at=started_at, signature_record=signature_record,
+                ledger=pre_model_ledger, reason=resource_reason,
+                detail={"phase": "model_metadata", "role": role,
+                        "model_inventory_status": "not_authenticated"},
+            )
         if role == "student":
             expected_names = {item.rfilename for item in metadata.siblings}
             cache_path = (
@@ -370,10 +662,33 @@ def run_calibration_stage(
                 excluded_subtree = None
             else:
                 estimated = sum(int(getattr(item, "size", 0) or 0) for item in metadata.siblings)
-                if ResourceLedger.initial().download_bytes + downloaded_bytes + estimated > config.resources.download_bytes:
-                    raise StageError("pinned student download would exceed the registered download cap")
+                try:
+                    projected_ledger = pre_model_ledger.charge_worker(
+                        cuda_seconds=0, wall_seconds=0,
+                        download_bytes=estimated, artifact_bytes=0,
+                    )
+                except ResourceLimitError as exc:
+                    attempted_ledger = exc.ledger or pre_model_ledger
+                    return _persist_pre_model_stop(
+                        root, reservation_path, config=config, manifest_hash=manifest_hash,
+                        prepare_hash=prepare_hash, originating_commit=originating_commit,
+                        started_at=started_at, signature_record=signature_record,
+                        ledger=attempted_ledger, reason=f"student projected download exceeds resource budget: {exc}",
+                        detail={"phase": "model_source_preflight", "role": role,
+                                "estimated_download_bytes": estimated,
+                                "model_inventory_status": "not_authenticated"},
+                    )
                 if shutil.disk_usage(repo_root).free < estimated + 2 * 1024**3:
-                    raise StageError("insufficient disk for the pinned student model snapshot")
+                    return _persist_pre_model_stop(
+                        root, reservation_path, config=config, manifest_hash=manifest_hash,
+                        prepare_hash=prepare_hash, originating_commit=originating_commit,
+                        started_at=started_at, signature_record=signature_record,
+                        ledger=pre_model_ledger, reason="insufficient disk for the pinned student model snapshot",
+                        detail={"phase": "student_download_preflight", "estimated_download_bytes": estimated,
+                                "disk_free_bytes": shutil.disk_usage(repo_root).free,
+                                "model_inventory_status": "not_authenticated"},
+                    )
+                pre_model_ledger = projected_ledger
                 downloaded_bytes += estimated
                 download_started = _utc_now()
                 _append_stage_event(reservation_path, {
@@ -409,10 +724,37 @@ def run_calibration_stage(
             missing_names = sorted(set(expected_by_name) - actual_names)
             if missing_names:
                 estimated = sum(int(getattr(expected_by_name[name], "size", 0) or 0) for name in missing_names)
-                if ResourceLedger.initial().download_bytes + downloaded_bytes + estimated > config.resources.download_bytes:
-                    raise StageError("missing pinned teacher files would exceed the registered download cap")
+                try:
+                    projected_ledger = pre_model_ledger.charge_worker(
+                        cuda_seconds=0, wall_seconds=0,
+                        download_bytes=estimated, artifact_bytes=0,
+                    )
+                except ResourceLimitError as exc:
+                    attempted_ledger = exc.ledger or pre_model_ledger
+                    return _persist_pre_model_stop(
+                        root, reservation_path, config=config, manifest_hash=manifest_hash,
+                        prepare_hash=prepare_hash, originating_commit=originating_commit,
+                        started_at=started_at, signature_record=signature_record,
+                        ledger=attempted_ledger, reason=f"teacher projected download exceeds resource budget: {exc}",
+                        detail={"phase": "model_source_preflight", "role": role,
+                                "estimated_download_bytes": estimated,
+                                "missing_files": missing_names,
+                                "model_inventory_status": "partially_authenticated",
+                                "authenticated_model_inventory_sha256": inventory_hashes},
+                    )
                 if shutil.disk_usage(repo_root).free < estimated + 2 * 1024**3:
-                    raise StageError("insufficient disk for missing pinned teacher metadata")
+                    return _persist_pre_model_stop(
+                        root, reservation_path, config=config, manifest_hash=manifest_hash,
+                        prepare_hash=prepare_hash, originating_commit=originating_commit,
+                        started_at=started_at, signature_record=signature_record,
+                        ledger=pre_model_ledger, reason="insufficient disk for missing pinned teacher metadata",
+                        detail={"phase": "teacher_download_preflight", "estimated_download_bytes": estimated,
+                                "missing_files": missing_names,
+                                "disk_free_bytes": shutil.disk_usage(repo_root).free,
+                                "model_inventory_status": "partially_authenticated",
+                                "authenticated_model_inventory_sha256": inventory_hashes},
+                    )
+                pre_model_ledger = projected_ledger
                 downloaded_bytes += estimated
                 download_started = _utc_now()
                 _append_stage_event(reservation_path, {
@@ -474,7 +816,16 @@ def run_calibration_stage(
         if frozen_signature.get("stage_signature") != signature_record.get("stage_signature"):
             raise StageError("calibration recovery signature differs from first reservation")
     stage_signature = signature_record["stage_signature"]
-    free_before = preflight_disk(root, reserve_bytes=2 * 1024**3)
+    try:
+        free_before = preflight_disk(root, reserve_bytes=2 * 1024**3)
+    except ResourceLimitError as exc:
+        return _persist_pre_model_stop(
+            root, reservation_path, config=config, manifest_hash=manifest_hash,
+            prepare_hash=prepare_hash, originating_commit=originating_commit,
+            started_at=started_at, signature_record=signature_record,
+            ledger=pre_model_ledger, reason=str(exc),
+            detail={"phase": "post_source_disk_preflight", "model_inventory_status": "authenticated"},
+        )
     rows = load_split(root, "calibration")
     if len(rows) != 60 or [row["id"] for row in rows] != expected_ids:
         raise StageError("loaded calibration rows differ from the authenticated manifest ID order")
@@ -538,96 +889,13 @@ def run_calibration_stage(
             total += journal.failure_count()
         return total
 
-    # Reconstruct every previously consumed item before enforcing current caps;
-    # otherwise an over-cap replay would escape without a durable stop record.
-    recovered_ledger = replace(
-        ResourceLedger.initial(), cuda_cap=2**63 - 1, wall_cap=2**63 - 1,
-        download_cap=2**63 - 1, artifact_cap=2**63 - 1,
+    # Reconstruct every prior item before enforcing caps so a replay overrun
+    # reaches the durable terminal path instead of escaping mid-recovery.
+    recovered_ledger = _replay_calibration_resources(
+        root, history, expected_ids=expected_ids, stage_signature=stage_signature,
+        config=config, additional_download_bytes=downloaded_bytes,
     )
-    prior_downloads = sum(int(item.get("reserved_bytes", 0)) for item in history if item.get("event_type") == "download_reservation") + downloaded_bytes
-    for raw_path in raw_directory.glob("*.jsonl"):
-        if raw_path.name.endswith(".attempts.jsonl"):
-            continue
-        for line in raw_path.read_text(encoding="utf-8").splitlines():
-            raw = json.loads(line)
-            startup = float(raw.get("worker_startup_wall_seconds", 0.0))
-            if startup:
-                recovered_ledger = recovered_ledger.charge_worker(
-                    cuda_seconds=None, wall_seconds=startup, download_bytes=0, artifact_bytes=0,
-                )
-            recovered_ledger = recovered_ledger.charge_worker(
-                cuda_seconds=raw.get("cuda_seconds"),
-                wall_seconds=float(raw.get("wall_seconds", 0.0)),
-                download_bytes=0,
-                artifact_bytes=len(line.encode("utf-8")) + 1,
-            )
-    for attempt_path in raw_directory.glob("*.attempts.jsonl"):
-        raw_path = Path(str(attempt_path)[:-len(".attempts.jsonl")])
-        parts = raw_path.stem.split("-")
-        if len(parts) < 3 or parts[-1] not in {"student", "teacher"}:
-            raise StageError("calibration attempt journal filename is invalid")
-        candidate = [int(parts[0]), int(parts[1])]
-        journal = RawRowJournal(raw_path, expected_ids=expected_ids, stage_signature=stage_signature)
-        events = journal.attempts()
-        grouped: dict[str, list[dict[str, Any]]] = {}
-        for index, event in enumerate(events):
-            grouped.setdefault(str(event.get("attempt_id", f"legacy-{index}")), []).append(event)
-        for attempt_events in grouped.values():
-            if any(event.get("status") == "worker_complete" for event in attempt_events):
-                continue
-            failed = [event for event in attempt_events if event.get("status") in {"failed", "worker_load_failed", "worker_close_failed"}]
-            if failed:
-                event = failed[-1]
-                recovered_ledger = recovered_ledger.charge_worker(
-                    cuda_seconds=event.get("cuda_seconds"),
-                    wall_seconds=float(event.get("worker_startup_wall_seconds", 0.0)) + float(event.get("wall_seconds", 0.0)),
-                    download_bytes=0, artifact_bytes=0,
-                )
-                continue
-            reservation_event = next((event for event in attempt_events if event.get("status") == "worker_reserved"), None)
-            if reservation_event is None:
-                raise StageError("incomplete calibration attempt lacks a durable reservation")
-            reserved = datetime.fromisoformat(str(reservation_event["reserved_at_utc"]).replace("Z", "+00:00"))
-            elapsed = max(0.0, (datetime.now(timezone.utc) - reserved).total_seconds())
-            known = 0.0
-            raw_startup = 0.0
-            for raw in journal.read():
-                if raw.get("attempt_id") == reservation_event.get("attempt_id"):
-                    raw_startup += float(raw.get("worker_startup_wall_seconds", 0.0))
-                    known += float(raw.get("wall_seconds", 0.0))
-            known += raw_startup
-            if not raw_startup:
-                known += sum(float(event.get("startup_wall_seconds", 0.0)) for event in attempt_events if event.get("status") == "worker_started")
-            uncommitted = max(0.0, elapsed - known)
-            if uncommitted:
-                recovered_ledger = recovered_ledger.charge_worker(
-                    cuda_seconds=None, wall_seconds=uncommitted,
-                    download_bytes=0, artifact_bytes=0,
-                )
-    recovered_ledger = recovered_ledger.charge_worker(
-        cuda_seconds=0, wall_seconds=0, download_bytes=prior_downloads, artifact_bytes=0,
-    )
-    current_artifacts = sum(
-        path.stat().st_size
-        for base in (root / "calibration", root / "stages")
-        for path in (base.rglob("*") if base.exists() else ())
-        if path.is_file() and (base == root / "calibration" or path.name.startswith("calibrate"))
-    )
-    failure_metadata_reserve = 1024**2
-    operational_artifact_cap = max(0, config.resources.artifact_bytes - failure_metadata_reserve)
-    recovered_ledger = replace(
-        recovered_ledger, artifact_bytes=current_artifacts,
-        cuda_cap=config.resources.cuda_seconds,
-        wall_cap=config.resources.wall_seconds,
-        download_cap=config.resources.download_bytes,
-        artifact_cap=operational_artifact_cap,
-    )
-    replay_over_caps = (
-        recovered_ledger.cuda_seconds > recovered_ledger.cuda_cap
-        or recovered_ledger.wall_seconds > recovered_ledger.wall_cap
-        or recovered_ledger.download_bytes > recovered_ledger.download_cap
-        or recovered_ledger.artifact_bytes > recovered_ledger.artifact_cap
-    )
+    replay_over_caps = _resource_limit_reason(recovered_ledger) is not None
 
     try:
         with WorkerLease(root / "stages" / "calibrate.worker.lock") as lease:
@@ -714,47 +982,11 @@ def run_calibration_stage(
             name: getattr(recovered_ledger, name)
             for name in recovered_ledger.__dataclass_fields__
         }
-    actual_artifacts = sum(
-        path.stat().st_size
-        for base in (root / "calibration", root / "stages")
-        for path in (base.rglob("*") if base.exists() else ())
-        if path.is_file() and (base == root / "calibration" or path.name.startswith("calibrate"))
-    )
     if result["status"] != "interrupted":
-        ended_at = _utc_now()
-        result["started_at_utc"] = started_at
-        result["ended_at_utc"] = ended_at
-        terminal_event = {
-            "status": result["status"], "event_type": "terminal", "event_id": uuid4().hex,
-            "stage_signature": stage_signature, "originating_git_commit": originating_commit,
-            "started_at_utc": started_at, "ended_at_utc": ended_at,
-        }
-        other_cap_exceeded = (
-            result["resource_ledger"]["cuda_seconds"] > config.resources.cuda_seconds
-            or result["resource_ledger"]["wall_seconds"] > config.resources.wall_seconds
-            or result["resource_ledger"]["download_bytes"] > config.resources.download_bytes
+        result = _persist_calibration_terminal(
+            root, reservation_path, result, started_at=started_at,
+            artifact_cap=config.resources.artifact_bytes,
         )
-        # Reserve at most 1 MiB inside the hard cap for bounded terminal failure
-        # metadata. Count the terminal event and final stage JSON before writing.
-        def terminal_artifact_total() -> int:
-            total = actual_artifacts + len(_canonical_bytes(terminal_event)) + 1
-            while True:
-                result["resource_ledger"]["artifact_bytes"] = total
-                updated = actual_artifacts + len(_canonical_bytes(terminal_event)) + 1 + len(_canonical_bytes(result)) + 1
-                if updated == total:
-                    return total
-                total = updated
-
-        projected = terminal_artifact_total()
-        if projected > operational_artifact_cap or other_cap_exceeded:
-            result["status"] = "stopped_environment"
-            result["reason"] = result.get("reason") or "calibration resource use reached a registered cap"
-            terminal_event["status"] = "stopped_environment"
-            # The emergency terminal record is bounded; preserve the complete
-            # attempted total, even if the journal was already over the cap.
-            projected = terminal_artifact_total()
-        _append_stage_event(reservation_path, terminal_event)
-        atomic_write_json(stage_path(root, "calibrate"), result)
     return result
 
 

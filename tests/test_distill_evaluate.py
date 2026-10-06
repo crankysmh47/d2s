@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from hashlib import sha256
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -51,13 +52,20 @@ def _worker_factory(role, candidate):
     return FakeWorker()
 
 
-def test_calibration_uses_prespecified_first_passing_budget_and_no_gold() -> None:
+@pytest.fixture
+def unexpired_test_ledger() -> ResourceLedger:
+    started = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return ResourceLedger(wall_started_utc=started)
+
+
+def test_calibration_uses_prespecified_first_passing_budget_and_no_gold(unexpired_test_ledger: ResourceLedger) -> None:
     rows = _rows()
     selected = calibrate_candidates(
         rows,
         candidates=((256, 768), (512, 1024), (768, 1536)),
         worker_factory=_worker_factory,
         minimum_eos=57,
+        ledger=unexpired_test_ledger,
     )
     assert selected["candidate"] == [256, 768]
     assert selected["status"] == "awaiting_review"
@@ -125,7 +133,7 @@ def test_raw_journal_rejects_modified_payload_even_with_signature(tmp_path: Path
         journal.read()
 
 
-def test_failed_row_is_persisted_via_explicit_failure_sink_before_retry() -> None:
+def test_failed_row_is_persisted_via_explicit_failure_sink_before_retry(unexpired_test_ledger: ResourceLedger) -> None:
     class Flaky:
         def __init__(self):
             self.calls = 0
@@ -164,6 +172,7 @@ def test_failed_row_is_persisted_via_explicit_failure_sink_before_retry() -> Non
         [{"id": "x", "question": "q?"}], candidates=((256, 768),),
         worker_factory=factory, minimum_eos=1, max_retries=2,
         failure_sink=FailureSink(),
+        ledger=unexpired_test_ledger,
     )
     assert result["status"] == "awaiting_review"
     assert failures[0]["status"] == "failed"
@@ -171,7 +180,7 @@ def test_failed_row_is_persisted_via_explicit_failure_sink_before_retry() -> Non
     assert reservations[0]["status"] == "worker_reserved"
 
 
-def test_aggregate_worker_retry_exhaustion_is_environment_stop() -> None:
+def test_aggregate_worker_retry_exhaustion_is_environment_stop(unexpired_test_ledger: ResourceLedger) -> None:
     class BrokenWorkerFactory:
         def __call__(self, role, candidate):
             raise RuntimeError("synthetic load failure")
@@ -187,6 +196,7 @@ def test_aggregate_worker_retry_exhaustion_is_environment_stop() -> None:
         [{"id": "x", "question": "q?"}], candidates=((256, 768),),
         worker_factory=BrokenWorkerFactory(), minimum_eos=1, max_retries=2,
         failure_sink=FailureSink(),
+        ledger=unexpired_test_ledger,
     )
     assert result["status"] == "stopped_environment"
 
@@ -221,13 +231,13 @@ def test_parser_review_gate_accepts_equivalent_numeric_alias_without_gold() -> N
     assert metrics["passes"]
 
 
-def test_resource_ledger_preserves_initial_charges_and_caps() -> None:
-    ledger = ResourceLedger.initial()
+def test_resource_ledger_preserves_initial_charges_and_caps(unexpired_test_ledger: ResourceLedger) -> None:
+    ledger = unexpired_test_ledger
     assert ledger.cuda_seconds == 1168
     assert ledger.download_bytes == 8066699435
     ledger = ledger.charge_worker(cuda_seconds=None, wall_seconds=10, download_bytes=0, artifact_bytes=0)
     assert ledger.cuda_seconds == 1178
-    assert ledger.wall_started_utc == "2026-10-03T08:01:07Z"
+    assert ledger.wall_started_utc == unexpired_test_ledger.wall_started_utc
     with pytest.raises(ResourceLimitError, match="CUDA"):
         ledger.charge_worker(cuda_seconds=86400, wall_seconds=0, download_bytes=0, artifact_bytes=0)
 
@@ -248,7 +258,7 @@ def test_resource_ledger_wall_is_global_elapsed_and_cap_error_carries_attempted_
     assert caught.value.ledger.artifact_bytes == 5
 
 
-def test_failed_durable_row_append_retries_same_id_without_advancing_prefix() -> None:
+def test_failed_durable_row_append_retries_same_id_without_advancing_prefix(unexpired_test_ledger: ResourceLedger) -> None:
     generated_ids = []
     saved = []
     class Worker:
@@ -269,13 +279,14 @@ def test_failed_durable_row_append_retries_same_id_without_advancing_prefix() ->
         [{"id": "same-id", "question": "q?"}], candidates=((256, 768),),
         worker_factory=lambda role, candidate: Worker(), minimum_eos=1,
         row_sink=sink, max_retries=2,
+        ledger=unexpired_test_ledger,
     )
     assert generated_ids == ["same-id", "same-id", "same-id"]
     assert len(saved) == 2
     assert result["status"] == "awaiting_review"
 
 
-def test_worker_close_failure_has_no_worker_complete_and_carries_cost() -> None:
+def test_worker_close_failure_has_no_worker_complete_and_carries_cost(unexpired_test_ledger: ResourceLedger) -> None:
     from ppmoe.distill.model import WorkerOwnershipError
     attempts = []
     failures = []
@@ -294,19 +305,25 @@ def test_worker_close_failure_has_no_worker_complete_and_carries_cost() -> None:
             [{"id": "x", "question": "q?"}], candidates=((256, 768),),
             worker_factory=lambda role, candidate: Worker(), minimum_eos=1,
             failure_sink=Sink(),
+            ledger=unexpired_test_ledger,
         )
     assert caught.value.ledger is not None
     assert not any(item["status"] == "worker_complete" for item in attempts)
     assert failures[-1]["status"] == "worker_close_failed"
 
 
-def test_last_durable_row_over_artifact_cap_preserves_attempted_total() -> None:
+def test_last_durable_row_over_artifact_cap_preserves_attempted_total(unexpired_test_ledger: ResourceLedger) -> None:
     saved = []
     class Worker:
         def generate(self, row, candidate):
             return {"text": "Final answer: 1", "stop_reason": "eos", "generated_tokens": 2,
                     "wall_seconds": 0, "cuda_seconds": 0}
-    ledger = ResourceLedger(artifact_bytes=0, artifact_cap=0)
+    ledger = ResourceLedger(
+        wall_seconds=unexpired_test_ledger.wall_seconds,
+        wall_started_utc=unexpired_test_ledger.wall_started_utc,
+        artifact_bytes=0,
+        artifact_cap=0,
+    )
     with pytest.raises(ResourceLimitError, match="artifact") as caught:
         calibrate_candidates(
             [{"id": "x", "question": "q?"}], candidates=((256, 768),),
