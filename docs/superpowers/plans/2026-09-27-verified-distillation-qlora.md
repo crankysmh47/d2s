@@ -94,6 +94,8 @@ The run ID binds preparation's active source list. Each later stage additionally
 
 Implementation freeze boundary: before calibration, finish reusable inference, complete-row validation and resource-accounting helpers in `answers.py`, `model.py` and `evaluate.py`. These modules/tests, source/config modules, config bytes and lock then stay immutable. Later `teacher.py`, `train.py` and `gates.py` consume them. `study.py` and CLI can add dispatch for previously unused stages, but cannot change an executed stage's implementation; bind each revision and originating Git commit so additions can be checked. Reopening a run validates its stored preparation signature and run-ID digest, not a new digest incorporating later code. The resource ledger includes the failed/successful feasibility attempts before calibration, never starts fresh at training.
 
+Reserve 1 MiB inside the artifact cap for terminal failure metadata before model work. A detected resource overrun is still terminal: retain the consumed bytes/cost truthfully and write only a bounded failure record (at most 1 MiB); do not overwrite evidence, pretend the cap passed, or run more inference/training. Wall time is elapsed from the original study start, not the sum of replayed historical phase durations. Complete-row prefixes advance only after durable persistence, and worker completion requires confirmed process exit.
+
 ## 3. Sequential implementation and execution tasks
 
 ### Task 0 — dependency and hardware feasibility

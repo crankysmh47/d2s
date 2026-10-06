@@ -12,14 +12,16 @@ Plan: [revision 2](superpowers/plans/2026-09-27-verified-distillation-qlora.md).
 
 ## Task status
 
+2026-10-06 resume: the original run's 48-hour wall deadline was **2026-10-05 08:01:07 UTC**. Live time at resume was 2026-10-06 18:53:11 UTC (298,324 elapsed seconds, exceeding the 172,800-second cap). The interruption was an agent usage limit, not a model-quality failure. No calibration rows, teacher pilot/corpus, or study training artifacts exist. Do not reset the clock or launch inference for this expired run. Finish the remaining engineering fix/review, write its durable environment stop, then request approval for any fresh bounded run.
+
 | Task | State | Evidence / next action |
 | --- | --- | --- |
 | 0 dependency/GPU feasibility | Passed | Reviewed/pushed fix `50164c1`; 28 covering CPU tests. Recovery1 exited 0 and result validator passed: student loss 1.262591, gradient norm 4.516547, 392 changed adapter tensors; peak allocated/reserved 13,761,504,256 / 14,222,884,864 bytes, below 14,926,938,112-byte cap. Teacher BF16 generated 16 synthetic tokens; peak allocated/reserved 8,087,715,840 / 8,090,812,416 bytes. No benchmark result is implied. |
 | 1 source/config/splits | Passed | Reviewed/pushed `323080d` + `4bd6d6a`; final preflight/prepare exited 0. Run `acd8dfc400c8f079d0403da5d4b981b8aac8e94226db8760f632c8307ff785c2`; all seven split counts exact, no exclusions. Root independently validated manifest/stage/run-ID/output hashes and copied retention chunks. |
-| 2 budget/scorer calibration | Fix round 2 in progress | Initial `c2fee6c`, first fixes `d97bb7f`; root full CPU 1,150 passed/5 skipped/3 deselected. Scoped review closed all eight initial findings, but found LFS-pointer authentication and terminal resource-reporting issues; existing student snapshot reuse also needs completion. Live metadata-only source checks identified these before GPU work. No benchmark output yet. |
-| 3 teacher qualification/corpus | Pending | No model benchmark or teacher data yet. |
-| 4 trainer/retention | Pending | No training yet. |
-| 5 discovery/confirmation/report | Pending | Only through passing gates. |
+| 2 budget/scorer calibration | Engineering fix round 3; run expired | `1180831` fixed LFS authentication, source reuse and later resource stops (73 focused tests passed/1 skipped). Saved round-2 review still identifies early disk/download resource exits without durable terminal records. Luna closes that boundary and adds expired-wall rejection before network/workers; no real calibration will run on the expired candidate. |
+| 3 teacher qualification/corpus | Not run; blocked by expired window | No model benchmark or teacher data. |
+| 4 trainer/retention | Not run; blocked by expired window | No study training. |
+| 5 discovery/confirmation/report | Not run; environment closeout only | Quality and transfer results remain unevaluated. |
 
 Record exact commands, commits, tests and gate artifacts as each task advances. GPU-active budget is 24 hours; failures/recoveries consume it. No training result is implied by completed code.
 
