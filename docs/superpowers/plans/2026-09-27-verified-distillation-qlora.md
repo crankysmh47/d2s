@@ -1,6 +1,8 @@
 # Option 2: verified teacher-rationale QLoRA study — execution plan
 
-**Status (2026-10-03): revision 2, execution authorized.** The user directed revision of the four identified defects and continuation of this plan. See [execution state](../../distillation-v1-execution-state.md). The V0–V3 recurrence decisions remain terminal and unchanged. Work on `exp`; never merge to `main` without a separate request.
+**Status (2026-10-07): revision 3, execution authorized; background runtime implementation pending.** The user directed revision of the four identified defects and continuation, then authorized a detached worker with 48 hours of cumulative worker execution excluding review/agent downtime. See [execution state](../../distillation-v1-execution-state.md). The V0–V3 recurrence decisions remain terminal and unchanged. Work on `exp`; never merge to `main` without a separate request.
+
+**Runtime addendum:** The original prepared run's calendar deadline expired before calibration; preserve its clock and `stopped_environment` closeout. The approved new execution namespace uses up to 172,800 active stage-job seconds, not calendar elapsed time, and carries all previous CUDA/download costs. Its [design](../specs/2026-10-07-distillation-background-runtime-design.md) and [implementation plan](2026-10-07-distillation-background-runtime.md) override only wall-budget semantics and source/output execution identity for new-mode runs. All scientific choices and other caps below remain binding. No background worker has yet been launched.
 
 > For an implementer: read this entire plan before editing. Work in ordered tasks; run the named tests and gates before advancing. A failed scientific gate is terminal for this candidate, not permission to tune and rerun. Preserve unrelated `task-14*.md` files and every recurrence artifact. Keep a signed, hash-linked run ledger and write a report even for a stop.
 

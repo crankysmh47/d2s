@@ -84,7 +84,8 @@ Detailed [Option 2 plan](docs/superpowers/plans/2026-09-27-verified-distillation
 - [x] Finish/review deterministic sources, sealed partitions, and authenticated retention provenance; signed prepare passed and root verified its hashes.
 - [x] Check the October 6 resume against the original wall deadline; the October 5 deadline expired during the usage-limit interruption, before any calibration answers.
 - [ ] Finish the early-resource terminal-reporting fix/review and preserve the expired run as `stopped_environment`; do not silently reset its budget.
-- [ ] Obtain approval for a fresh bounded execution window before any calibration, pilot, corpus or study training; keep the scientific protocol and old evidence unchanged.
+- [x] Obtain approval for a fresh execution policy: user selected 48 cumulative worker hours excluding review/agent downtime on October 7; old window remains expired, cumulative CUDA/download costs carry forward.
+- [ ] Implement/review the [detached runtime plan](docs/superpowers/plans/2026-10-07-distillation-background-runtime.md), verify native Windows process containment/durable logs, then register one distinct execution and launch calibration. No new worker launched yet.
 - [ ] Freeze/review the final-answer scorer, calibrate output budget on 60 exclusive questions, and obtain blind Luna extraction reviews before the teacher viability pilot.
 - [ ] Require teacher viability, >=800 matched verified targets, and the independent rationale-quality audit before any study training.
 - [ ] Only if all gates pass: run paired discovery, one confirmation, sealed evaluation, and independent report. Stop on any registered no-go.

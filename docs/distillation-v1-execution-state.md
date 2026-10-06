@@ -1,6 +1,6 @@
 # Verified-distillation QLoRA execution state
 
-Plan: [revision 2](superpowers/plans/2026-09-27-verified-distillation-qlora.md). Branch `exp`; starting commit `8309b2a`. Authorized 2026-10-03 by the user's instruction to revise and continue. No separate design file: the scientific contract in sections 1–2 of the plan is binding.
+Plan: [revision 3](superpowers/plans/2026-09-27-verified-distillation-qlora.md). Branch `exp`; starting commit `8309b2a`. Authorized 2026-10-03 by the user's instruction to revise and continue. The scientific contract in sections 1–2 is binding; the [background runtime design](superpowers/specs/2026-10-07-distillation-background-runtime-design.md) governs the separately approved new execution policy.
 
 ## Decisions before output
 
@@ -12,7 +12,9 @@ Plan: [revision 2](superpowers/plans/2026-09-27-verified-distillation-qlora.md).
 
 ## Task status
 
-2026-10-06 resume: the original run's 48-hour wall deadline was **2026-10-05 08:01:07 UTC**. Live time at resume was 2026-10-06 18:53:11 UTC (298,324 elapsed seconds, exceeding the 172,800-second cap). The interruption was an agent usage limit, not a model-quality failure. No calibration rows, teacher pilot/corpus, or study training artifacts exist. Do not reset the clock or launch inference for this expired run. Finish the remaining engineering fix/review, write its durable environment stop, then request approval for any fresh bounded run.
+2026-10-07: user authorized detached compute and selected **48 hours of actual worker execution**, excluding review/agent downtime. A separate execution namespace will retain the 24-cumulative-CUDA-hour cap and historical costs; the old run will not be reset. [Runner implementation plan](superpowers/plans/2026-10-07-distillation-background-runtime.md) written; implementation/native verification/launch still pending. Independent reviews remain required; at `awaiting_review` the worker exits and its active clock stops. PC must remain powered and awake. No calibration/pilot/corpus or study training has run.
+
+2026-10-06 resume: the original run's 48-hour wall deadline was **2026-10-05 08:01:07 UTC**. Live time at resume was 2026-10-06 18:53:11 UTC (298,324 elapsed seconds, exceeding the 172,800-second cap). The interruption was an agent usage limit, not a model-quality failure. No calibration rows, teacher pilot/corpus, or study training artifacts exist. Do not reset the clock or launch inference for this expired run. Finish the remaining engineering fix/review and write its durable environment stop. The subsequent October 7 approval above permits a separate active-runtime execution, not modification of this historical deadline.
 
 | Task | State | Evidence / next action |
 | --- | --- | --- |
