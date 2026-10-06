@@ -1,6 +1,6 @@
 # Current work queue
 
-Updated 2026-10-03. Historical V0 requirements and stop rules: [plan.md](plan.md). This file is a summary, not permission to skip gates.
+Updated 2026-10-07. Historical V0 requirements and stop rules: [plan.md](plan.md). This file is a summary, not permission to skip gates.
 
 Historical recurrence execution contract: [docs/superpowers/plans/2026-09-11-pretrained-recurrence-execution.md](docs/superpowers/plans/2026-09-11-pretrained-recurrence-execution.md). It is not an active queue after V0–V3 stops.
 
