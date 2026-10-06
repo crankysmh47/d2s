@@ -338,7 +338,8 @@ def test_execution_replay_bounds_incomplete_worker_to_settled_job_interval(monke
     })
     append_event(root, {
         "type": "job_settled", "execution_id": "execution-id", "attempt_id": "old-job",
-        "stage": "calibrate", "started_monotonic_ns": old_start,
+        "stage": "calibrate", "prior_active_seconds": 0,
+        "started_monotonic_ns": old_start,
         "ended_monotonic_ns": old_end, "settled_active_seconds": 4,
         "supervisor_pid": 123, "supervisor_created_utc": "2026-10-07T00:00:00.000000Z",
         "stage_pid": 456, "stage_created_utc": "2026-10-07T00:00:01.000000Z",

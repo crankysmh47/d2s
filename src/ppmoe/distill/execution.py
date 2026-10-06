@@ -410,6 +410,8 @@ def validate_job_intervals(execution_root: Path) -> dict[str, dict[str, Any]]:
             or type(started_ns) is not int or started_ns != state["started_monotonic_ns"]
             or type(ended_ns) is not int or ended_ns < started_ns
             or type(settled_seconds) is not int
+            or type(payload.get("prior_active_seconds")) is not int
+            or payload["prior_active_seconds"] != state["prior_active_seconds"]
             or type(payload.get("supervisor_pid")) is not int
             or type(payload.get("stage_pid")) is not int
             or payload.get("supervisor_pid") != start.get("supervisor_pid")

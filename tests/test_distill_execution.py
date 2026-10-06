@@ -352,6 +352,28 @@ def test_validate_job_intervals_returns_ordered_cumulative_state(tmp_path: Path)
     assert intervals["current"]["settlement"] is None
 
 
+@pytest.mark.parametrize("mutation", ["missing", "wrong", "bool"])
+def test_validate_job_intervals_rejects_settlement_prior_mismatch(tmp_path: Path, mutation: str):
+    from ppmoe.distill.execution import validate_job_intervals
+
+    first = _lifecycle_start("execution-id", "first", prior=0, started=1_000_000_000)
+    second = _lifecycle_start("execution-id", "second", prior=1, started=3_000_000_000)
+    second_settlement = _lifecycle_settlement(second, ended=4_000_000_000)
+    if mutation == "missing":
+        del second_settlement["prior_active_seconds"]
+    elif mutation == "wrong":
+        second_settlement["prior_active_seconds"] = 0
+    else:
+        second_settlement["prior_active_seconds"] = True
+    root = _execution_with_events(tmp_path, [
+        first, _lifecycle_settlement(first, ended=2_000_000_000),
+        second, second_settlement,
+    ])
+
+    with pytest.raises(ValueError):
+        validate_job_intervals(root)
+
+
 @pytest.mark.parametrize("corruption", [
     "reset_prior", "inflated_prior", "overlap", "duplicate_id", "out_of_order_settlement",
     "changed_identity", "settled_mismatch", "monotonic_regression",
