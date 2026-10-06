@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import importlib.util
 from hashlib import sha256
 from pathlib import Path
+import shutil
+import sys
+from types import SimpleNamespace
+import time
 
 import pytest
 
@@ -68,6 +73,348 @@ def test_calibration_code_signature_binds_task1_and_task2_transitive_files(tmp_p
         "src/ppmoe/distill/study.py", "src/ppmoe/distill/model.py",
         "src/ppmoe/distill/answers.py", "src/ppmoe/distill/evaluate.py", "uv.lock",
     }
+
+
+def _copy_calibration_test_repo(repo_root: Path) -> Path:
+    source_repo = Path(__file__).parents[1]
+    from ppmoe.distill.study import ACTIVE_FILES, CALIBRATION_FILES
+
+    active = set(ACTIVE_FILES) | set(CALIBRATION_FILES) | {
+        "src/ppmoe/distill/execution.py",
+        "tests/test_distill_execution.py",
+        "tests/test_distill_evaluate.py",
+        "tests/test_distill_study.py",
+        "scripts/run_distillation_v1.py",
+    }
+    for relative in active | {"uv.lock", "pyproject.toml"}:
+        source = source_repo / relative
+        target = repo_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+    return repo_root / "configs/distillation-v1.toml"
+
+
+def _make_execution_source(tmp_path: Path, config, *, with_terminal: bool = True) -> Path:
+    from ppmoe.distill.config import canonical_config
+    from ppmoe.distill.data import sha256_file
+
+    source_signature = {
+        "config": canonical_config(config),
+        "runtime_identity": {"python": "3.11-fixture", "cuda": "fixture-authenticated"},
+    }
+    run_id = sha256(json.dumps(source_signature, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    root = tmp_path / run_id
+    root.mkdir(parents=True)
+    rows = [
+        {"id": f"id-{i}", "dataset": "gsm8k", "source_split": "train",
+         "question": f"Unique calibration question {i}?", "gold": str(i), "solution": "fixture"}
+        for i in range(60)
+    ]
+    data_path = root / "data" / "calibration.jsonl"
+    data_path.parent.mkdir()
+    data_path.write_text("".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows), encoding="utf-8")
+    retention = root / "retention" / "retention-chunks.jsonl"
+    retention.parent.mkdir()
+    retention.write_text('{"index":0}\n', encoding="utf-8")
+    manifest = {
+        "schema_version": 1, "run_id": run_id,
+        "config": canonical_config(config), "source_signature": source_signature,
+        "retention": {"chunks_sha256": sha256_file(retention)},
+        "splits": {
+            "calibration": {"path": "data/calibration.jsonl", "sha256": sha256_file(data_path),
+                            "count": 60, "ordered_ids": [row["id"] for row in rows]},
+            "retention_chunks": {"path": "retention/retention-chunks.jsonl", "sha256": sha256_file(retention),
+                                 "count": 1, "ordered_ids": [0]},
+        },
+    }
+    manifest_path = root / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    prepare_path = root / "stages" / "prepare.json"
+    prepare_path.parent.mkdir()
+    signature_hash = sha256(json.dumps(source_signature, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    prepare_path.write_text(json.dumps({
+        "stage": "prepare", "status": "passed", "run_id": run_id,
+        "manifest_sha256": sha256_file(manifest_path),
+        "source_signature_sha256": signature_hash,
+        "retention_chunks_sha256": sha256_file(retention),
+    }, sort_keys=True), encoding="utf-8")
+    if with_terminal:
+        terminal_path = root / "stages" / "calibrate.json"
+        terminal_path.write_text(json.dumps({
+            "stage": "calibrate", "status": "stopped_environment",
+            "reason": "global wall-time budget expired", "run_id": run_id,
+            "task1_manifest_sha256": sha256_file(manifest_path),
+            "task1_prepare_sha256": sha256_file(prepare_path),
+            "signature": {
+                "predecessors": {"prepare_manifest_sha256": sha256_file(manifest_path),
+                                 "prepare_stage_sha256": sha256_file(prepare_path)},
+                "code_signatures": {"configs/distillation-v1.toml": sha256_file(Path(__file__).parents[1] / "configs/distillation-v1.toml")},
+            },
+        }, sort_keys=True), encoding="utf-8")
+    return root
+
+
+def test_execution_calibration_keeps_source_read_only_and_accounts_only_active_time(monkeypatch, tmp_path: Path) -> None:
+    from ppmoe.distill.config import load_config
+    from ppmoe.distill import execution
+    from ppmoe.distill.execution import ActiveJobContext, append_event, execution_stage_signature, register_execution
+    from ppmoe.distill.study import run_calibration_stage
+
+    repo_root = tmp_path / "repo"
+    config_path = _copy_calibration_test_repo(repo_root)
+    config = load_config(config_path)
+    source_root = _make_execution_source(tmp_path / "source", config)
+    monkeypatch.setattr("ppmoe.distill.study.TASK1_RUN_ID", source_root.name)
+    monkeypatch.setattr("ppmoe.distill.study.TASK1_MANIFEST_SHA256", sha256((source_root / "manifest.json").read_bytes()).hexdigest())
+    monkeypatch.setattr("ppmoe.distill.study.TASK1_PREPARE_SHA256", sha256((source_root / "stages/prepare.json").read_bytes()).hexdigest())
+    monkeypatch.setattr(execution, "TASK1_STOP_SHA256", sha256((source_root / "stages/calibrate.json").read_bytes()).hexdigest())
+    runtime_identity = json.loads((source_root / "manifest.json").read_text())["source_signature"]["runtime_identity"]
+    monkeypatch.setattr("ppmoe.distill.study.feasibility_runtime_identity", lambda *args, **kwargs: runtime_identity)
+    monkeypatch.setattr("ppmoe.distill.study.preflight_disk", lambda *args, **kwargs: 100 * 1024**3)
+    monkeypatch.setattr("ppmoe.distill.study._git_commit", lambda *args, **kwargs: "a" * 40)
+
+    for model_dir in (
+        repo_root / ".cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots" / config.student.revision,
+        repo_root / ".cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots" / config.teacher.revision,
+    ):
+        model_dir.mkdir(parents=True)
+        (model_dir / "config.json").write_text("{}", encoding="utf-8")
+
+    class FakeApi:
+        def model_info(self, repo_id, *, revision, files_metadata):
+            return SimpleNamespace(sha=revision, siblings=[SimpleNamespace(rfilename="config.json", size=2)])
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(
+        HfApi=FakeApi,
+        snapshot_download=lambda **kwargs: pytest.fail("complete local model cache must avoid downloads"),
+        hf_hub_download=lambda **kwargs: pytest.fail("complete local model cache must avoid downloads"),
+    ))
+    monkeypatch.setattr("ppmoe.distill.study.authenticate_model_snapshot", lambda *args, **kwargs: {"files": []})
+    monkeypatch.setattr("ppmoe.distill.study.pinned_eos_token_ids", lambda *args, **kwargs: (2,))
+
+    execution_root = register_execution(source_root, tmp_path / "executions", repo_root=repo_root, config_path=config_path)
+    signature = execution_stage_signature(execution_root, "calibrate", repo_root=repo_root)
+    supervisor_created = "2026-10-07T00:00:00.000000Z"
+    stage_created = "2026-10-07T00:00:01.000000Z"
+    started_ns = time.monotonic_ns() - 1_000_000_000
+    job_payload = {
+        "type": "job_started", "execution_id": execution_root.name,
+        "attempt_id": "attempt-1", "stage": "calibrate",
+        "prior_active_seconds": 500, "started_monotonic_ns": started_ns,
+        "supervisor_pid": 123, "supervisor_created_utc": supervisor_created,
+        "stage_pid": os.getpid(), "stage_created_utc": stage_created,
+        "stage_signature": signature,
+    }
+    append_event(execution_root, job_payload)
+    job_bytes = json.dumps(job_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    (execution_root / "current-job.json").write_bytes((json.dumps({
+        "payload": job_payload, "payload_sha256": sha256(job_bytes).hexdigest(),
+    }, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"))
+    monkeypatch.setattr("ppmoe.distill.execution.process_creation_utc", lambda pid: {
+        123: supervisor_created, os.getpid(): stage_created,
+    }.get(pid))
+    context = ActiveJobContext(
+        execution_root.name, "attempt-1", "calibrate", 500, started_ns, 123,
+        supervisor_created, signature,
+    )
+
+    class Worker:
+        startup_wall_seconds = 0
+        def generate(self, row, candidate):
+            return {"text": "Final answer: 1", "stop_reason": "eos", "generated_tokens": 2,
+                    "wall_seconds": 0.001, "cuda_seconds": 0}
+        def close(self):
+            pass
+
+    source_before = {path.relative_to(source_root): path.read_bytes() for path in source_root.rglob("*") if path.is_file()}
+    result = run_calibration_stage(
+        source_root, config, repo_root=repo_root, config_path=config_path,
+        execution_root=execution_root, active_job=context,
+        worker_loader=lambda *args: Worker(),
+    )
+    source_after = {path.relative_to(source_root): path.read_bytes() for path in source_root.rglob("*") if path.is_file()}
+    assert result["status"] == "awaiting_review"
+    assert result["wall_mode"] == "active_job"
+    assert result["resource_ledger"]["wall_seconds"] < 600
+    assert result["resource_ledger"]["cuda_seconds"] >= 1168
+    assert result["resource_ledger"]["download_bytes"] == 8066699435
+    assert source_after == source_before
+    assert (execution_root / "calibration" / "raw").is_dir()
+    assert (execution_root / "calibration" / "review").is_dir()
+    assert (execution_root / "stages" / "calibrate.json").is_file()
+
+
+@pytest.mark.parametrize("wall_mode", ["legacy_calendar", "active_job"])
+def test_wall_refresh_crossing_cap_persists_terminal_stop(monkeypatch, tmp_path: Path, wall_mode: str) -> None:
+    from datetime import datetime, timedelta, timezone
+    from dataclasses import replace
+    from ppmoe.distill.config import load_config
+    from ppmoe.distill.evaluate import ResourceLedger
+    from ppmoe.distill.study import _refresh_pre_model_ledger
+
+    config = load_config(Path(__file__).parents[1] / "configs/distillation-v1.toml")
+    if wall_mode == "active_job":
+        ledger = replace(
+            ResourceLedger(wall_seconds=172799, wall_cap=172800),
+            wall_mode="active_job", settled_wall_seconds=172799,
+            current_job_started_monotonic_ns=1_000_000_000,
+        )
+        monkeypatch.setattr("ppmoe.distill.evaluate.time.monotonic_ns", lambda: 2_000_000_001)
+    else:
+        started = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat().replace("+00:00", "Z")
+        ledger = ResourceLedger(wall_seconds=172799, wall_cap=172800, wall_started_utc=started)
+    output = tmp_path / wall_mode
+    (output / "stages").mkdir(parents=True)
+    updated, stop = _refresh_pre_model_ledger(
+        output, output / "stages" / "calibrate-reservations.jsonl",
+        config=config, manifest_hash="m" * 64, prepare_hash="p" * 64,
+        originating_commit="a" * 40, started_at="2026-10-07T00:00:00.000000Z",
+        signature_record={"stage_signature": "s" * 64, "predecessors": {}},
+        ledger=ledger, detail={"phase": "preflight"},
+    )
+    saved = json.loads((output / "stages" / "calibrate.json").read_text(encoding="utf-8"))
+    assert stop is not None and stop["status"] == "stopped_environment"
+    assert updated.wall_seconds > updated.wall_cap
+    assert saved["status"] == "stopped_environment"
+    assert "wall-time" in saved["reason"]
+    assert saved["resource_ledger"]["wall_mode"] == wall_mode
+
+
+def test_legacy_expired_calibration_stops_before_hub_or_worker(monkeypatch, tmp_path: Path) -> None:
+    import sys
+    from ppmoe.distill.config import load_config
+    from ppmoe.distill.study import run_calibration_stage
+
+    repo_root = tmp_path / "repo"
+    config_path = _copy_calibration_test_repo(repo_root)
+    config = load_config(config_path)
+    source_root = _make_execution_source(tmp_path / "source", config, with_terminal=False)
+    monkeypatch.setattr("ppmoe.distill.study.TASK1_RUN_ID", source_root.name)
+    monkeypatch.setattr("ppmoe.distill.study.TASK1_MANIFEST_SHA256", sha256((source_root / "manifest.json").read_bytes()).hexdigest())
+    monkeypatch.setattr("ppmoe.distill.study.TASK1_PREPARE_SHA256", sha256((source_root / "stages/prepare.json").read_bytes()).hexdigest())
+    monkeypatch.setattr("ppmoe.distill.study._git_commit", lambda *args, **kwargs: "a" * 40)
+    runtime_identity = json.loads((source_root / "manifest.json").read_text())["source_signature"]["runtime_identity"]
+    monkeypatch.setattr("ppmoe.distill.study.feasibility_runtime_identity", lambda *args, **kwargs: runtime_identity)
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(
+        HfApi=lambda: pytest.fail("expired legacy run reached Hub metadata"),
+        snapshot_download=lambda **kwargs: pytest.fail("expired legacy run reached download"),
+        hf_hub_download=lambda **kwargs: pytest.fail("expired legacy run reached download"),
+    ))
+    result = run_calibration_stage(
+        source_root, config, repo_root=repo_root, config_path=config_path,
+        worker_loader=lambda *args: pytest.fail("expired legacy run constructed a worker"),
+    )
+    assert result["status"] == "stopped_environment"
+    assert "wall-time" in result["reason"]
+    assert not (source_root / "calibration" / "raw").exists()
+
+
+def test_separate_execution_cli_requires_paired_args_before_validation(tmp_path: Path) -> None:
+    with pytest.raises(StageError, match="supplied together"):
+        run_stage("calibrate", tmp_path / "config.toml", tmp_path / ("a" * 64), execution_root=tmp_path / "exec")
+
+
+@pytest.mark.parametrize("has_completed_row", [False, True])
+def test_execution_replay_bounds_incomplete_worker_to_settled_job_interval(monkeypatch, tmp_path: Path, has_completed_row: bool) -> None:
+    from ppmoe.distill.config import load_config
+    from ppmoe.distill.evaluate import RawRowJournal
+    from ppmoe.distill.execution import ActiveJobContext, append_event
+    from ppmoe.distill.study import _execution_job_intervals, _replay_calibration_resources
+
+    root = tmp_path / "execution"
+    (root / "calibration" / "raw").mkdir(parents=True)
+    (root / "stages").mkdir()
+    (root / "execution.json").write_text('{"execution_id":"execution-id"}', encoding="utf-8")
+    (root / "events.jsonl").touch()
+    old_start = 1_000_000_000
+    old_end = 5_000_000_000
+    append_event(root, {
+        "type": "job_started", "execution_id": "execution-id", "attempt_id": "old-job",
+        "stage": "calibrate", "prior_active_seconds": 10,
+        "started_monotonic_ns": old_start,
+        "supervisor_pid": 123, "supervisor_created_utc": "2026-10-07T00:00:00.000000Z",
+        "stage_pid": 456, "stage_created_utc": "2026-10-07T00:00:01.000000Z",
+        "stage_signature": "s" * 64,
+    })
+    append_event(root, {
+        "type": "job_settled", "execution_id": "execution-id", "attempt_id": "old-job",
+        "stage": "calibrate", "started_monotonic_ns": old_start,
+        "ended_monotonic_ns": old_end, "settled_active_seconds": 14,
+        "supervisor_pid": 123, "supervisor_created_utc": "2026-10-07T00:00:00.000000Z",
+        "stage_pid": 456, "stage_created_utc": "2026-10-07T00:00:01.000000Z",
+        "stage_signature": "s" * 64,
+    })
+    current = ActiveJobContext(
+        "execution-id", "new-job", "calibrate", 14, 100_000_000_000,
+        123, "2026-10-07T00:00:00.000000Z", "t" * 64,
+    )
+    append_event(root, {
+        "type": "job_started", "execution_id": "execution-id", "attempt_id": "new-job",
+        "stage": "calibrate", "prior_active_seconds": 14,
+        "started_monotonic_ns": current.started_monotonic_ns,
+        "supervisor_pid": current.supervisor_pid,
+        "supervisor_created_utc": current.supervisor_created_utc,
+        "stage_pid": 456, "stage_created_utc": "2026-10-07T00:00:01.000000Z",
+        "stage_signature": current.stage_signature,
+    })
+    journal = RawRowJournal(
+        root / "calibration" / "raw" / "256-768-student.jsonl",
+        expected_ids=["id-1"], stage_signature="s" * 64,
+    )
+    journal.record_attempt({
+        "attempt_id": "worker-1", "job_attempt_id": "old-job",
+        "reserved_monotonic_ns": 2_000_000_000,
+        "reserved_at_utc": "2026-10-01T00:00:00.000000Z",
+        "status": "worker_reserved", "role": "student", "candidate": [256, 768],
+        "stage_signature": "s" * 64,
+    })
+    journal.record_attempt({
+        "attempt_id": "worker-1", "job_attempt_id": "old-job",
+        "status": "worker_started", "startup_wall_seconds": 1.0,
+        "stage_signature": "s" * 64,
+    })
+    if has_completed_row:
+        journal.append({
+            "source_id": "id-1", "role": "student", "candidate": [256, 768],
+            "stage_signature": "s" * 64, "attempt_id": "worker-1",
+            "wall_seconds": 1.0, "cuda_seconds": None,
+            "worker_startup_wall_seconds": 1.0,
+        })
+    monkeypatch.setattr("ppmoe.distill.study.time.monotonic_ns", lambda: 101_000_000_000)
+    intervals = _execution_job_intervals(root, current)
+    config = load_config(Path(__file__).parents[1] / "configs/distillation-v1.toml")
+
+    ledger = _replay_calibration_resources(
+        root, [], expected_ids=["id-1"], stage_signature="s" * 64,
+        config=config, active_job=current,
+        settled_job_intervals=intervals,
+        inherited_artifact_bytes=50,
+    )
+    replayed_again = _replay_calibration_resources(
+        root, [], expected_ids=["id-1"], stage_signature="s" * 64,
+        config=config, active_job=current,
+        settled_job_intervals=intervals,
+        inherited_artifact_bytes=50,
+    )
+    assert ledger.cuda_seconds == replayed_again.cuda_seconds == 1171
+    assert ledger.download_bytes == replayed_again.download_bytes == 8066699435
+    assert ledger.wall_seconds == replayed_again.wall_seconds == 15
+    assert ledger.artifact_bytes == replayed_again.artifact_bytes == 50 + sum(
+        path.stat().st_size for path in root.rglob("*") if path.is_file()
+    )
+    journal.record_attempt({
+        "attempt_id": "worker-2", "job_attempt_id": "unsettled-job",
+        "reserved_monotonic_ns": 2_000_000_000,
+        "reserved_at_utc": "2026-10-01T00:00:00.000000Z",
+        "status": "worker_reserved", "role": "student", "candidate": [256, 768],
+        "stage_signature": "s" * 64,
+    })
+    with pytest.raises(StageError, match="no settled owner interval"):
+        _replay_calibration_resources(
+            root, [], expected_ids=["id-1"], stage_signature="s" * 64,
+            config=config, active_job=current,
+            settled_job_intervals=intervals, inherited_artifact_bytes=50,
+        )
 
 
 def test_prepare_requires_explicit_run_root_before_source_scan(monkeypatch) -> None:

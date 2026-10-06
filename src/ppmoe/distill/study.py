@@ -5,12 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from hashlib import sha256
 import json
+import math
 import os
 from pathlib import Path
 import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from datetime import datetime, timezone
 from uuid import uuid4
 from typing import Any, Mapping, Sequence
@@ -210,6 +212,8 @@ def calibration_stage_signature(
     model_inventory_sha256: dict[str, str] | None = None,
     effective_eos_token_ids: Sequence[int] | None = None,
     originating_git_commit: str | None = None,
+    execution_stage_signature: str | None = None,
+    execution_policy_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Bind Task 2 execution code to the authenticated immutable Task 1 checkpoint."""
     code_signatures: dict[str, str] = {}
@@ -231,6 +235,9 @@ def calibration_stage_signature(
         "originating_git_commit": originating_git_commit or _git_commit(repo_root),
         "code_signatures": code_signatures,
     }
+    if execution_stage_signature is not None:
+        signature["execution_stage_signature"] = execution_stage_signature
+        signature["execution_policy_sha256"] = execution_policy_sha256
     signature["stage_signature"] = sha256(_canonical_bytes(signature)).hexdigest()
     return signature
 
@@ -279,6 +286,8 @@ def _initial_resource_ledger() -> ResourceLedger:
 
 
 def _calibration_artifact_bytes(root: Path) -> int:
+    if (root / "execution.json").is_file():
+        return sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
     return sum(
         path.stat().st_size
         for base in (root / "calibration", root / "stages")
@@ -287,11 +296,115 @@ def _calibration_artifact_bytes(root: Path) -> int:
     )
 
 
+def _execution_job_intervals(
+    root: Path, active_job: Any,
+) -> dict[str, tuple[int, int]]:
+    """Validate lifecycle ownership and return settled monotonic job intervals."""
+    from .execution import read_events
+
+    manifest = json.loads((root / "execution.json").read_text(encoding="utf-8"))
+    execution_id = manifest.get("execution_id")
+    starts: dict[str, Mapping[str, Any]] = {}
+    settled: dict[str, tuple[int, int]] = {}
+
+    def valid_utc(value: Any) -> bool:
+        if not isinstance(value, str) or not value.endswith("Z"):
+            return False
+        try:
+            parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+        except ValueError:
+            return False
+        return parsed.isoformat(timespec="microseconds").replace("+00:00", "Z") == value
+
+    for event in read_events(root):
+        payload = event["payload"]
+        kind = payload.get("type")
+        if kind not in {"job_started", "job_settled"}:
+            continue
+        attempt_id = payload.get("attempt_id")
+        if (
+            payload.get("execution_id") != execution_id
+            or payload.get("stage") != "calibrate"
+            or not isinstance(attempt_id, str)
+            or not attempt_id
+        ):
+            raise StageError("execution job event has invalid execution/stage/attempt identity")
+        if kind == "job_started":
+            prior = payload.get("prior_active_seconds")
+            started_ns = payload.get("started_monotonic_ns")
+            supervisor_pid = payload.get("supervisor_pid")
+            stage_pid = payload.get("stage_pid")
+            if (
+                attempt_id in starts or type(prior) is not int or prior < 0
+                or type(started_ns) is not int or started_ns < 0
+                or type(supervisor_pid) is not int or supervisor_pid <= 0
+                or type(stage_pid) is not int or stage_pid <= 0
+                or not valid_utc(payload.get("supervisor_created_utc"))
+                or not valid_utc(payload.get("stage_created_utc"))
+                or not isinstance(payload.get("stage_signature"), str)
+                or len(payload["stage_signature"]) != 64
+            ):
+                raise StageError("execution job start event has invalid or duplicate runtime fields")
+            starts[attempt_id] = payload
+        else:
+            start = starts.get(attempt_id)
+            started_ns = payload.get("started_monotonic_ns")
+            ended_ns = payload.get("ended_monotonic_ns")
+            settled_seconds = payload.get("settled_active_seconds")
+            if (
+                start is None or attempt_id in settled
+                or started_ns != start.get("started_monotonic_ns")
+                or type(ended_ns) is not int or ended_ns < started_ns
+                or type(settled_seconds) is not int or settled_seconds < 0
+                or payload.get("supervisor_pid") != start.get("supervisor_pid")
+                or payload.get("supervisor_created_utc") != start.get("supervisor_created_utc")
+                or payload.get("stage_pid") != start.get("stage_pid")
+                or payload.get("stage_created_utc") != start.get("stage_created_utc")
+                or payload.get("stage_signature") != start.get("stage_signature")
+            ):
+                raise StageError("execution job settlement has invalid ownership or interval")
+            duration_seconds = (ended_ns - started_ns + 999_999_999) // 1_000_000_000
+            if settled_seconds != start["prior_active_seconds"] + duration_seconds:
+                raise StageError("execution job settlement cumulative runtime does not match its interval")
+            settled[attempt_id] = (started_ns, ended_ns)
+    if active_job.attempt_id not in starts or active_job.attempt_id in settled:
+        raise StageError("current active job lacks one authenticated unmatched start event")
+    current = starts[active_job.attempt_id]
+    if (
+        current.get("started_monotonic_ns") != active_job.started_monotonic_ns
+        or current.get("prior_active_seconds") != active_job.prior_active_seconds
+        or current.get("supervisor_pid") != active_job.supervisor_pid
+        or current.get("supervisor_created_utc") != active_job.supervisor_created_utc
+        or current.get("stage_signature") != active_job.stage_signature
+    ):
+        raise StageError("current active-job clock differs from its authenticated start event")
+    if set(starts) - set(settled) != {active_job.attempt_id}:
+        raise StageError("execution contains an unclosed noncurrent job interval")
+    return settled
+
+
+def _validate_active_cost_record(record: Mapping[str, Any]) -> None:
+    for field in ("wall_seconds", "worker_startup_wall_seconds", "startup_wall_seconds", "cuda_seconds"):
+        value = record.get(field)
+        if value is None and field == "cuda_seconds":
+            continue
+        if field not in record:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise StageError(f"active worker resource field {field} is invalid")
+
+
 def _replay_calibration_resources(
     root: Path, history: Sequence[Mapping[str, Any]], *, expected_ids: Sequence[str],
     stage_signature: str | None, config: Any, additional_download_bytes: int = 0,
+    active_job: Any | None = None, inherited_artifact_bytes: int = 0,
+    settled_job_intervals: Mapping[str, tuple[int, int]] | None = None,
 ) -> ResourceLedger:
     """Rebuild durable charges once without enforcing caps mid-replay."""
+    if active_job is not None:
+        for start_ns, end_ns in (settled_job_intervals or {}).values():
+            if type(start_ns) is not int or type(end_ns) is not int or start_ns < 0 or end_ns < start_ns:
+                raise StageError("settled job interval is invalid")
     ledger = replace(
         _initial_resource_ledger(), cuda_cap=2**63 - 1, wall_cap=2**63 - 1,
         download_cap=2**63 - 1, artifact_cap=2**63 - 1,
@@ -308,6 +421,8 @@ def _replay_calibration_resources(
         journal = RawRowJournal(raw_path, expected_ids=expected_ids, stage_signature=str(stage_signature))
         journals[raw_path] = journal
         for raw in journal.read():
+            if active_job is not None:
+                _validate_active_cost_record(raw)
             startup = float(raw.get("worker_startup_wall_seconds", 0.0))
             if startup:
                 ledger = ledger.charge_worker(
@@ -331,6 +446,9 @@ def _replay_calibration_resources(
             raw_path, expected_ids=expected_ids, stage_signature=stage_signature,
         )
         events = journal.attempts()
+        if active_job is not None:
+            for event in events:
+                _validate_active_cost_record(event)
         grouped: dict[str, list[dict[str, Any]]] = {}
         for index, event in enumerate(events):
             grouped.setdefault(str(event.get("attempt_id", f"legacy-{index}")), []).append(event)
@@ -352,8 +470,26 @@ def _replay_calibration_resources(
             reservation_event = next((event for event in attempt_events if event.get("status") == "worker_reserved"), None)
             if reservation_event is None:
                 raise StageError("incomplete calibration attempt lacks a durable reservation")
-            reserved = datetime.fromisoformat(str(reservation_event["reserved_at_utc"]).replace("Z", "+00:00"))
-            elapsed = max(0.0, (datetime.now(timezone.utc) - reserved).total_seconds())
+            if active_job is not None:
+                owner_job = reservation_event.get("job_attempt_id")
+                reserved_ns = reservation_event.get("reserved_monotonic_ns")
+                if not isinstance(owner_job, str) or not isinstance(reserved_ns, int) or reserved_ns < 0:
+                    raise StageError("incomplete worker reservation lacks monotonic job ownership")
+                if owner_job == active_job.attempt_id:
+                    interval_start = active_job.started_monotonic_ns
+                    interval_end = time.monotonic_ns()
+                else:
+                    interval = (settled_job_intervals or {}).get(owner_job)
+                    if interval is None:
+                        raise StageError("incomplete worker reservation has no settled owner interval")
+                    interval_start, interval_end = interval
+                if reserved_ns < interval_start or reserved_ns > interval_end:
+                    raise StageError("incomplete worker reservation falls outside its owner job interval")
+                elapsed_ns = max(0, interval_end - reserved_ns)
+                elapsed = (elapsed_ns + 999_999_999) // 1_000_000_000
+            else:
+                reserved = datetime.fromisoformat(str(reservation_event["reserved_at_utc"]).replace("Z", "+00:00"))
+                elapsed = max(0.0, (datetime.now(timezone.utc) - reserved).total_seconds())
             known = raw_startup = 0.0
             for raw in journal.read():
                 if raw.get("attempt_id") == reservation_event.get("attempt_id"):
@@ -361,10 +497,16 @@ def _replay_calibration_resources(
                     known += float(raw.get("wall_seconds", 0.0))
             known += raw_startup
             if not raw_startup:
-                known += sum(
+                startup_wall = sum(
                     float(event.get("startup_wall_seconds", 0.0))
                     for event in attempt_events if event.get("status") == "worker_started"
                 )
+                if startup_wall:
+                    ledger = ledger.charge_worker(
+                        cuda_seconds=None, wall_seconds=startup_wall,
+                        download_bytes=0, artifact_bytes=0,
+                    )
+                    known += startup_wall
             uncommitted = max(0.0, elapsed - known)
             if uncommitted:
                 ledger = ledger.charge_worker(
@@ -379,14 +521,24 @@ def _replay_calibration_resources(
         cuda_seconds=0, wall_seconds=0,
         download_bytes=prior_downloads + additional_download_bytes, artifact_bytes=0,
     )
-    return replace(
+    ledger = replace(
         ledger,
-        artifact_bytes=_calibration_artifact_bytes(root),
+        artifact_bytes=inherited_artifact_bytes + _calibration_artifact_bytes(root),
         cuda_cap=config.resources.cuda_seconds,
         wall_cap=config.resources.wall_seconds,
         download_cap=config.resources.download_bytes,
         artifact_cap=max(0, config.resources.artifact_bytes - 1024**2),
     )
+    if active_job is not None:
+        from .execution import active_elapsed_seconds
+        ledger = replace(
+            ledger,
+            wall_mode="active_job",
+            settled_wall_seconds=active_job.prior_active_seconds,
+            current_job_started_monotonic_ns=active_job.started_monotonic_ns,
+            wall_seconds=active_elapsed_seconds(active_job),
+        )
+    return ledger
 
 
 def _resource_limit_reason(ledger: ResourceLedger) -> str | None:
@@ -417,13 +569,14 @@ def _persist_calibration_terminal(
     }
     operational_cap = max(0, artifact_cap - 1024**2)
     artifacts_before_terminal = _calibration_artifact_bytes(root)
+    inherited_artifact_bytes = int(result.get("inherited_artifact_bytes", 0))
 
     def projected_total() -> int:
-        total = artifacts_before_terminal + len(_canonical_bytes(terminal_event)) + 1
+        total = inherited_artifact_bytes + artifacts_before_terminal + len(_canonical_bytes(terminal_event)) + 1
         while True:
             result["resource_ledger"]["artifact_bytes"] = total
             updated = (
-                artifacts_before_terminal + len(_canonical_bytes(terminal_event)) + 1
+                inherited_artifact_bytes + artifacts_before_terminal + len(_canonical_bytes(terminal_event)) + 1
                 + len(_canonical_bytes(result)) + 1
             )
             if updated == total:
@@ -474,6 +627,7 @@ def _persist_pre_model_stop(
         "signature": dict(signature_record), "task1_originating_commit": TASK1_ORIGINATING_COMMIT,
         "originating_git_commit": originating_commit,
         "task1_manifest_sha256": manifest_hash, "task1_prepare_sha256": prepare_hash,
+        "wall_mode": ledger.wall_mode,
         "resource_caps": {
             "cuda_seconds": config.resources.cuda_seconds,
             "wall_seconds": config.resources.wall_seconds,
@@ -482,12 +636,51 @@ def _persist_pre_model_stop(
         },
         "resource_ledger": {name: getattr(ledger, name) for name in ledger.__dataclass_fields__},
     }
+    if (root / "execution.json").is_file():
+        result["execution_id"] = root.name
+        result["source_run_id"] = signature_record.get("source_run_id")
+        result["execution_policy_sha256"] = signature_record.get("execution_policy_sha256")
+        execution_manifest = json.loads((root / "execution.json").read_text(encoding="utf-8"))
+        baseline = execution_manifest.get("artifact_baseline", {})
+        result["inherited_artifact_bytes"] = int(baseline.get("source_bytes", 0)) + sum(
+            int(item.get("size_bytes", 0)) for item in baseline.get("feasibility_files", [])
+        )
     if (detail or {}).get("authenticated_model_inventory_sha256"):
         result["authenticated_model_inventory_sha256"] = dict(detail["authenticated_model_inventory_sha256"])
     return _persist_calibration_terminal(
         root, reservation_path, result, started_at=started_at,
         artifact_cap=config.resources.artifact_bytes,
     )
+
+
+def _refresh_pre_model_ledger(
+    root: Path, reservation_path: Path, *, config: Any, manifest_hash: str,
+    prepare_hash: str, originating_commit: str, started_at: str,
+    signature_record: Mapping[str, Any], ledger: ResourceLedger,
+    detail: Mapping[str, Any],
+) -> tuple[ResourceLedger, dict[str, Any] | None]:
+    """Refresh the wall boundary and durably stop if the refresh crosses a cap."""
+    try:
+        refreshed = ledger.charge_worker(
+            cuda_seconds=0, wall_seconds=0, download_bytes=0, artifact_bytes=0,
+        )
+    except ResourceLimitError as exc:
+        attempted = exc.ledger or ledger
+        return attempted, _persist_pre_model_stop(
+            root, reservation_path, config=config, manifest_hash=manifest_hash,
+            prepare_hash=prepare_hash, originating_commit=originating_commit,
+            started_at=started_at, signature_record=signature_record,
+            ledger=attempted, reason=str(exc), detail=detail,
+        )
+    reason = _resource_limit_reason(refreshed)
+    if reason:
+        return refreshed, _persist_pre_model_stop(
+            root, reservation_path, config=config, manifest_hash=manifest_hash,
+            prepare_hash=prepare_hash, originating_commit=originating_commit,
+            started_at=started_at, signature_record=signature_record,
+            ledger=refreshed, reason=reason, detail=detail,
+        )
+    return refreshed, None
 
 
 def _read_stage_events(path: Path) -> list[dict[str, Any]]:
@@ -498,11 +691,44 @@ def _read_stage_events(path: Path) -> list[dict[str, Any]]:
 
 def run_calibration_stage(
     run_root: Path, config: Any, *, repo_root: Path, config_path: Path,
-    worker_loader: Any | None = None,
+    worker_loader: Any | None = None, execution_root: Path | None = None,
+    active_job: Any | None = None,
 ) -> dict[str, Any]:
     """Run only the gold-free blind calibration against the reviewed Task 1 run."""
-    root = Path(run_root)
-    if root.name != TASK1_RUN_ID:
+    source_root = Path(run_root)
+    new_execution = execution_root is not None or active_job is not None
+    if (execution_root is None) != (active_job is None):
+        raise StageError("execution root and active-job context must be supplied together")
+    root = Path(execution_root) if execution_root is not None else source_root
+    execution_manifest: dict[str, Any] | None = None
+    launch_signature: str | None = None
+    execution_policy_sha256: str | None = None
+    inherited_artifact_bytes = 0
+    settled_job_intervals: dict[str, tuple[int, int]] | None = None
+    if new_execution:
+        from .execution import (
+            execution_stage_signature as sign_execution_stage,
+            load_active_job,
+            validate_execution,
+        )
+        execution_manifest = validate_execution(root, repo_root=repo_root, config_path=config_path)
+        if execution_manifest.get("source_root") != str(source_root.resolve()):
+            raise StageError("execution source root differs from the selected prepared source")
+        if active_job.execution_id != execution_manifest.get("execution_id") or active_job.stage != "calibrate":
+            raise StageError("active-job identity does not match the registered calibration execution")
+        owned_context = load_active_job(root, active_job.attempt_id, stage="calibrate")
+        if owned_context != active_job:
+            raise StageError("active-job context differs from the authenticated current job")
+        settled_job_intervals = _execution_job_intervals(root, active_job)
+        launch_signature = sign_execution_stage(root, "calibrate", repo_root=repo_root)
+        if active_job.stage_signature != launch_signature:
+            raise StageError("active-job prelaunch stage signature drifted")
+        execution_policy_sha256 = sha256(_canonical_bytes(execution_manifest["policy"])).hexdigest()
+        baseline = execution_manifest.get("artifact_baseline", {})
+        inherited_artifact_bytes = int(baseline.get("source_bytes", 0)) + sum(
+            int(item.get("size_bytes", 0)) for item in baseline.get("feasibility_files", [])
+        )
+    if source_root.name != TASK1_RUN_ID:
         raise StageError("calibrate requires the reviewed Task 1 prepared run ID")
     if stage_path(root, "calibrate").exists():
         raise FileExistsError("calibrate stage is immutable and already exists")
@@ -531,9 +757,11 @@ def run_calibration_stage(
     runtime_identity = feasibility_runtime_identity(
         repo_root, vram_reserve_bytes=config.resources.vram_reserve_bytes
     )
-    manifest = validate_prepared_run(root, runtime_identity=runtime_identity)
-    manifest_path = root / "manifest.json"
-    prepare_path = stage_path(root, "prepare")
+    if execution_manifest is not None and runtime_identity != execution_manifest.get("runtime_identity"):
+        raise StageError("execution runtime identity differs from authenticated Task 0 feasibility")
+    manifest = validate_prepared_run(source_root, runtime_identity=runtime_identity)
+    manifest_path = source_root / "manifest.json"
+    prepare_path = stage_path(source_root, "prepare")
     manifest_hash = sha256_file(manifest_path)
     prepare_hash = sha256_file(prepare_path)
     if manifest_hash != TASK1_MANIFEST_SHA256 or prepare_hash != TASK1_PREPARE_SHA256:
@@ -553,6 +781,8 @@ def run_calibration_stage(
         repo_root, source_run_id=TASK1_RUN_ID,
         manifest_sha256=manifest_hash, prepare_sha256=prepare_hash,
         originating_git_commit=originating_commit,
+        execution_stage_signature=launch_signature,
+        execution_policy_sha256=execution_policy_sha256,
     )
     signature_record = existing_signature or pre_model_signature
     current_active_signatures = _file_signatures(repo_root)
@@ -570,6 +800,8 @@ def run_calibration_stage(
     pre_model_ledger = _replay_calibration_resources(
         root, history, expected_ids=expected_ids,
         stage_signature=signature_record.get("stage_signature"), config=config,
+        active_job=active_job, inherited_artifact_bytes=inherited_artifact_bytes,
+        settled_job_intervals=settled_job_intervals,
     )
     resource_reason = _resource_limit_reason(pre_model_ledger)
     if resource_reason:
@@ -580,18 +812,15 @@ def run_calibration_stage(
             ledger=pre_model_ledger, reason=resource_reason,
             detail={"phase": "preflight", "model_inventory_status": "not_authenticated"},
         )
-    pre_model_ledger = pre_model_ledger.charge_worker(
-        cuda_seconds=0, wall_seconds=0, download_bytes=0, artifact_bytes=0,
+    pre_model_ledger, refresh_stop = _refresh_pre_model_ledger(
+        root, reservation_path, config=config, manifest_hash=manifest_hash,
+        prepare_hash=prepare_hash, originating_commit=originating_commit,
+        started_at=started_at, signature_record=signature_record,
+        ledger=pre_model_ledger,
+        detail={"phase": "disk_preflight", "model_inventory_status": "not_authenticated"},
     )
-    resource_reason = _resource_limit_reason(pre_model_ledger)
-    if resource_reason:
-        return _persist_pre_model_stop(
-            root, reservation_path, config=config, manifest_hash=manifest_hash,
-            prepare_hash=prepare_hash, originating_commit=originating_commit,
-            started_at=started_at, signature_record=signature_record,
-            ledger=pre_model_ledger, reason=resource_reason,
-            detail={"phase": "disk_preflight", "model_inventory_status": "not_authenticated"},
-        )
+    if refresh_stop is not None:
+        return refresh_stop
     try:
         free_before = preflight_disk(root, reserve_bytes=2 * 1024**3)
     except ResourceLimitError as exc:
@@ -615,19 +844,16 @@ def run_calibration_stage(
         metadata = api.model_info(pin.repo_id, revision=pin.revision, files_metadata=True)
         if getattr(metadata, "sha", None) != pin.revision:
             raise StageError(f"Hub pin authentication failed for {role}")
-        pre_model_ledger = pre_model_ledger.charge_worker(
-            cuda_seconds=0, wall_seconds=0, download_bytes=0, artifact_bytes=0,
+        pre_model_ledger, refresh_stop = _refresh_pre_model_ledger(
+            root, reservation_path, config=config, manifest_hash=manifest_hash,
+            prepare_hash=prepare_hash, originating_commit=originating_commit,
+            started_at=started_at, signature_record=signature_record,
+            ledger=pre_model_ledger,
+            detail={"phase": "model_metadata", "role": role,
+                    "model_inventory_status": "not_authenticated"},
         )
-        resource_reason = _resource_limit_reason(pre_model_ledger)
-        if resource_reason:
-            return _persist_pre_model_stop(
-                root, reservation_path, config=config, manifest_hash=manifest_hash,
-                prepare_hash=prepare_hash, originating_commit=originating_commit,
-                started_at=started_at, signature_record=signature_record,
-                ledger=pre_model_ledger, reason=resource_reason,
-                detail={"phase": "model_metadata", "role": role,
-                        "model_inventory_status": "not_authenticated"},
-            )
+        if refresh_stop is not None:
+            return refresh_stop
         if role == "student":
             expected_names = {item.rfilename for item in metadata.siblings}
             cache_path = (
@@ -799,6 +1025,8 @@ def run_calibration_stage(
         model_inventory_sha256=inventory_hashes,
         effective_eos_token_ids=eos_ids,
         originating_git_commit=originating_commit,
+        execution_stage_signature=launch_signature,
+        execution_policy_sha256=execution_policy_sha256,
     )
     current_active_signatures = _file_signatures(repo_root)
     for event in history:
@@ -826,7 +1054,7 @@ def run_calibration_stage(
             ledger=pre_model_ledger, reason=str(exc),
             detail={"phase": "post_source_disk_preflight", "model_inventory_status": "authenticated"},
         )
-    rows = load_split(root, "calibration")
+    rows = load_split(source_root, "calibration")
     if len(rows) != 60 or [row["id"] for row in rows] != expected_ids:
         raise StageError("loaded calibration rows differ from the authenticated manifest ID order")
     if any(set(row) != {"id", "dataset", "source_split", "question"} for row in rows):
@@ -894,6 +1122,8 @@ def run_calibration_stage(
     recovered_ledger = _replay_calibration_resources(
         root, history, expected_ids=expected_ids, stage_signature=stage_signature,
         config=config, additional_download_bytes=downloaded_bytes,
+        active_job=active_job, inherited_artifact_bytes=inherited_artifact_bytes,
+        settled_job_intervals=settled_job_intervals,
     )
     replay_over_caps = _resource_limit_reason(recovered_ledger) is not None
 
@@ -924,6 +1154,7 @@ def run_calibration_stage(
                     failure_sink=FailureSink(),
                     ledger=recovered_ledger,
                     max_retries=config.resources.phase_retries,
+                    active_job=active_job,
                 )
     except (ResourceLimitError, WorkerOwnershipError) as exc:
         stopped_ledger = getattr(exc, "ledger", None) or recovered_ledger
@@ -957,6 +1188,12 @@ def run_calibration_stage(
     result["task1_originating_commit"] = TASK1_ORIGINATING_COMMIT
     result["originating_git_commit"] = originating_commit
     result["effective_eos_token_ids"] = list(eos_ids)
+    result["wall_mode"] = recovered_ledger.wall_mode
+    if execution_manifest is not None:
+        result["execution_id"] = execution_manifest["execution_id"]
+        result["source_run_id"] = source_root.name
+        result["execution_policy_sha256"] = execution_policy_sha256
+        result["inherited_artifact_bytes"] = inherited_artifact_bytes
     result["resource_caps"] = {
         "cuda_seconds": config.resources.cuda_seconds,
         "wall_seconds": config.resources.wall_seconds,
@@ -972,7 +1209,7 @@ def run_calibration_stage(
         for role in ("student", "teacher"):
             selected_rows.extend(journal_for(role, result["candidate"]).read())
         review_directory = safe_output_path(root, root / "calibration" / "review")
-        private_gold = _authenticated_private_gold(root, manifest, expected_ids)
+        private_gold = _authenticated_private_gold(source_root, manifest, expected_ids)
         review = export_review_packets(rows, selected_rows, review_directory, seed=stage_signature, private_gold_by_id=private_gold)
         result["review_packet"] = str(Path(review["packets"][0]).relative_to(root))
         result["review_packet_sha256"] = review["packet_sha256"]
@@ -1085,11 +1322,18 @@ def run_stage(
     stage: str,
     config_path: Path = DEFAULT_CONFIG,
     run_root: Path | None = None,
+    *,
+    execution_root: Path | None = None,
+    attempt_id: str | None = None,
 ) -> StageRecord:
     if stage not in KNOWN_STAGES:
         raise StageError(f"unknown stage {stage}")
     if stage not in IMPLEMENTED_STAGES:
         raise StageError(f"stage {stage} is registered but not implemented")
+    if (execution_root is None) != (attempt_id is None):
+        raise StageError("--execution-root and --attempt-id must be supplied together")
+    if execution_root is not None and stage != "calibrate":
+        raise StageError("separate execution mode currently supports calibrate only")
     if stage == "prepare" and run_root is None:
         raise StageError("prepare requires an explicit run-root")
     repo_root = Path(__file__).resolve().parents[3]
@@ -1104,12 +1348,38 @@ def run_stage(
             selected_root = repo_root / selected_root
         selected_root = safe_output_path(selected_root.parent, selected_root)
         config = load_config(config_path)
-        result = run_calibration_stage(
-            selected_root, config, repo_root=repo_root, config_path=config_path,
-        )
-        manifest = json.loads((selected_root / "manifest.json").read_text(encoding="utf-8"))
+        if execution_root is None:
+            result = run_calibration_stage(
+                selected_root, config, repo_root=repo_root, config_path=config_path,
+            )
+            output_root = selected_root
+            manifest = json.loads((selected_root / "manifest.json").read_text(encoding="utf-8"))
+            record_run_id = selected_root.name
+        else:
+            from .execution import load_active_job, validate_execution
+            selected_execution = Path(execution_root)
+            if not selected_execution.is_absolute():
+                selected_execution = repo_root / selected_execution
+            selected_execution = safe_output_path(selected_execution.parent, selected_execution)
+            active_job = load_active_job(selected_execution, str(attempt_id), stage="calibrate")
+            execution_manifest = validate_execution(
+                selected_execution, repo_root=repo_root, config_path=config_path,
+            )
+            result = run_calibration_stage(
+                selected_root, config, repo_root=repo_root, config_path=config_path,
+                execution_root=selected_execution, active_job=active_job,
+            )
+            output_root = selected_execution
+            manifest = json.loads((selected_root / "manifest.json").read_text(encoding="utf-8"))
+            record_run_id = execution_manifest["execution_id"]
+            result = {
+                **result,
+                "source_run_id": selected_root.name,
+                "execution_id": execution_manifest["execution_id"],
+                "execution_policy_sha256": sha256(_canonical_bytes(execution_manifest["policy"])).hexdigest(),
+            }
         return StageRecord(
-            stage, selected_root.name, str(selected_root), result["status"],
+            stage, record_run_id, str(output_root), result["status"],
             manifest.get("split_counts", {}), manifest.get("source_counts", {}),
             manifest.get("exclusion_counts", {}), result,
         )

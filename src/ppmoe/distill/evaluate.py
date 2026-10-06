@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from fractions import Fraction
 from hashlib import sha256
@@ -16,6 +16,7 @@ import uuid
 from typing import Any, Callable, Mapping, Sequence
 
 from .answers import extract_final_numeric
+from .execution import ActiveJobContext, active_elapsed_seconds
 from .model import WorkerOwnershipError
 
 
@@ -34,6 +35,9 @@ class ResourceLedger:
     download_bytes: int = 8066699435
     artifact_bytes: int = 0
     wall_started_utc: str = "2026-10-03T08:01:07Z"
+    wall_mode: str = "legacy_calendar"
+    settled_wall_seconds: int = 0
+    current_job_started_monotonic_ns: int | None = None
     cuda_cap: int = 86400
     wall_cap: int = 172800
     download_cap: int = 21474836480
@@ -51,8 +55,16 @@ class ResourceLedger:
     ) -> "ResourceLedger":
         # When synchronized device timing is absent, wall time is the upper bound.
         cuda_charge = int((wall_seconds if cuda_seconds is None else cuda_seconds) + 0.999999)
-        wall_start = datetime.fromisoformat(self.wall_started_utc.replace("Z", "+00:00"))
-        wall_elapsed = max(0, int((datetime.now(timezone.utc) - wall_start).total_seconds()))
+        if self.wall_mode == "active_job":
+            if self.current_job_started_monotonic_ns is None:
+                raise ValueError("active-job wall ledger has no monotonic start")
+            elapsed_ns = max(0, time.monotonic_ns() - self.current_job_started_monotonic_ns)
+            wall_elapsed = self.settled_wall_seconds + (elapsed_ns + 999_999_999) // 1_000_000_000
+        elif self.wall_mode == "legacy_calendar":
+            wall_start = datetime.fromisoformat(self.wall_started_utc.replace("Z", "+00:00"))
+            wall_elapsed = max(0, int((datetime.now(timezone.utc) - wall_start).total_seconds()))
+        else:
+            raise ValueError(f"unknown wall accounting mode: {self.wall_mode}")
         next_ledger = ResourceLedger(
             cuda_seconds=self.cuda_seconds + cuda_charge,
             # Global wall is elapsed since the single phase origin. Replayed
@@ -61,6 +73,9 @@ class ResourceLedger:
             download_bytes=self.download_bytes + download_bytes,
             artifact_bytes=self.artifact_bytes + artifact_bytes,
             wall_started_utc=self.wall_started_utc,
+            wall_mode=self.wall_mode,
+            settled_wall_seconds=self.settled_wall_seconds,
+            current_job_started_monotonic_ns=self.current_job_started_monotonic_ns,
             cuda_cap=self.cuda_cap,
             wall_cap=self.wall_cap,
             download_cap=self.download_cap,
@@ -259,11 +274,20 @@ def calibrate_candidates(
     failure_count_loader: Callable[[str, Sequence[int]], int] | None = None,
     ledger: ResourceLedger | None = None, max_retries: int = 2,
     failure_sink: Any | None = None,
+    active_job: ActiveJobContext | None = None,
 ) -> dict[str, Any]:
     """Try the registered budgets in order, student then teacher, without exposing gold."""
     if not rows or len({row["id"] for row in rows}) != len(rows):
         raise ValueError("calibration rows must have unique IDs")
     current_ledger = ledger or ResourceLedger.initial()
+    if active_job is not None:
+        current_ledger = replace(
+            current_ledger,
+            wall_mode="active_job",
+            settled_wall_seconds=active_job.prior_active_seconds,
+            current_job_started_monotonic_ns=active_job.started_monotonic_ns,
+            wall_seconds=active_elapsed_seconds(active_job),
+        )
     attempt_records: list[dict[str, Any]] = []
     for candidate in candidates:
         pair = [int(candidate[0]), int(candidate[1])]
@@ -289,6 +313,9 @@ def calibrate_candidates(
                     "role": role, "candidate": pair, "stage_signature": stage_signature,
                     "reserved_at_utc": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
                 }
+                if active_job is not None:
+                    reservation["job_attempt_id"] = active_job.attempt_id
+                    reservation["reserved_monotonic_ns"] = time.monotonic_ns()
                 if failure_sink is not None:
                     failure_sink.record_attempt(reservation)
                 try:

@@ -258,6 +258,23 @@ def test_resource_ledger_wall_is_global_elapsed_and_cap_error_carries_attempted_
     assert caught.value.ledger.artifact_bytes == 5
 
 
+def test_active_wall_refresh_crossing_cap_carries_attempted_totals(monkeypatch) -> None:
+    from dataclasses import replace
+
+    ledger = replace(
+        ResourceLedger(wall_seconds=172799, wall_cap=172800),
+        wall_mode="active_job",
+        settled_wall_seconds=172799,
+        current_job_started_monotonic_ns=1_000_000_000,
+    )
+    monkeypatch.setattr("ppmoe.distill.evaluate.time.monotonic_ns", lambda: 2_000_000_001)
+    with pytest.raises(ResourceLimitError, match="wall-time") as caught:
+        ledger.charge_worker(cuda_seconds=0, wall_seconds=0, download_bytes=0, artifact_bytes=0)
+    assert caught.value.ledger.wall_seconds == 172801
+    assert caught.value.ledger.wall_mode == "active_job"
+    assert caught.value.ledger.settled_wall_seconds == 172799
+
+
 def test_failed_durable_row_append_retries_same_id_without_advancing_prefix(unexpired_test_ledger: ResourceLedger) -> None:
     generated_ids = []
     saved = []
