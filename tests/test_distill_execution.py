@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from hashlib import sha256
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -16,6 +18,7 @@ from ppmoe.distill.execution import (
     register_execution,
     validate_execution,
     load_active_job,
+    process_creation_utc,
 )
 
 
@@ -174,7 +177,7 @@ def test_load_active_job_requires_supervisor_and_contained_stage_identity(tmp_pa
         "execution_id": execution_root.name,
         "attempt_id": "attempt-1",
         "stage": "calibrate",
-        "prior_active_seconds": 4,
+        "prior_active_seconds": 0,
         "started_monotonic_ns": 900,
         "supervisor_pid": supervisor_pid,
         "supervisor_created_utc": supervisor_created,
@@ -191,7 +194,7 @@ def test_load_active_job_requires_supervisor_and_contained_stage_identity(tmp_pa
         supervisor_pid: supervisor_created,
         payload["stage_pid"]: stage_created,
     }.get(pid))
-    assert load_active_job(execution_root, "attempt-1", stage="calibrate").prior_active_seconds == 4
+    assert load_active_job(execution_root, "attempt-1", stage="calibrate").prior_active_seconds == 0
 
     monkeypatch.setattr(execution, "process_creation_utc", lambda pid: {
         supervisor_pid: supervisor_created,
@@ -291,3 +294,91 @@ def test_load_active_job_rejects_unrelated_stage_pid(tmp_path: Path, monkeypatch
     }.get(pid))
     with pytest.raises(ValueError, match="contained stage process"):
         load_active_job(execution_root, "attempt-1", stage="calibrate")
+
+
+def test_process_creation_utc_requires_live_process_and_reads_current_process():
+    assert process_creation_utc(__import__("os").getpid()) is not None
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    assert child.wait(timeout=10) == 0
+    assert process_creation_utc(child.pid) is None
+
+
+def _lifecycle_start(execution_id: str, attempt_id: str, *, prior: int, started: int) -> dict[str, object]:
+    return {
+        "type": "job_started", "execution_id": execution_id, "attempt_id": attempt_id,
+        "stage": "calibrate", "prior_active_seconds": prior,
+        "started_monotonic_ns": started,
+        "supervisor_pid": 123, "supervisor_created_utc": "2026-10-07T00:00:00.000000Z",
+        "stage_pid": 456, "stage_created_utc": "2026-10-07T00:00:01.000000Z",
+        "stage_signature": "a" * 64,
+    }
+
+
+def _lifecycle_settlement(start: dict[str, object], *, ended: int) -> dict[str, object]:
+    duration = (ended - int(start["started_monotonic_ns"]) + 999_999_999) // 1_000_000_000
+    return {
+        **start, "type": "job_settled", "ended_monotonic_ns": ended,
+        "settled_active_seconds": int(start["prior_active_seconds"]) + duration,
+    }
+
+
+def _execution_with_events(tmp_path: Path, events: list[dict[str, object]]) -> Path:
+    root = tmp_path / "execution"
+    root.mkdir()
+    (root / "execution.json").write_bytes(_canonical({"execution_id": "execution-id"}) + b"\n")
+    (root / "events.jsonl").touch()
+    for event in events:
+        append_event(root, event)
+    return root
+
+
+def test_validate_job_intervals_returns_ordered_cumulative_state(tmp_path: Path):
+    from ppmoe.distill.execution import validate_job_intervals
+
+    first = _lifecycle_start("execution-id", "first", prior=0, started=1_000_000_000)
+    second = _lifecycle_start("execution-id", "second", prior=2, started=5_000_000_000)
+    current = _lifecycle_start("execution-id", "current", prior=3, started=8_000_000_000)
+    root = _execution_with_events(tmp_path, [
+        first, _lifecycle_settlement(first, ended=3_000_000_000),
+        second, _lifecycle_settlement(second, ended=6_000_000_000), current,
+    ])
+
+    intervals = validate_job_intervals(root)
+
+    assert intervals["first"]["settled_active_seconds"] == 2
+    assert intervals["second"]["prior_active_seconds"] == 2
+    assert intervals["second"]["settled_active_seconds"] == 3
+    assert intervals["current"]["prior_active_seconds"] == 3
+    assert intervals["current"]["settlement"] is None
+
+
+@pytest.mark.parametrize("corruption", [
+    "reset_prior", "inflated_prior", "overlap", "duplicate_id", "out_of_order_settlement",
+    "changed_identity", "settled_mismatch", "monotonic_regression",
+])
+def test_validate_job_intervals_rejects_broken_lifecycle_chain(tmp_path: Path, corruption: str):
+    from ppmoe.distill.execution import validate_job_intervals
+
+    first = _lifecycle_start("execution-id", "first", prior=0, started=1_000_000_000)
+    settlement = _lifecycle_settlement(first, ended=3_000_000_000)
+    second_prior = 0 if corruption == "reset_prior" else 3 if corruption == "inflated_prior" else 2
+    second_started = 1_500_000_000 if corruption == "overlap" else 3_000_000_000
+    second = _lifecycle_start("execution-id", "second", prior=second_prior, started=second_started)
+    if corruption == "duplicate_id":
+        second["attempt_id"] = "first"
+    if corruption == "changed_identity":
+        settlement["stage_signature"] = "b" * 64
+    if corruption == "settled_mismatch":
+        settlement["settled_active_seconds"] = 9
+    if corruption == "monotonic_regression":
+        second_started = 500_000_000
+        second["started_monotonic_ns"] = second_started
+    events = [first]
+    if corruption == "out_of_order_settlement":
+        events.extend([_lifecycle_settlement(second, ended=second_started + 1_000_000_000), settlement, second])
+    else:
+        events.extend([settlement, second])
+    root = _execution_with_events(tmp_path, events)
+
+    with pytest.raises(ValueError):
+        validate_job_intervals(root)

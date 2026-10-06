@@ -200,7 +200,7 @@ def test_execution_calibration_keeps_source_read_only_and_accounts_only_active_t
     job_payload = {
         "type": "job_started", "execution_id": execution_root.name,
         "attempt_id": "attempt-1", "stage": "calibrate",
-        "prior_active_seconds": 500, "started_monotonic_ns": started_ns,
+        "prior_active_seconds": 0, "started_monotonic_ns": started_ns,
         "supervisor_pid": 123, "supervisor_created_utc": supervisor_created,
         "stage_pid": os.getpid(), "stage_created_utc": stage_created,
         "stage_signature": signature,
@@ -214,7 +214,7 @@ def test_execution_calibration_keeps_source_read_only_and_accounts_only_active_t
         123: supervisor_created, os.getpid(): stage_created,
     }.get(pid))
     context = ActiveJobContext(
-        execution_root.name, "attempt-1", "calibrate", 500, started_ns, 123,
+        execution_root.name, "attempt-1", "calibrate", 0, started_ns, 123,
         supervisor_created, signature,
     )
 
@@ -330,7 +330,7 @@ def test_execution_replay_bounds_incomplete_worker_to_settled_job_interval(monke
     old_end = 5_000_000_000
     append_event(root, {
         "type": "job_started", "execution_id": "execution-id", "attempt_id": "old-job",
-        "stage": "calibrate", "prior_active_seconds": 10,
+        "stage": "calibrate", "prior_active_seconds": 0,
         "started_monotonic_ns": old_start,
         "supervisor_pid": 123, "supervisor_created_utc": "2026-10-07T00:00:00.000000Z",
         "stage_pid": 456, "stage_created_utc": "2026-10-07T00:00:01.000000Z",
@@ -339,18 +339,18 @@ def test_execution_replay_bounds_incomplete_worker_to_settled_job_interval(monke
     append_event(root, {
         "type": "job_settled", "execution_id": "execution-id", "attempt_id": "old-job",
         "stage": "calibrate", "started_monotonic_ns": old_start,
-        "ended_monotonic_ns": old_end, "settled_active_seconds": 14,
+        "ended_monotonic_ns": old_end, "settled_active_seconds": 4,
         "supervisor_pid": 123, "supervisor_created_utc": "2026-10-07T00:00:00.000000Z",
         "stage_pid": 456, "stage_created_utc": "2026-10-07T00:00:01.000000Z",
         "stage_signature": "s" * 64,
     })
     current = ActiveJobContext(
-        "execution-id", "new-job", "calibrate", 14, 100_000_000_000,
+        "execution-id", "new-job", "calibrate", 4, 100_000_000_000,
         123, "2026-10-07T00:00:00.000000Z", "t" * 64,
     )
     append_event(root, {
         "type": "job_started", "execution_id": "execution-id", "attempt_id": "new-job",
-        "stage": "calibrate", "prior_active_seconds": 14,
+        "stage": "calibrate", "prior_active_seconds": 4,
         "started_monotonic_ns": current.started_monotonic_ns,
         "supervisor_pid": current.supervisor_pid,
         "supervisor_created_utc": current.supervisor_created_utc,
@@ -398,7 +398,7 @@ def test_execution_replay_bounds_incomplete_worker_to_settled_job_interval(monke
     )
     assert ledger.cuda_seconds == replayed_again.cuda_seconds == 1171
     assert ledger.download_bytes == replayed_again.download_bytes == 8066699435
-    assert ledger.wall_seconds == replayed_again.wall_seconds == 15
+    assert ledger.wall_seconds == replayed_again.wall_seconds == 5
     assert ledger.artifact_bytes == replayed_again.artifact_bytes == 50 + sum(
         path.stat().st_size for path in root.rglob("*") if path.is_file()
     )

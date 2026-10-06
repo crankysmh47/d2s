@@ -333,6 +333,105 @@ def read_events(execution_root: Path) -> list[dict[str, Any]]:
     return events
 
 
+def validate_job_intervals(execution_root: Path) -> dict[str, dict[str, Any]]:
+    """Validate the ordered cumulative job clock and return its authenticated state."""
+    root = _checked_path(Path(execution_root)).resolve(strict=True)
+    try:
+        manifest = json.loads(_checked_path(root / "execution.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError("execution manifest is missing or malformed") from exc
+    execution_id = manifest.get("execution_id") if isinstance(manifest, dict) else None
+    if not isinstance(execution_id, str) or not execution_id:
+        raise ValueError("execution manifest has no execution identity")
+
+    def valid_utc(value: Any) -> bool:
+        if not isinstance(value, str) or not value.endswith("Z"):
+            return False
+        try:
+            parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+        except ValueError:
+            return False
+        return parsed.isoformat(timespec="microseconds").replace("+00:00", "Z") == value
+
+    jobs: dict[str, dict[str, Any]] = {}
+    open_attempt: str | None = None
+    latest_settled_seconds = 0
+    last_ended_ns: int | None = None
+    for event in read_events(root):
+        payload = event["payload"]
+        kind = payload.get("type")
+        if kind not in {"job_started", "job_settled", "job_failed"}:
+            continue
+        attempt_id = payload.get("attempt_id")
+        if (
+            payload.get("execution_id") != execution_id
+            or payload.get("stage") != "calibrate"
+            or not isinstance(attempt_id, str) or not attempt_id
+        ):
+            raise ValueError("execution job event has invalid execution/stage/attempt identity")
+        if kind == "job_failed":
+            raise ValueError("failed job has no trusted settled runtime interval")
+        if kind == "job_started":
+            prior = payload.get("prior_active_seconds")
+            started_ns = payload.get("started_monotonic_ns")
+            supervisor_pid = payload.get("supervisor_pid")
+            stage_pid = payload.get("stage_pid")
+            stage_signature = payload.get("stage_signature")
+            if (
+                attempt_id in jobs or open_attempt is not None
+                or type(prior) is not int or prior != latest_settled_seconds
+                or type(started_ns) is not int or started_ns < 0
+                or (last_ended_ns is not None and started_ns < last_ended_ns)
+                or type(supervisor_pid) is not int or supervisor_pid <= 0
+                or type(stage_pid) is not int or stage_pid <= 0
+                or not valid_utc(payload.get("supervisor_created_utc"))
+                or not valid_utc(payload.get("stage_created_utc"))
+                or not isinstance(stage_signature, str) or len(stage_signature) != 64
+            ):
+                raise ValueError("execution job start is duplicate, overlapping, out of order, or has invalid clock/owner fields")
+            jobs[attempt_id] = {
+                "start": payload,
+                "settlement": None,
+                "started_monotonic_ns": started_ns,
+                "ended_monotonic_ns": None,
+                "prior_active_seconds": prior,
+                "settled_active_seconds": None,
+            }
+            open_attempt = attempt_id
+            continue
+
+        state = jobs.get(attempt_id)
+        started_ns = payload.get("started_monotonic_ns")
+        ended_ns = payload.get("ended_monotonic_ns")
+        settled_seconds = payload.get("settled_active_seconds")
+        start = state["start"] if state is not None else {}
+        if (
+            state is None or open_attempt != attempt_id
+            or type(started_ns) is not int or started_ns != state["started_monotonic_ns"]
+            or type(ended_ns) is not int or ended_ns < started_ns
+            or type(settled_seconds) is not int
+            or type(payload.get("supervisor_pid")) is not int
+            or type(payload.get("stage_pid")) is not int
+            or payload.get("supervisor_pid") != start.get("supervisor_pid")
+            or payload.get("supervisor_created_utc") != start.get("supervisor_created_utc")
+            or payload.get("stage_pid") != start.get("stage_pid")
+            or payload.get("stage_created_utc") != start.get("stage_created_utc")
+            or payload.get("stage_signature") != start.get("stage_signature")
+        ):
+            raise ValueError("execution job settlement is out of order or has changed owner/interval identity")
+        duration_seconds = (ended_ns - started_ns + 999_999_999) // 1_000_000_000
+        expected_seconds = state["prior_active_seconds"] + duration_seconds
+        if settled_seconds != expected_seconds:
+            raise ValueError("execution job settlement cumulative runtime does not match its interval")
+        state["settlement"] = payload
+        state["ended_monotonic_ns"] = ended_ns
+        state["settled_active_seconds"] = settled_seconds
+        latest_settled_seconds = settled_seconds
+        last_ended_ns = ended_ns
+        open_attempt = None
+    return jobs
+
+
 def append_event(execution_root: Path, event: Mapping[str, Any]) -> None:
     """Append and fsync one canonical event in a contiguous digest chain."""
     root = _checked_path(Path(execution_root)).resolve(strict=True)
@@ -413,6 +512,8 @@ def process_creation_utc(pid: int) -> str | None:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
         kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
         kernel32.GetProcessTimes.argtypes = [
             wintypes.HANDLE, ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME),
             ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME),
@@ -420,10 +521,14 @@ def process_creation_utc(pid: int) -> str | None:
         kernel32.GetProcessTimes.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
-        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        handle = kernel32.OpenProcess(
+            0x00100000 | 0x1000, False, pid,
+        )  # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
         if not handle:
             return None
         try:
+            if kernel32.WaitForSingleObject(handle, 0) != 258:  # WAIT_TIMEOUT means it is still running.
+                return None
             creation = FILETIME()
             exit_time = FILETIME()
             kernel_time = FILETIME()
@@ -433,6 +538,8 @@ def process_creation_utc(pid: int) -> str | None:
                 return None
             ticks = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
             timestamp = datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=ticks // 10)
+            if kernel32.WaitForSingleObject(handle, 0) != 258:
+                return None
             return timestamp.isoformat(timespec="microseconds").replace("+00:00", "Z")
         finally:
             kernel32.CloseHandle(handle)
@@ -452,15 +559,11 @@ def load_active_job(execution_root: Path, attempt_id: str, *, stage: str) -> Act
     unsigned_manifest = {key: value for key, value in manifest.items() if key != "execution_id"}
     if execution_id != _sha(unsigned_manifest) or root.name != execution_id:
         raise ValueError("execution manifest identity mismatch")
-    events = read_events(root)
-    starts = [
-        event["payload"] for event in events
-        if event["payload"].get("type") == "job_started"
-        and event["payload"].get("attempt_id") == attempt_id
-    ]
-    if len(starts) != 1:
-        raise ValueError("active job start event is missing or duplicated")
-    payload = starts[0]
+    jobs = validate_job_intervals(root)
+    state = jobs.get(attempt_id)
+    if state is None or state["settlement"] is not None:
+        raise ValueError("active job start event is missing, duplicated, or settled")
+    payload = state["start"]
     if payload.get("execution_id") != execution_id or payload.get("stage") != stage:
         raise ValueError("active job execution or stage identity mismatch")
     job_path = _checked_path(root / "current-job.json")
@@ -475,22 +578,7 @@ def load_active_job(execution_root: Path, attempt_id: str, *, stage: str) -> Act
         raise ValueError("current active-job record is not canonical JSON")
     if signature != _sha(job_payload) or job_payload != payload:
         raise ValueError("current active-job record signature mismatch")
-    if any(
-        event["payload"].get("type") in {"job_settled", "job_failed"}
-        and event["payload"].get("attempt_id") == attempt_id
-        for event in events
-    ):
-        raise ValueError("active job is already settled")
-    active_attempts: set[str] = set()
-    settled_attempts: set[str] = set()
-    for event in events:
-        event_payload = event["payload"]
-        event_attempt = event_payload.get("attempt_id")
-        if event_payload.get("type") == "job_started" and isinstance(event_attempt, str):
-            active_attempts.add(event_attempt)
-        elif event_payload.get("type") in {"job_settled", "job_failed"} and isinstance(event_attempt, str):
-            settled_attempts.add(event_attempt)
-    if active_attempts - settled_attempts != {attempt_id}:
+    if [job_id for job_id, job in jobs.items() if job["settlement"] is None] != [attempt_id]:
         raise ValueError("execution has no unique current active job")
     pid = payload.get("supervisor_pid")
     created = payload.get("supervisor_created_utc")
@@ -525,5 +613,5 @@ def load_active_job(execution_root: Path, attempt_id: str, *, stage: str) -> Act
 __all__ = [
     "ActiveJobContext", "active_elapsed_seconds", "append_event", "execution_stage_signature",
     "load_active_job", "process_creation_utc", "read_events", "register_execution",
-    "validate_execution",
+    "validate_execution", "validate_job_intervals",
 ]

@@ -299,88 +299,31 @@ def _calibration_artifact_bytes(root: Path) -> int:
 def _execution_job_intervals(
     root: Path, active_job: Any,
 ) -> dict[str, tuple[int, int]]:
-    """Validate lifecycle ownership and return settled monotonic job intervals."""
-    from .execution import read_events
+    """Use the shared lifecycle validator and return settled monotonic intervals."""
+    from .execution import validate_job_intervals
 
-    manifest = json.loads((root / "execution.json").read_text(encoding="utf-8"))
-    execution_id = manifest.get("execution_id")
-    starts: dict[str, Mapping[str, Any]] = {}
-    settled: dict[str, tuple[int, int]] = {}
-
-    def valid_utc(value: Any) -> bool:
-        if not isinstance(value, str) or not value.endswith("Z"):
-            return False
-        try:
-            parsed = datetime.fromisoformat(value[:-1] + "+00:00")
-        except ValueError:
-            return False
-        return parsed.isoformat(timespec="microseconds").replace("+00:00", "Z") == value
-
-    for event in read_events(root):
-        payload = event["payload"]
-        kind = payload.get("type")
-        if kind not in {"job_started", "job_settled"}:
-            continue
-        attempt_id = payload.get("attempt_id")
-        if (
-            payload.get("execution_id") != execution_id
-            or payload.get("stage") != "calibrate"
-            or not isinstance(attempt_id, str)
-            or not attempt_id
-        ):
-            raise StageError("execution job event has invalid execution/stage/attempt identity")
-        if kind == "job_started":
-            prior = payload.get("prior_active_seconds")
-            started_ns = payload.get("started_monotonic_ns")
-            supervisor_pid = payload.get("supervisor_pid")
-            stage_pid = payload.get("stage_pid")
-            if (
-                attempt_id in starts or type(prior) is not int or prior < 0
-                or type(started_ns) is not int or started_ns < 0
-                or type(supervisor_pid) is not int or supervisor_pid <= 0
-                or type(stage_pid) is not int or stage_pid <= 0
-                or not valid_utc(payload.get("supervisor_created_utc"))
-                or not valid_utc(payload.get("stage_created_utc"))
-                or not isinstance(payload.get("stage_signature"), str)
-                or len(payload["stage_signature"]) != 64
-            ):
-                raise StageError("execution job start event has invalid or duplicate runtime fields")
-            starts[attempt_id] = payload
-        else:
-            start = starts.get(attempt_id)
-            started_ns = payload.get("started_monotonic_ns")
-            ended_ns = payload.get("ended_monotonic_ns")
-            settled_seconds = payload.get("settled_active_seconds")
-            if (
-                start is None or attempt_id in settled
-                or started_ns != start.get("started_monotonic_ns")
-                or type(ended_ns) is not int or ended_ns < started_ns
-                or type(settled_seconds) is not int or settled_seconds < 0
-                or payload.get("supervisor_pid") != start.get("supervisor_pid")
-                or payload.get("supervisor_created_utc") != start.get("supervisor_created_utc")
-                or payload.get("stage_pid") != start.get("stage_pid")
-                or payload.get("stage_created_utc") != start.get("stage_created_utc")
-                or payload.get("stage_signature") != start.get("stage_signature")
-            ):
-                raise StageError("execution job settlement has invalid ownership or interval")
-            duration_seconds = (ended_ns - started_ns + 999_999_999) // 1_000_000_000
-            if settled_seconds != start["prior_active_seconds"] + duration_seconds:
-                raise StageError("execution job settlement cumulative runtime does not match its interval")
-            settled[attempt_id] = (started_ns, ended_ns)
-    if active_job.attempt_id not in starts or active_job.attempt_id in settled:
+    try:
+        jobs = validate_job_intervals(root)
+    except ValueError as exc:
+        raise StageError(f"execution job lifecycle is invalid: {exc}") from exc
+    current = jobs.get(active_job.attempt_id)
+    if current is None or current["settlement"] is not None:
         raise StageError("current active job lacks one authenticated unmatched start event")
-    current = starts[active_job.attempt_id]
+    start = current["start"]
     if (
-        current.get("started_monotonic_ns") != active_job.started_monotonic_ns
-        or current.get("prior_active_seconds") != active_job.prior_active_seconds
-        or current.get("supervisor_pid") != active_job.supervisor_pid
-        or current.get("supervisor_created_utc") != active_job.supervisor_created_utc
-        or current.get("stage_signature") != active_job.stage_signature
+        start.get("started_monotonic_ns") != active_job.started_monotonic_ns
+        or start.get("prior_active_seconds") != active_job.prior_active_seconds
+        or start.get("supervisor_pid") != active_job.supervisor_pid
+        or start.get("supervisor_created_utc") != active_job.supervisor_created_utc
+        or start.get("stage_signature") != active_job.stage_signature
     ):
         raise StageError("current active-job clock differs from its authenticated start event")
-    if set(starts) - set(settled) != {active_job.attempt_id}:
+    if [attempt_id for attempt_id, job in jobs.items() if job["settlement"] is None] != [active_job.attempt_id]:
         raise StageError("execution contains an unclosed noncurrent job interval")
-    return settled
+    return {
+        attempt_id: (job["started_monotonic_ns"], job["ended_monotonic_ns"])
+        for attempt_id, job in jobs.items() if job["settlement"] is not None
+    }
 
 
 def _validate_active_cost_record(record: Mapping[str, Any]) -> None:
