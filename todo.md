@@ -85,7 +85,8 @@ Detailed [Option 2 plan](docs/superpowers/plans/2026-09-27-verified-distillation
 - [x] Check the October 6 resume against the original wall deadline; the October 5 deadline expired during the usage-limit interruption, before any calibration answers.
 - [x] Finish/review the early-resource terminal-reporting fix and persist the old expired run as `stopped_environment`; source hashes/costs unchanged, no answers generated.
 - [x] Obtain approval for a fresh execution policy: user selected 48 cumulative worker hours excluding review/agent downtime on October 7; old window remains expired, cumulative CUDA/download costs carry forward.
-- [ ] Implement/review the [detached runtime plan](docs/superpowers/plans/2026-10-07-distillation-background-runtime.md), verify native Windows process containment/durable logs, then register one distinct execution and launch calibration. No new worker launched yet.
+- [x] Implement/review runtime Task 1: separate execution identity/source outputs, cumulative active clock and interrupted-cost replay; root full CPU 1,195 passed/5 skipped/3 deselected.
+- [ ] Finish [runtime Task 2](docs/superpowers/plans/2026-10-07-distillation-background-runtime.md): native Windows supervision/containment, detached lifetime and logs/status; then register one distinct execution and launch calibration. No new worker launched yet.
 - [ ] Freeze/review the final-answer scorer, calibrate output budget on 60 exclusive questions, and obtain blind Luna extraction reviews before the teacher viability pilot.
 - [ ] Require teacher viability, >=800 matched verified targets, and the independent rationale-quality audit before any study training.
 - [ ] Only if all gates pass: run paired discovery, one confirmation, sealed evaluation, and independent report. Stop on any registered no-go.

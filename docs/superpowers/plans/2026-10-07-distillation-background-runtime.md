@@ -64,6 +64,7 @@ def validate_execution(execution_root: Path, *, repo_root: Path,
                        config_path: Path) -> dict[str, Any]: ...
 def read_events(execution_root: Path) -> list[dict[str, Any]]: ...
 def append_event(execution_root: Path, event: Mapping[str, Any]) -> None: ...
+def validate_job_intervals(execution_root: Path) -> dict[str, dict[str, Any]]: ...
 def active_elapsed_seconds(context: ActiveJobContext, *,
                            now_ns: int | None = None) -> int: ...
 def process_creation_utc(pid: int) -> str | None: ...
@@ -74,6 +75,10 @@ def load_active_job(execution_root: Path, attempt_id: str, *,
 ```
 
 `active_elapsed_seconds` returns `prior_active_seconds + ceil(max(0, now_ns-started_ns)/1e9)`. Inject clocks in tests, never cap overrides in production. `process_creation_utc` uses read-only Windows process queries and canonical microsecond UTC-Z precision; inaccessible/dead/unsupported cannot establish ownership. `execution_stage_signature` hashes the implemented stage's closed prelaunch code/config/source/policy set, without requiring not-yet-authenticated model inventories. `ActiveJobContext.stage_signature` is this prelaunch signature; final calibration additionally binds model inventories. `load_active_job` validates the signed event/current-job record, frozen execution/stage identity and live supervisor PID+creation time; no standalone unowned stage execution.
+
+Reviewed interface clarification: prove actual liveness with `WaitForSingleObject(handle, 0) == WAIT_TIMEOUT` before and after reading creation time, using `SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION`; creation time alone accepts exited Windows processes with retained handles. `load_active_job` also matches `stage_pid`/`stage_created_utc` to the invoking process. `validate_job_intervals` is the single ordered lifecycle validator consumed by it, study replay and the supervisor: first prior zero, each subsequent prior equals previous cumulative settlement, no overlapping/duplicate/out-of-order intervals, owner/signature matches, exact integer clocks and ceil-duration settlement. Settlement `prior_active_seconds` must repeat its start, not merely yield a correct derived total.
+
+Its return maps attempt ID to `start`, `settlement` (payload or `None`), `started_monotonic_ns`, `ended_monotonic_ns` (integer or `None`), `prior_active_seconds` and `settled_active_seconds` (integer or `None`). `current-job.json` is canonical `{payload: <exact unmatched job_started payload>, payload_sha256: SHA256(canonical(payload))}` plus LF. `job_settled` copies its start payload, changes `type`, adds end monotonic timestamp and **cumulative** `settled_active_seconds`. Worker reservations add `job_attempt_id` and `reserved_monotonic_ns`; bound unknown worker CUDA cost by its authenticated settled/live job interval, never current UTC across a review gap. Missing interval fails closed. Charge startup exactly once whether zero or one raw rows survived.
 
 ```python
 # Existing signatures extended keyword-only, old callers unchanged.
@@ -152,7 +157,12 @@ def launch_stage(execution_root: Path, stage: str, *, repo_root: Path,
 def supervise_stage(execution_root: Path, stage: str, *, repo_root: Path,
                     config_path: Path) -> int: ...
 def execution_status(execution_root: Path) -> dict[str, Any]: ...
+def execution_stage_files(stage: str) -> tuple[str, ...]: ...  # in study.py
 ```
+
+Before first answers, generalize only common lifecycle naming to registered compute names (`KNOWN_STAGES` excluding preflight/prepare); signing/launch still reject unimplemented stages. `execution_stage_signature` consumes `study.execution_stage_files`, whose only initial branch is calibration with the closed supervisor/launcher/native-job/test files included. Future scientific-plan tasks may add previously unused stage-specific registry/dispatch branches without changing frozen common execution/ledger/scoring helpers. Do not implement those future stages in this task.
+
+Use mutable <=5-second status heartbeats and sparse authoritative lifecycle events, not full-journal parsing every watchdog poll. Copy saved start identities at settlement instead of querying a dead stage. A confirmed failure produces a trusted settlement plus separate terminal outcome; `job_failed` denotes uncertain/unsettled accounting and must not allow recovery/refund. Launch acknowledgment must match its own spawned supervisor, not a concurrent winner; authenticated matching completion can acknowledge a very short stage that already exited.
 
 `start` creates suspended, contained child and returns PID/creation time; `resume` happens after its reservation/context is durable. `poll` is owned stage exit, not proof all descendants exited; confirm Job Object active process count is zero before settlement. `close` is kill-on-close for abrupt supervisor loss. Set correct ctypes arg/restypes, Unicode quoting via `subprocess.list2cmdline`, noninherited job handle, inheritable log handles limited to child startup, correct handle cleanup. Production unsupported platforms fail closed before launch; CPU unit tests inject a job implementation but native Windows acceptance uses the real one.
 
