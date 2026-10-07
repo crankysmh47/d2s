@@ -39,6 +39,15 @@ _EXPECTED_ATTEMPT_ID = "216e170f91e1458aa74d679e457a159e"
 _EXPECTED_AUTHENTICATED_BASELINE_BYTES = 2047868
 
 
+def _matches_exact_costs(value: Any, expected: Mapping[str, int]) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value) == set(expected)
+        and all(type(value[name]) is int and value[name] >= 0 and value[name] == amount
+                for name, amount in expected.items())
+    )
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
@@ -309,10 +318,12 @@ def validate_repair_manifest(
             ).get("signature")
             or repair.get("predecessor_immutable_bytes") != verified["immutable_bytes"]
             or repair.get("predecessor_status_reserve_bytes") != verified["status_bytes"]
+            or type(repair.get("inherited_active_seconds")) is not int
             or repair.get("inherited_active_seconds") != _EXPECTED_ACTIVE_SECONDS
-            or repair.get("inherited_costs") != _EXPECTED_COSTS
+            or type(manifest.get("inherited_active_seconds")) is not int
             or manifest.get("inherited_active_seconds") != _EXPECTED_ACTIVE_SECONDS
-            or manifest.get("inherited_costs") != _EXPECTED_COSTS):
+            or not _matches_exact_costs(repair.get("inherited_costs"), _EXPECTED_COSTS)
+            or not _matches_exact_costs(manifest.get("inherited_costs"), _EXPECTED_COSTS)):
         raise ValueError("repair predecessor inventory or carried accounting changed")
     if repair.get("accounting_rationale") != {
         "cuda_seconds": "1199 authenticated schema 2 seconds plus the full 29 second settled repair interval; producer-reported 1189 remains pinned diagnostic evidence and is never refunded or substituted",

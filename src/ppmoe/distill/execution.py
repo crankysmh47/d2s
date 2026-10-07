@@ -135,7 +135,8 @@ def initial_active_seconds(manifest: Mapping[str, Any]) -> int:
     inherited = manifest.get("inherited_active_seconds")
     if type(inherited) is not int or inherited != expected or not isinstance(context, Mapping):
         raise ValueError("execution inherited active clock is missing or unauthenticated")
-    if context.get("inherited_active_seconds") != inherited:
+    context_inherited = context.get("inherited_active_seconds")
+    if type(context_inherited) is not int or context_inherited != inherited:
         raise ValueError("execution inherited active clock differs from its authorization context")
     return inherited
 

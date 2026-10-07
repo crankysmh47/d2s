@@ -115,6 +115,8 @@ def test_initial_active_clock_is_explicit_for_schemas_one_two_and_three_and_reje
         initial_active_seconds({"schema_version": True})
     with pytest.raises(ValueError, match="clock"):
         initial_active_seconds({"schema_version": 3, "inherited_active_seconds": True, "repair": {"inherited_active_seconds": True}})
+    with pytest.raises(ValueError, match="clock"):
+        initial_active_seconds({"schema_version": 3, "inherited_active_seconds": 60, "repair": {"inherited_active_seconds": 60.0}})
 
 
 @pytest.mark.parametrize("mutation", ["changed", "extra", "missing"])
@@ -244,6 +246,39 @@ def test_rehashed_schema3_manifest_rejects_refunds_and_changed_artifact_carry(
     (copied / "execution.json").write_bytes(execution._canonical(value) + b"\n")
     copied.rename(rebound)
     with pytest.raises(ValueError, match="inherited|clock|baseline|carry|accounting"):
+        execution.validate_execution(rebound, repo_root=REPO_ROOT, config_path=CONFIG_PATH)
+
+
+@pytest.mark.parametrize(("container", "field", "float_value"), [
+    ((), "cuda_seconds", 1228.0),
+    ((), "download_bytes", 8066717862.0),
+    (("repair",), "cuda_seconds", 1228.0),
+    (("repair",), "download_bytes", 8066717862.0),
+    (("repair",), "inherited_active_seconds", 60.0),
+])
+def test_rehashed_schema3_manifest_rejects_equal_valued_float_accounting(
+    tmp_path: Path, container: tuple[str, ...], field: str, float_value: float,
+) -> None:
+    from ppmoe.distill import execution
+
+    root, _manifest = _real_schema3_execution(tmp_path)
+    copied_parent = tmp_path / "float-rebound"
+    copied_parent.mkdir()
+    copied = copied_parent / root.name
+    shutil.copytree(root, copied)
+    value = json.loads((copied / "execution.json").read_text(encoding="utf-8"))
+    target = value
+    for key in container:
+        target = target[key]
+    if field in {"cuda_seconds", "download_bytes"}:
+        target = target["inherited_costs"]
+    target[field] = float_value
+    value["execution_id"] = execution._sha({key: item for key, item in value.items() if key != "execution_id"})
+    rebound = copied_parent / value["execution_id"]
+    (copied / "execution.json").write_bytes(execution._canonical(value) + b"\n")
+    copied.rename(rebound)
+
+    with pytest.raises(ValueError, match="inherited|clock|accounting"):
         execution.validate_execution(rebound, repo_root=REPO_ROOT, config_path=CONFIG_PATH)
 
 
