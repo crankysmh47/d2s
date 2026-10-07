@@ -1,5 +1,7 @@
 # Current work queue
 
+Current decision: **scientific extraction-gate stop; no compute is running for this study**. See [terminal report](docs/distillation-v1-report.md). The remaining training tasks below are blocked, not an active execution queue.
+
 Updated 2026-10-07. Historical V0 requirements and stop rules: [plan.md](plan.md). This file is a summary, not permission to skip gates.
 
 Historical recurrence execution contract: [docs/superpowers/plans/2026-09-11-pretrained-recurrence-execution.md](docs/superpowers/plans/2026-09-11-pretrained-recurrence-execution.md). It is not an active queue after V0–V3 stops.
@@ -103,7 +105,8 @@ Detailed [Option 2 plan](docs/superpowers/plans/2026-09-27-verified-distillation
 - [x] Tokenizer recovery Task1: explicit token-list contract and authenticated cached-tokenizer/CPU worker boundary tests; independently reviewed `6ccb619`, root65passed/no real-integration skips.
 - [x] Tokenizer recovery Task2/release: reviewed `9c460dd`; exact single-use schema4 and producer carry, fresh root CPU1,335 passed/7 skips/3 CUDA deselected, pinned lint/compile/diff and separate-terminal native proof cleared. Live generation/scientific quality remain untested.
 - [x] Launch approved calibration once after release: `163c6c24...` is running on pushed `9786f61`; detached owner identities verified after launcher exit. Blind review/pilot/corpus/training remain gated. No reset or further automatic registrations. [Saved status](artifacts/distillation-v1-executions/163c6c24c2fd409ade943ba2c9a0bef771d03c38338c9281851e701871943c11/status.md).
-- [ ] Freeze/review the final-answer scorer, calibrate output budget on 60 exclusive questions, and obtain blind Luna extraction reviews before the teacher viability pilot.
+- [x] Finish bounded length calibration and all120 blind Luna extraction reviews.512/1024 passed length selection but failed the frozen extraction gate: disagreements47/60 student and45/60 teacher, parser-invalid48/60 and45/60. Independent audit confirms the stop; no pilot/training. [Report](docs/distillation-v1-report.md).
+- [ ] Human decision: authorize a separately registered evaluator/output-format repair and fresh qualification, or end this direction. Current candidate remains stopped; no automatic retry or scorer patch.
 - [ ] Require teacher viability, >=800 matched verified targets, and the independent rationale-quality audit before any study training.
 - [ ] Only if all gates pass: run paired discovery, one confirmation, sealed evaluation, and independent report. Stop on any registered no-go.
 

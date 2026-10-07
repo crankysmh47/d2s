@@ -75,7 +75,7 @@ terminal.json 33cd54d85fb2d115257db4b54dba9826829e857a2c5ba34555dae6bfb06c9c2a 6
 - [x] Root focused real-tokenizer gate (no skip), native/finalCPU and independent finalreview clear; source/config/lock/runtime/GPU/allancestorpins recheck; push exp without PR/main merge.
 - [x] Register once with public register-tokenizer-recovery CLI and exact predecessor/root/config; assert printedroot's initial91/cost1250/8066717862/artifact2153595+newslotbytes before modelwork.
 - [x] Launch existing calibrate once, separate-terminal verify actualownedprocess creation identities/heartbeat/logs, initialreservation and placementcounts/costs. Sourcecodefrozen; noextra pretrained-modelsmoke.
-- [ ] At awaiting_review continue original blind Luna extractionaudit and registered teacher/corpus/training gates from docs/superpowers/plans/2026-09-27-verified-distillation-qlora.md. At terminalstop preserve precisecause/costs/absenceoutputs; nofurtherautomaticregistration. Update executionstate/todo/log/ledger andpush.
+- [x] At awaiting_review continue original blind Luna extractionaudit and registered teacher/corpus/training gates from docs/superpowers/plans/2026-09-27-verified-distillation-qlora.md. At terminalstop preserve precisecause/costs/absenceoutputs; nofurtherautomaticregistration. Update executionstate/todo/log/ledger andpush.
 
 ## Self-review
 
