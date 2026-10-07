@@ -185,6 +185,53 @@ def test_recovery_baseline_rejects_mutated_immutable_bytes(tmp_path: Path, monke
     assert not list(previous.parent.glob("recovery-authorization-*.json"))
 
 
+def test_recovery_rejects_actual_symlink_before_reservation_or_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from ppmoe.distill.recovery import register_recovery
+
+    previous, _before = _predecessor_copy(tmp_path)
+    _patch_disposable_pins(monkeypatch, previous)
+    outside = tmp_path / "outside-evidence.json"
+    outside.write_text("{}\n", encoding="utf-8")
+    link = previous / "unexpected-evidence-link.json"
+    try:
+        link.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable for this test user: {exc}")
+
+    with pytest.raises(ValueError, match="symlink/reparse path rejected"):
+        register_recovery(previous, previous.parent, repo_root=REPO_ROOT, config_path=CONFIG)
+
+    assert not list(previous.parent.glob("recovery-authorization-*.json"))
+    assert len([path for path in previous.parent.iterdir() if path.is_dir()]) == 1
+
+
+def test_recovery_rejects_reparse_metadata_before_reservation_or_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from types import SimpleNamespace
+
+    from ppmoe.distill.recovery import register_recovery
+
+    previous, _before = _predecessor_copy(tmp_path)
+    _patch_disposable_pins(monkeypatch, previous)
+    reparse = previous / "unexpected-reparse-metadata.json"
+    reparse.write_text("{}\n", encoding="utf-8")
+    path_type = type(reparse)
+    original_lstat = path_type.lstat
+    reparse_flag = getattr(os, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+    def report_reparse(path):
+        info = original_lstat(path)
+        if path == reparse:
+            return SimpleNamespace(st_mode=info.st_mode, st_file_attributes=reparse_flag)
+        return info
+
+    monkeypatch.setattr(path_type, "lstat", report_reparse)
+    with pytest.raises(ValueError, match="symlink/reparse path rejected"):
+        register_recovery(previous, previous.parent, repo_root=REPO_ROOT, config_path=CONFIG)
+
+    assert not list(previous.parent.glob("recovery-authorization-*.json"))
+    assert len([path for path in previous.parent.iterdir() if path.is_dir()]) == 1
+
+
 def test_mutable_predecessor_status_uses_frozen_observed_reserve(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from ppmoe.distill.execution import validate_execution
     from ppmoe.distill.recovery import register_recovery

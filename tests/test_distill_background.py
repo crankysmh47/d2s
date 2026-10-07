@@ -47,6 +47,8 @@ def test_registered_future_stage_is_signed_but_not_launchable(tmp_path: Path, mo
 
 def test_status_ignores_stale_snapshot_and_explains_corrupt_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     root, _, repo, config = _registered(tmp_path, monkeypatch)
+    assert json.loads((root / "execution.json").read_text(encoding="utf-8"))["schema_version"] == 1
+    assert execution_status(root, repo_root=repo, config_path=config)["runtime_used_seconds"] == 0
     (root / "status.json").write_text('{"state":"completed"}\n', encoding="utf-8")
     status = execution_status(root, repo_root=repo, config_path=config)
     assert status["state"] == "registered"
@@ -431,6 +433,15 @@ def test_detached_recovery_job_carries_31_second_clock_and_exits_cleanly(tmp_pat
             break
         time.sleep(0.2)
     assert status["state"] == "awaiting_review"
+    stage = json.loads((root / "stages" / "calibrate.json").read_text(encoding="utf-8"))
+    assert stage["stage"] == "calibrate"
+    assert stage["started_at_utc"]
+    assert stage["ended_at_utc"]
+    journal = [json.loads(line) for line in (root / "stages" / "calibrate-reservations.jsonl").read_text(encoding="utf-8").splitlines()]
+    terminal = [row for row in journal if row.get("event_type") == "terminal"]
+    assert len(terminal) == 1
+    assert terminal[0]["started_at_utc"] == stage["started_at_utc"]
+    assert terminal[0]["ended_at_utc"] == stage["ended_at_utc"]
     events = execution.read_events(root)
     payloads = [event["payload"] for event in events]
     started = next(item for item in payloads if item.get("type") == "job_started")

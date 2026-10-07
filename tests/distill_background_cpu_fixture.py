@@ -56,14 +56,17 @@ def _execution_fixture(workspace: Path, *, recovery: bool = False) -> dict[str, 
     runner.write_text(
         "import hashlib,json,sys,time\n"
         "from pathlib import Path\n"
+        "from ppmoe.distill.study import _persist_calibration_terminal,_utc_now\n"
         "root=Path(sys.argv[1]); signature=json.loads(sys.argv[2]); manifest=json.loads((root/'execution.json').read_text(encoding='utf-8'))\n"
+        "started_at=_utc_now()\n"
         "print('started', flush=True); time.sleep(float(sys.argv[3]))\n"
         "packet=root/'calibration'/'review'/'fixture.csv'; packet.parent.mkdir(parents=True,exist_ok=True)\n"
         "packet.write_text('opaque_id,answer\\nfixture,42\\n',encoding='utf-8'); packet_sha=hashlib.sha256(packet.read_bytes()).hexdigest()\n"
         "from ppmoe.distill.execution import artifact_baseline_bytes\n"
         "record={'execution_id':root.name,'stage':'calibrate','stage_signature':signature['stage_signature'],'signature':signature,'status':'awaiting_review','reason':'CPU fixture complete','resource_ledger':{'cuda_seconds':manifest.get('inherited_costs',{}).get('cuda_seconds',1168),'download_bytes':manifest.get('inherited_costs',{}).get('download_bytes',8066699435),'artifact_bytes':packet.stat().st_size},'resource_caps':{'cuda_seconds':86400,'wall_seconds':172800,'download_bytes':21474836480,'artifact_bytes':21474836480},'inherited_artifact_bytes':artifact_baseline_bytes(manifest),'review_packet':'calibration/review/fixture.csv','review_packet_sha256':packet_sha,'private_review_map':'calibration/review/private-map.json'}\n"
-        "target=root/'stages'/'calibrate.json'; target.parent.mkdir(parents=True,exist_ok=True)\n"
-        "target.write_bytes(json.dumps(record,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()+b'\\n')\n"
+        "record.pop('stage',None)\n"
+        "reservation_path=root/'stages'/'calibrate-reservations.jsonl'; reservation_path.parent.mkdir(parents=True,exist_ok=True); reservation_path.touch(exist_ok=True)\n"
+        "_persist_calibration_terminal(root,reservation_path,record,started_at=started_at,artifact_cap=record['resource_caps']['artifact_bytes'])\n"
         "print('finished', flush=True)\n",
         encoding="utf-8",
     )
