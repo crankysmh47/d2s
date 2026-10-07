@@ -98,6 +98,20 @@ def _inventory(root: Path) -> tuple[list[dict[str, Any]], int]:
     return entries, total
 
 
+def artifact_baseline_bytes(manifest: Mapping[str, Any]) -> int:
+    """Count the authenticated original baseline and, for schema 2, retained recovery evidence."""
+    baseline = manifest.get("artifact_baseline", {})
+    total = int(baseline.get("source_bytes", 0)) + sum(
+        int(row["size_bytes"]) for row in baseline.get("feasibility_files", [])
+    )
+    if manifest.get("schema_version") == 2:
+        total += int(baseline.get("predecessor_immutable_bytes", 0))
+        total += int(baseline.get("predecessor_status_reserve_bytes", 0))
+        reservation = baseline.get("authorization_reservation", {})
+        total += int(reservation.get("size_bytes", 0))
+    return total
+
+
 def _validate_old_terminal(source_root: Path, manifest: Mapping[str, Any], config_path: Path, repo_root: Path) -> tuple[Path, str]:
     from .study import TASK1_MANIFEST_SHA256, TASK1_PREPARE_SHA256
 
@@ -263,11 +277,19 @@ def validate_execution(execution_root: Path, *, repo_root: Path, config_path: Pa
     }
     if manifest.get("policy") != expected_policy:
         raise ValueError("execution resource policy differs from the registered fixed policy")
-    if manifest.get("inherited_costs") != {
-        "cuda_seconds": INHERITED_CUDA_SECONDS,
-        "download_bytes": INHERITED_DOWNLOAD_BYTES,
-    }:
-        raise ValueError("execution inherited costs differ from reviewed feasibility")
+    if manifest.get("schema_version") == 1:
+        expected_inherited_costs = {
+            "cuda_seconds": INHERITED_CUDA_SECONDS,
+            "download_bytes": INHERITED_DOWNLOAD_BYTES,
+        }
+    elif manifest.get("schema_version") == 2:
+        from .recovery import validate_recovery_manifest
+        validate_recovery_manifest(manifest, repo_root=repo, config_path=config)
+        expected_inherited_costs = {"cuda_seconds": 1199, "download_bytes": 8066717862}
+    else:
+        raise ValueError("unsupported execution manifest schema")
+    if manifest.get("inherited_costs") != expected_inherited_costs:
+        raise ValueError("execution inherited costs differ from reviewed evidence")
     from .study import validate_prepared_run
     source_manifest = validate_prepared_run(source)
     if source.name != manifest.get("source_run_id"):
@@ -358,7 +380,15 @@ def validate_job_intervals(execution_root: Path) -> dict[str, dict[str, Any]]:
 
     jobs: dict[str, dict[str, Any]] = {}
     open_attempt: str | None = None
-    latest_settled_seconds = 0
+    initial_active_seconds = 0
+    if manifest.get("schema_version") == 2:
+        inherited = manifest.get("inherited_active_seconds")
+        recovery = manifest.get("recovery")
+        if (type(inherited) is not int or inherited < 0 or not isinstance(recovery, Mapping)
+                or recovery.get("inherited_active_seconds") != inherited):
+            raise ValueError("execution inherited active clock is missing or unauthenticated")
+        initial_active_seconds = inherited
+    latest_settled_seconds = initial_active_seconds
     last_ended_ns: int | None = None
     for event in read_events(root):
         payload = event["payload"]

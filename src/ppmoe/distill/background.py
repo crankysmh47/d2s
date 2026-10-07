@@ -19,6 +19,7 @@ from .execution import (
     ActiveJobContext,
     active_elapsed_seconds,
     append_event,
+    artifact_baseline_bytes,
     process_creation_utc,
     read_events,
     register_execution,
@@ -188,11 +189,8 @@ def _resource_projection(
         "artifact_terminal_reserve_bytes": policy.get("artifact_terminal_reserve_bytes"),
         "memory_reserve_bytes": policy.get("memory_reserve_bytes"),
     }
-    baseline = manifest.get("artifact_baseline", {}) if isinstance(manifest, Mapping) else {}
     try:
-        inherited_artifact = int(baseline.get("source_bytes", 0)) + sum(
-            int(item["size_bytes"]) for item in baseline.get("feasibility_files", [])
-        )
+        inherited_artifact = artifact_baseline_bytes(manifest)
         measured_new = _artifact_bytes(root)
         measurement_complete = measurement_error is None
     except (OSError, ValueError, TypeError, KeyError) as exc:
@@ -348,7 +346,8 @@ def _base_status(root: Path, manifest: Mapping[str, Any], jobs: Mapping[str, Map
         state["settled_active_seconds"] for state in jobs.values()
         if state.get("settled_active_seconds") is not None
     ]
-    used = settled[-1] if settled else 0
+    initial_active_seconds = manifest.get("inherited_active_seconds", 0)
+    used = settled[-1] if settled else initial_active_seconds
     current = next((state for state in jobs.values() if state.get("settlement") is None), None)
     current_owner_valid = True
     if current is not None:
@@ -586,10 +585,7 @@ def _release_lease(root: Path, owner: Mapping[str, Any]) -> None:
 
 
 def _artifact_baseline(manifest: Mapping[str, Any]) -> int:
-    baseline = manifest.get("artifact_baseline", {})
-    return int(baseline.get("source_bytes", 0)) + sum(
-        int(row.get("size_bytes", 0)) for row in baseline.get("feasibility_files", [])
-    )
+    return artifact_baseline_bytes(manifest)
 
 
 def _command(repo_root: Path, config_path: Path, manifest: Mapping[str, Any], execution_root: Path, attempt_id: str) -> list[str]:
@@ -671,7 +667,10 @@ def supervise_stage(
             raise RuntimeError("a prior settled interval lacks its authenticated stage outcome")
         if any(item.get("stage") == stage for item in prior_attempts):
             raise RuntimeError(f"stage {stage} already has a settled attempt; review its saved outcome")
-        prior = max((int(state["settled_active_seconds"]) for state in intervals.values()), default=0)
+        prior = max(
+            (int(state["settled_active_seconds"]) for state in intervals.values()),
+            default=int(manifest.get("inherited_active_seconds", 0)),
+        )
         if prior >= ACTIVE_RUNTIME_SECONDS:
             raise RuntimeError("cumulative active runtime budget is exhausted")
         owner = _acquire_lease(root, attempt_id)
@@ -1024,6 +1023,33 @@ def register_execution_cli(source_root: Path, executions_root: Path, *, repo_roo
     _write_status(root, {
         "execution_id": manifest["execution_id"], "state": "registered",
         "runtime_used_seconds": 0, "runtime_remaining_seconds": ACTIVE_RUNTIME_SECONDS,
+        "reason": None,
+    })
+    return root
+
+
+def register_recovery_cli(
+    previous_execution_root: Path,
+    executions_root: Path,
+    *, repo_root: Path,
+    config_path: Path,
+) -> Path:
+    from .recovery import register_recovery
+
+    root = register_recovery(
+        previous_execution_root, executions_root,
+        repo_root=repo_root, config_path=config_path,
+    )
+    manifest = validate_execution(root, repo_root=repo_root, config_path=config_path)
+    append_event(root, {
+        "type": "registered", "execution_id": manifest["execution_id"],
+        "created_utc": manifest["created_utc"], "recovery": True,
+    })
+    initial = int(manifest["inherited_active_seconds"])
+    _write_status(root, {
+        "execution_id": manifest["execution_id"], "state": "registered",
+        "runtime_used_seconds": initial,
+        "runtime_remaining_seconds": max(0, ACTIVE_RUNTIME_SECONDS - initial),
         "reason": None,
     })
     return root

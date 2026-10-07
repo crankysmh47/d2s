@@ -68,10 +68,12 @@ CALIBRATION_FILES = (
 EXECUTION_COMMON_FILES = (
     "src/ppmoe/distill/execution.py",
     "src/ppmoe/distill/background.py",
+    "src/ppmoe/distill/recovery.py",
     "src/ppmoe/distill/windows_job.py",
     "scripts/run_distillation_background.py",
     "tests/test_distill_execution.py",
     "tests/test_distill_background.py",
+    "tests/test_distill_recovery.py",
     "tests/test_distill_windows_job.py",
     "tests/distill_background_cpu_fixture.py",
     "tests/test_distill_evaluate.py",
@@ -609,10 +611,8 @@ def _persist_pre_model_stop(
         result["source_run_id"] = signature_record.get("source_run_id")
         result["execution_policy_sha256"] = signature_record.get("execution_policy_sha256")
         execution_manifest = json.loads((root / "execution.json").read_text(encoding="utf-8"))
-        baseline = execution_manifest.get("artifact_baseline", {})
-        result["inherited_artifact_bytes"] = int(baseline.get("source_bytes", 0)) + sum(
-            int(item.get("size_bytes", 0)) for item in baseline.get("feasibility_files", [])
-        )
+        from .execution import artifact_baseline_bytes
+        result["inherited_artifact_bytes"] = artifact_baseline_bytes(execution_manifest)
     if (detail or {}).get("authenticated_model_inventory_sha256"):
         result["authenticated_model_inventory_sha256"] = dict(detail["authenticated_model_inventory_sha256"])
     return _persist_calibration_terminal(
@@ -692,10 +692,8 @@ def run_calibration_stage(
         if active_job.stage_signature != launch_signature:
             raise StageError("active-job prelaunch stage signature drifted")
         execution_policy_sha256 = sha256(_canonical_bytes(execution_manifest["policy"])).hexdigest()
-        baseline = execution_manifest.get("artifact_baseline", {})
-        inherited_artifact_bytes = int(baseline.get("source_bytes", 0)) + sum(
-            int(item.get("size_bytes", 0)) for item in baseline.get("feasibility_files", [])
-        )
+        from .execution import artifact_baseline_bytes
+        inherited_artifact_bytes = artifact_baseline_bytes(execution_manifest)
     if source_root.name != TASK1_RUN_ID:
         raise StageError("calibrate requires the reviewed Task 1 prepared run ID")
     if stage_path(root, "calibrate").exists():

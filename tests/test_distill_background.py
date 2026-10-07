@@ -395,6 +395,54 @@ def test_detached_cpu_launcher_exits_before_stage_and_other_invocation_reads_sta
     assert status["runtime_remaining_seconds"] < 172800
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires detached Windows supervisor process")
+def test_detached_recovery_job_carries_31_second_clock_and_exits_cleanly(tmp_path: Path):
+    workspace = tmp_path / "recovery cpu fixture path with spaces"
+    prepared = subprocess.run(
+        [sys.executable, str(CPU_FIXTURE), "prepare-recovery", "--workspace", str(workspace)],
+        cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=30,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    fixture = json.loads(prepared.stdout)
+    root = Path(fixture["execution_root"])
+    initial = json.loads((root / "status.json").read_text(encoding="utf-8"))
+    assert initial["runtime_used_seconds"] == 31
+    assert initial["runtime_remaining_seconds"] == 172769
+
+    launched = subprocess.run(
+        [sys.executable, str(CPU_FIXTURE), "start", "--workspace", str(workspace)],
+        cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=20,
+    )
+    assert launched.returncode == 0, launched.stderr
+    launch = json.loads(launched.stdout)
+    stdout_path = Path(launch["stdout_path"])
+    assert "finished" not in stdout_path.read_text(encoding="utf-8")
+
+    deadline = time.monotonic() + 12
+    status: dict[str, object] = {}
+    while time.monotonic() < deadline:
+        result = subprocess.run(
+            [sys.executable, str(CPU_FIXTURE), "status", "--workspace", str(workspace)],
+            cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=20,
+        )
+        assert result.returncode == 0, result.stderr
+        status = json.loads(result.stdout)
+        if status["state"] == "awaiting_review":
+            break
+        time.sleep(0.2)
+    assert status["state"] == "awaiting_review"
+    events = execution.read_events(root)
+    payloads = [event["payload"] for event in events]
+    started = next(item for item in payloads if item.get("type") == "job_started")
+    settled = next(item for item in payloads if item.get("type") == "job_settled")
+    assert started["prior_active_seconds"] == 31
+    assert settled["settled_active_seconds"] > 31
+    assert settled["settled_active_seconds"] == 31 + (settled["ended_monotonic_ns"] - settled["started_monotonic_ns"] + 999_999_999) // 1_000_000_000
+    assert "finished" in stdout_path.read_text(encoding="utf-8")
+    for owner_pid in (started["stage_pid"], started["supervisor_pid"]):
+        assert execution.process_creation_utc(owner_pid) is None
+
+
 @pytest.mark.skipif(os.name != "nt", reason="requires real concurrent detached Windows supervisors")
 def test_concurrent_detached_launchers_have_one_attempt_owner(tmp_path: Path):
     workspace = tmp_path / "concurrent cpu fixture"

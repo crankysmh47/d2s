@@ -6,6 +6,7 @@ import argparse
 import importlib.util
 import json
 from pathlib import Path
+import shutil
 import sys
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -16,7 +17,7 @@ def _canonical(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
 
-def _execution_fixture(workspace: Path) -> dict[str, str]:
+def _execution_fixture(workspace: Path, *, recovery: bool = False) -> dict[str, str]:
     spec = importlib.util.spec_from_file_location(
         "distill_task1_fixture", TESTS / "test_distill_execution.py",
     )
@@ -24,34 +25,43 @@ def _execution_fixture(workspace: Path) -> dict[str, str]:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     config = REPO_ROOT / "configs" / "distillation-v1.toml"
-    source, _ = module._prepared_source(workspace / "source fixture", config)
     from ppmoe.distill import execution, study
+    if recovery:
+        from ppmoe.distill.background import register_recovery_cli
+        predecessor_id = "fc901bb0766a9c79fb205302d220fe727a99ebbd0b315e6ee4ad4e66e6733634"
+        source = workspace / "executions" / predecessor_id
+        source.parent.mkdir(parents=True)
+        shutil.copytree(REPO_ROOT / "artifacts" / "distillation-v1-executions" / predecessor_id, source)
+        root = register_recovery_cli(source, source.parent, repo_root=REPO_ROOT, config_path=config)
+        source_root = Path(json.loads((source / "execution.json").read_text(encoding="utf-8"))["source_root"])
+    else:
+        source_root, _ = module._prepared_source(workspace / "source fixture", config)
+        terminal_path = source_root / "stages" / "calibrate.json"
+        terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
+        terminal["signature"]["code_signatures"] = {
+            config.resolve().relative_to(REPO_ROOT.resolve()).as_posix():
+                __import__("hashlib").sha256(config.read_bytes()).hexdigest(),
+        }
+        terminal_path.write_bytes(_canonical(terminal) + b"\n")
 
-    terminal_path = source / "stages" / "calibrate.json"
-    terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
-    terminal["signature"]["code_signatures"] = {
-        config.resolve().relative_to(REPO_ROOT.resolve()).as_posix():
-            __import__("hashlib").sha256(config.read_bytes()).hexdigest(),
-    }
-    terminal_path.write_bytes(_canonical(terminal) + b"\n")
-
-    study.TASK1_MANIFEST_SHA256 = __import__("hashlib").sha256((source / "manifest.json").read_bytes()).hexdigest()
-    study.TASK1_PREPARE_SHA256 = __import__("hashlib").sha256((source / "stages" / "prepare.json").read_bytes()).hexdigest()
-    execution.TASK1_STOP_SHA256 = __import__("hashlib").sha256(terminal_path.read_bytes()).hexdigest()
-    root = execution.register_execution(
-        source, workspace / "executions", repo_root=REPO_ROOT, config_path=config,
-    )
+        study.TASK1_MANIFEST_SHA256 = __import__("hashlib").sha256((source_root / "manifest.json").read_bytes()).hexdigest()
+        study.TASK1_PREPARE_SHA256 = __import__("hashlib").sha256((source_root / "stages" / "prepare.json").read_bytes()).hexdigest()
+        execution.TASK1_STOP_SHA256 = __import__("hashlib").sha256(terminal_path.read_bytes()).hexdigest()
+        root = execution.register_execution(
+            source_root, workspace / "executions", repo_root=REPO_ROOT, config_path=config,
+        )
     runner_dir = workspace / "fake stage path with spaces"
     runner_dir.mkdir(parents=True, exist_ok=True)
     runner = runner_dir / "fake stage.py"
     runner.write_text(
         "import hashlib,json,sys,time\n"
         "from pathlib import Path\n"
-        "root=Path(sys.argv[1]); signature=json.loads(sys.argv[2])\n"
+        "root=Path(sys.argv[1]); signature=json.loads(sys.argv[2]); manifest=json.loads((root/'execution.json').read_text(encoding='utf-8'))\n"
         "print('started', flush=True); time.sleep(float(sys.argv[3]))\n"
         "packet=root/'calibration'/'review'/'fixture.csv'; packet.parent.mkdir(parents=True,exist_ok=True)\n"
         "packet.write_text('opaque_id,answer\\nfixture,42\\n',encoding='utf-8'); packet_sha=hashlib.sha256(packet.read_bytes()).hexdigest()\n"
-        "record={'execution_id':root.name,'stage':'calibrate','stage_signature':signature['stage_signature'],'signature':signature,'status':'awaiting_review','reason':'CPU fixture complete','resource_ledger':{'cuda_seconds':1168,'download_bytes':8066699435,'artifact_bytes':packet.stat().st_size},'resource_caps':{'cuda_seconds':86400,'wall_seconds':172800,'download_bytes':21474836480,'artifact_bytes':21474836480},'inherited_artifact_bytes':0,'review_packet':'calibration/review/fixture.csv','review_packet_sha256':packet_sha,'private_review_map':'calibration/review/private-map.json'}\n"
+        "from ppmoe.distill.execution import artifact_baseline_bytes\n"
+        "record={'execution_id':root.name,'stage':'calibrate','stage_signature':signature['stage_signature'],'signature':signature,'status':'awaiting_review','reason':'CPU fixture complete','resource_ledger':{'cuda_seconds':manifest.get('inherited_costs',{}).get('cuda_seconds',1168),'download_bytes':manifest.get('inherited_costs',{}).get('download_bytes',8066699435),'artifact_bytes':packet.stat().st_size},'resource_caps':{'cuda_seconds':86400,'wall_seconds':172800,'download_bytes':21474836480,'artifact_bytes':21474836480},'inherited_artifact_bytes':artifact_baseline_bytes(manifest),'review_packet':'calibration/review/fixture.csv','review_packet_sha256':packet_sha,'private_review_map':'calibration/review/private-map.json'}\n"
         "target=root/'stages'/'calibrate.json'; target.parent.mkdir(parents=True,exist_ok=True)\n"
         "target.write_bytes(json.dumps(record,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()+b'\\n')\n"
         "print('finished', flush=True)\n",
@@ -59,10 +69,11 @@ def _execution_fixture(workspace: Path) -> dict[str, str]:
     )
     fixture = {
         "execution_root": str(root), "repo_root": str(REPO_ROOT),
-        "config_path": str(config), "source_root": str(source),
-        "manifest_sha256": study.TASK1_MANIFEST_SHA256,
-        "prepare_sha256": study.TASK1_PREPARE_SHA256,
-        "stop_sha256": execution.TASK1_STOP_SHA256,
+        "config_path": str(config), "source_root": str(source_root),
+        "schema_version": 2 if recovery else 1,
+        "manifest_sha256": study.TASK1_MANIFEST_SHA256 if not recovery else "",
+        "prepare_sha256": study.TASK1_PREPARE_SHA256 if not recovery else "",
+        "stop_sha256": execution.TASK1_STOP_SHA256 if not recovery else "",
         "runner": str(runner),
         "duration_seconds": 2.5,
     }
@@ -75,6 +86,8 @@ def _load_fixture(workspace: Path) -> dict[str, str]:
 
 
 def _patch_fixture_constants(fixture: dict[str, str]) -> None:
+    if fixture.get("schema_version") == 2:
+        return
     from ppmoe.distill import execution, study
 
     study.TASK1_MANIFEST_SHA256 = fixture["manifest_sha256"]
@@ -145,6 +158,8 @@ def main() -> int:
     sub = parser.add_subparsers(dest="action", required=True)
     prepare = sub.add_parser("prepare")
     prepare.add_argument("--workspace", type=Path, required=True)
+    prepare_recovery = sub.add_parser("prepare-recovery")
+    prepare_recovery.add_argument("--workspace", type=Path, required=True)
     start = sub.add_parser("start")
     start.add_argument("--workspace", type=Path, required=True)
     start.add_argument("--duration", type=float)
@@ -154,8 +169,8 @@ def main() -> int:
     run.add_argument("--workspace", type=Path, required=True)
     run.add_argument("--attempt-id", required=True)
     args = parser.parse_args()
-    if args.action == "prepare":
-        print(json.dumps(_execution_fixture(args.workspace), sort_keys=True))
+    if args.action in {"prepare", "prepare-recovery"}:
+        print(json.dumps(_execution_fixture(args.workspace, recovery=args.action == "prepare-recovery"), sort_keys=True))
         return 0
     if args.action == "start":
         print(json.dumps(_start(args.workspace, args.duration), sort_keys=True))
