@@ -1,0 +1,23 @@
+# Production-path repair and second diagnostic authorization
+
+User approved on2026-10-07: fix the placement and producer-cost defects, continue autonomously until a real blocker. This authorizes the proposed further bounded diagnostic execution, not unlimited new registrations or changes to scientific gates. Keep exp, Luna workers, cumulative budgets, immutable historical records and durable results.
+
+## Verified defects and repairs
+
+The stopped schema2 execution b0c082cba66a37f6f49bacc4bee182102b926ac5ac3af4c0a657823213e1802f has three identical errors: the placement validator requires hf_device_map, but pinned Transformers can omit it for a single-device load. No tensor-placement evidence was captured. Repair by validating actual named parameters AND buffers plus relevant bitsandbytes quantization-state tensors. Require nonempty parameters, every inspected tensor on CUDA device0, and fail on unavailable/malformed devices, CPU, disk, meta, or another CUDA device. If hf_device_map is present, reject contradictory/non-CUDA/malformed entries. Missing mapping alone may pass only when actual tensors prove placement. Do not change automatic loading, precision, runtime/dependencies, memory bounds or student freezing. Persist a small placement summary (counts/device set, no values) on successful load so the next real run has evidence rather than just a passed guard.
+
+The real producer initializes replay and its reservation with legacy1168 CUDA seconds/8066699435 downloads. Repair by seeding from validate_execution's inherited_costs for EVERY separate execution, then replay only this execution's own charges. The same baseline must reach pre-model stops, normal/exhausted-load terminals, interruptions/resume and initial reservation. Legacy/calendar-only calls retain old defaults. Invalid supplied cost types/negative values fail closed. Tests must exercise actual run_calibration_stage serialization and supervisor projection, not a fixture that supplies its own correct ledger. Include already-materialized teacher metadata without redownload/refund.
+
+## Separate bounded authorization
+
+Do not alter existing schema1 or schema2 records/protocols. Add schema3 only for the exact reviewed schema2 predecessor above. A separate immutable `repair-authorization-<predecessor-id>.json` namespace avoids invalidating the older `recovery-authorization-*` one-slot contract. Same parent as predecessor; exclusive O_EXCL/fsync before new execution creation, retain partial/failed slot and reject duplicate/concurrent registration. No generic chain, reset, budget override or caller-supplied command. Validate both historical ancestors under their own saved identities; never recompute old code into an old signature.
+
+New inherited baseline:60 cumulative active seconds,1228 conservative cumulative CUDA seconds (1199 +whole29-second failed-job upper bound, REPLACING the observed21-second load charge),8066717862 downloads. Source/config/lock/runtime/model/data/prompt/scorer/training unchanged. Overall caps172800 active seconds/86400 CUDA seconds/21474836480 download and artifact bytes/capacity-minus2GiB VRAM unchanged. Downtime does not consume active runtime.
+
+Artifact baseline carries the predecessor's authenticated2047868 bytes plus its42270 immutable files plus4744 fixed observed convenience-status bytes plus new authorization bytes exactly once:2094882 before the new slot. Neither status file is hash authority; its reserved bytes are frozen in the new manifest. Pin all13 immutable predecessor files, reject extra files/links/reparse, unsettled/live owners, scientific stops, outputs/answers or a different predecessor. Carry source and oldest predecessor/reservation costs through the saved predecessor baseline; no recount/refund.
+
+## Release and scientific boundaries
+
+Repair actual producer/placement tests first, independent task reviews, root focused/native/fullCPU verification and final integration review, then register/launch once. Do not use an extra uncharged model smoke. The authorized production calibration itself demonstrates real student/teacher placement and ledger propagation. Keep initial attempt plus2 worker recoveries. On awaiting_review, continue original blind Luna extraction audits and registered scientific branches; no teacher qualification/corpus/training before calibration reviews. On another terminal environment/scientific/resource stop preserve evidence; further registration requires new authority. Keep PC powered/awake for detached execution.
+
+Routine spec/plan approvals and worktree creation are waived by the user's explicit autonomy and existing exp workflow; engineering/scientific gates are not waived. Preserve scratch review/ledger evidence instead of deleting it.
