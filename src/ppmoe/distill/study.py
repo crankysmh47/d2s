@@ -303,9 +303,25 @@ def _append_stage_event(path: Path, event: dict[str, Any]) -> None:
         os.fsync(stream.fileno())
 
 
-def _initial_resource_ledger() -> ResourceLedger:
-    """Return the ledger anchored to the frozen feasibility wall origin."""
-    return ResourceLedger.initial()
+def _initial_resource_ledger(*, inherited_costs: Mapping[str, Any] | None = None) -> ResourceLedger:
+    """Return the legacy ledger or seed immutable prior CUDA/download costs."""
+    ledger = ResourceLedger.initial()
+    if inherited_costs is None:
+        return ledger
+    if (
+        not isinstance(inherited_costs, Mapping)
+        or set(inherited_costs) != {"cuda_seconds", "download_bytes"}
+        or type(inherited_costs.get("cuda_seconds")) is not int
+        or type(inherited_costs.get("download_bytes")) is not int
+        or inherited_costs["cuda_seconds"] < 0
+        or inherited_costs["download_bytes"] < 0
+    ):
+        raise StageError("authenticated inherited costs must contain two nonnegative integers")
+    return replace(
+        ledger,
+        cuda_seconds=inherited_costs["cuda_seconds"],
+        download_bytes=inherited_costs["download_bytes"],
+    )
 
 
 def _calibration_artifact_bytes(root: Path) -> int:
@@ -363,6 +379,7 @@ def _validate_active_cost_record(record: Mapping[str, Any]) -> None:
 def _replay_calibration_resources(
     root: Path, history: Sequence[Mapping[str, Any]], *, expected_ids: Sequence[str],
     stage_signature: str | None, config: Any, additional_download_bytes: int = 0,
+    inherited_costs: Mapping[str, Any] | None = None,
     active_job: Any | None = None, inherited_artifact_bytes: int = 0,
     settled_job_intervals: Mapping[str, tuple[int, int]] | None = None,
 ) -> ResourceLedger:
@@ -371,8 +388,12 @@ def _replay_calibration_resources(
         for start_ns, end_ns in (settled_job_intervals or {}).values():
             if type(start_ns) is not int or type(end_ns) is not int or start_ns < 0 or end_ns < start_ns:
                 raise StageError("settled job interval is invalid")
+    initial_ledger = (
+        _initial_resource_ledger() if inherited_costs is None
+        else _initial_resource_ledger(inherited_costs=inherited_costs)
+    )
     ledger = replace(
-        _initial_resource_ledger(), cuda_cap=2**63 - 1, wall_cap=2**63 - 1,
+        initial_ledger, cuda_cap=2**63 - 1, wall_cap=2**63 - 1,
         download_cap=2**63 - 1, artifact_cap=2**63 - 1,
     )
     raw_directory = root / "calibration" / "raw"
@@ -671,6 +692,7 @@ def run_calibration_stage(
     execution_manifest: dict[str, Any] | None = None
     launch_signature: str | None = None
     execution_policy_sha256: str | None = None
+    inherited_costs: Mapping[str, Any] | None = None
     inherited_artifact_bytes = 0
     settled_job_intervals: dict[str, tuple[int, int]] | None = None
     if new_execution:
@@ -680,6 +702,7 @@ def run_calibration_stage(
             validate_execution,
         )
         execution_manifest = validate_execution(root, repo_root=repo_root, config_path=config_path)
+        inherited_costs = execution_manifest["inherited_costs"]
         if execution_manifest.get("source_root") != str(source_root.resolve()):
             raise StageError("execution source root differs from the selected prepared source")
         if active_job.execution_id != execution_manifest.get("execution_id") or active_job.stage != "calibrate":
@@ -766,6 +789,7 @@ def run_calibration_stage(
     pre_model_ledger = _replay_calibration_resources(
         root, history, expected_ids=expected_ids,
         stage_signature=signature_record.get("stage_signature"), config=config,
+        inherited_costs=inherited_costs,
         active_job=active_job, inherited_artifact_bytes=inherited_artifact_bytes,
         settled_job_intervals=settled_job_intervals,
     )
@@ -1029,13 +1053,18 @@ def run_calibration_stage(
     raw_directory = safe_output_path(root, root / "calibration" / "raw")
     raw_directory.mkdir(parents=True, exist_ok=True)
     attempts_path = safe_output_path(root, root / "stages" / "calibrate-attempts.jsonl")
+    reservation_ledger = (
+        _initial_resource_ledger() if inherited_costs is None
+        else _initial_resource_ledger(inherited_costs=inherited_costs)
+    )
     reservation = {
         "status": "reserved", "event_type": "reservation", "event_id": uuid4().hex, "stage": "calibrate", "stage_signature": stage_signature,
         "predecessor_hashes": signature_record["predecessors"],
         "started_at_utc": started_at,
         "originating_git_commit": originating_commit,
         "signature": signature_record,
-        "initial_cuda_seconds": 1168, "initial_download_bytes": 8066699435,
+        "initial_cuda_seconds": reservation_ledger.cuda_seconds,
+        "initial_download_bytes": reservation_ledger.download_bytes,
         "download_bytes": downloaded_bytes,
         "cuda_cap_seconds": config.resources.cuda_seconds,
         "wall_cap_seconds": config.resources.wall_seconds,
@@ -1088,6 +1117,7 @@ def run_calibration_stage(
     recovered_ledger = _replay_calibration_resources(
         root, history, expected_ids=expected_ids, stage_signature=stage_signature,
         config=config, additional_download_bytes=downloaded_bytes,
+        inherited_costs=inherited_costs,
         active_job=active_job, inherited_artifact_bytes=inherited_artifact_bytes,
         settled_job_intervals=settled_job_intervals,
     )

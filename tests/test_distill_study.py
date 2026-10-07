@@ -414,6 +414,58 @@ def test_execution_replay_bounds_incomplete_worker_to_settled_job_interval(monke
         )
 
 
+def test_inherited_resource_costs_seed_replay_and_failed_attempts_once(tmp_path: Path) -> None:
+    from ppmoe.distill.config import load_config
+    from ppmoe.distill.evaluate import RawRowJournal
+    from ppmoe.distill.study import _replay_calibration_resources
+
+    inherited = {"cuda_seconds": 1228, "download_bytes": 8066717862}
+    root = tmp_path / "execution"
+    raw = root / "calibration" / "raw" / "256-768-student.jsonl"
+    journal = RawRowJournal(raw, expected_ids=["id-1"], stage_signature="s" * 64)
+    for attempt_id, status, seconds in (("old-failure", "failed", 5), ("new-load", "worker_load_failed", 7)):
+        journal.record_attempt({
+            "attempt_id": attempt_id, "status": status, "role": "student",
+            "candidate": [256, 768], "stage_signature": "s" * 64,
+            "cuda_seconds": seconds, "wall_seconds": seconds,
+        })
+    config = load_config(Path(__file__).parents[1] / "configs/distillation-v1.toml")
+
+    first = _replay_calibration_resources(
+        root, [], expected_ids=["id-1"], stage_signature="s" * 64,
+        config=config, inherited_costs=inherited,
+    )
+    replayed = _replay_calibration_resources(
+        root, [], expected_ids=["id-1"], stage_signature="s" * 64,
+        config=config, inherited_costs=inherited,
+    )
+    assert first.cuda_seconds == replayed.cuda_seconds == 1240
+    assert first.download_bytes == replayed.download_bytes == 8066717862
+
+
+@pytest.mark.parametrize("inherited", [
+    {"cuda_seconds": True, "download_bytes": 1},
+    {"cuda_seconds": -1, "download_bytes": 1},
+    {"cuda_seconds": 1, "download_bytes": False},
+    {"cuda_seconds": 1, "download_bytes": -1},
+    {"cuda_seconds": 1},
+])
+def test_initial_resource_ledger_rejects_invalid_inherited_costs(inherited) -> None:
+    from ppmoe.distill.study import StageError, _initial_resource_ledger
+
+    with pytest.raises(StageError, match="inherited costs"):
+        _initial_resource_ledger(inherited_costs=inherited)
+
+
+def test_initial_resource_ledger_preserves_legacy_defaults_and_seeds_authenticated_costs() -> None:
+    from ppmoe.distill.study import _initial_resource_ledger
+
+    legacy = _initial_resource_ledger()
+    seeded = _initial_resource_ledger(inherited_costs={"cuda_seconds": 1199, "download_bytes": 8066717862})
+    assert (legacy.cuda_seconds, legacy.download_bytes) == (1168, 8066699435)
+    assert (seeded.cuda_seconds, seeded.download_bytes) == (1199, 8066717862)
+
+
 def test_prepare_requires_explicit_run_root_before_source_scan(monkeypatch) -> None:
     def source_scan_must_not_run(*args, **kwargs):
         raise AssertionError("prepare checked source data before validating its required run root")
@@ -588,7 +640,8 @@ def test_cli_accepts_positional_stages_and_rejects_missing_required_options(monk
     assert len(calls) == 3
 
 
-def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_terminal(monkeypatch, tmp_path: Path) -> None:
+@pytest.mark.parametrize(("inherited_cuda", "cached_teacher_metadata"), [(1199, False), (1228, True)])
+def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_terminal(monkeypatch, tmp_path: Path, inherited_cuda: int, cached_teacher_metadata: bool) -> None:
     from types import SimpleNamespace
     from datetime import datetime, timezone
     from hashlib import sha256
@@ -638,8 +691,8 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
     from ppmoe.distill.evaluate import ResourceLedger
     simulated_origin = study._utc_now()
     monkeypatch.setattr(
-        study, "_initial_resource_ledger",
-        lambda: ResourceLedger(wall_seconds=0, wall_started_utc=simulated_origin), raising=False,
+        ResourceLedger, "initial",
+        classmethod(lambda cls: cls(wall_seconds=0, wall_started_utc=simulated_origin)),
     )
     monkeypatch.setattr(study, "load_split", lambda *args, **kwargs: questions)
     inventory_by_role = {
@@ -682,6 +735,9 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
     student_cache.mkdir(parents=True)
     (student_cache / "config.json").write_text("x", encoding="utf-8")
     (teacher_cache / "config.json").write_text("x", encoding="utf-8")
+    if cached_teacher_metadata:
+        (teacher_cache / "README.md").write_text("x" * 2, encoding="utf-8")
+        (teacher_cache / ".gitattributes").write_text("x" * 3, encoding="utf-8")
     config = SimpleNamespace(
         resources=SimpleNamespace(vram_reserve_bytes=2 * 1024**3, phase_retries=2, download_bytes=21474836480,
                                   artifact_bytes=21474836480, cuda_seconds=86400, wall_seconds=172800),
@@ -708,6 +764,7 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
             "source_manifest_sha256": sha256_file(source_root / "manifest.json"),
             "source_prepare_sha256": sha256_file(source_root / "stages" / "prepare.json"),
             "policy": execution_policy,
+            "inherited_costs": {"cuda_seconds": inherited_cuda, "download_bytes": 8066717862},
             "artifact_baseline": {"source_bytes": 0, "feasibility_files": []},
             "runtime_identity": {"synthetic": True},
         }
@@ -742,6 +799,27 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
         )
         assert error is None
         assert authenticated == saved
+
+    pre_model_root, pre_model_manifest, pre_model_context = bind_execution(root, "p")
+    from ppmoe.distill.evaluate import ResourceLimitError
+    with monkeypatch.context() as pre_model_patch:
+        pre_model_patch.setattr(
+            study, "preflight_disk",
+            lambda *_a, **_k: (_ for _ in ()).throw(ResourceLimitError("synthetic low disk")),
+        )
+        stopped = study.run_calibration_stage(
+            root, config, repo_root=repo_root, config_path=tmp_path / "config.toml",
+            execution_root=pre_model_root, active_job=pre_model_context,
+            worker_loader=lambda *_a: pytest.fail("pre-model stop constructed a worker"),
+        )
+    assert stopped["status"] == "stopped_environment"
+    assert stopped["resource_ledger"]["cuda_seconds"] == inherited_cuda
+    assert stopped["resource_ledger"]["download_bytes"] == 8066717862
+    assert stopped["model_inventory_status"] == "not_authenticated"
+    assert pre_model_manifest["inherited_costs"] == {
+        "cuda_seconds": inherited_cuda, "download_bytes": 8066717862,
+    }
+
     execution_root, execution_manifest, execution_context = bind_execution(root, "x")
     active_reservation_root[0] = execution_root
     original_signature = study.calibration_stage_signature
@@ -792,6 +870,8 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
                                          worker_loader=lambda role, candidate: FakeWorker(role))
     assert result["status"] == "awaiting_review"
     assert_authenticated_producer_artifact(execution_root, execution_manifest, execution_context, "awaiting_review")
+    assert result["resource_ledger"]["cuda_seconds"] >= inherited_cuda
+    assert result["resource_ledger"]["download_bytes"] >= 8066717862
     assert generated == {"student": 59, "teacher": 60}
     packet = execution_root / result["review_packet"]
     packet_text = packet.read_text(encoding="utf-8")
@@ -802,9 +882,20 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
     assert ("student", artifact_student, ".cache") in authenticated_paths
     assert any(repo == "teacher" and path == teacher_cache and excluded is None for repo, path, excluded in authenticated_paths)
     reservation_events = [json.loads(line) for line in (execution_root / "stages" / "calibrate-reservations.jsonl").read_text().splitlines()]
-    teacher_reservation = next(item for item in reservation_events if item.get("event_type") == "download_reservation" and item.get("role") == "teacher")
-    assert teacher_reservation["reserved_bytes"] == 5
-    assert teacher_reservation["missing_files"] == [".gitattributes", "README.md"]
+    teacher_reservations = [item for item in reservation_events if item.get("event_type") == "download_reservation" and item.get("role") == "teacher"]
+    if cached_teacher_metadata:
+        assert teacher_reservations == []
+        assert result["resource_ledger"]["download_bytes"] == 8066717862
+    else:
+        assert len(teacher_reservations) == 1
+        assert teacher_reservations[0]["reserved_bytes"] == 5
+        assert teacher_reservations[0]["missing_files"] == [".gitattributes", "README.md"]
+    stage_reservation = next(
+        item for item in reservation_events
+        if item.get("event_type") == "reservation" and "initial_cuda_seconds" in item
+    )
+    assert stage_reservation["initial_cuda_seconds"] == inherited_cuda
+    assert stage_reservation["initial_download_bytes"] == 8066717862
     with pytest.raises(FileExistsError, match="immutable"):
         study.run_calibration_stage(root, config, repo_root=repo_root, config_path=tmp_path / "config.toml",
                                     execution_root=execution_root, active_job=execution_context,
@@ -827,6 +918,8 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
         )),
     )
     assert failed_result["status"] == "stopped_environment"
+    assert failed_result["resource_ledger"]["cuda_seconds"] >= inherited_cuda
+    assert failed_result["resource_ledger"]["download_bytes"] >= 8066717862
     assert_authenticated_producer_artifact(failure_execution_root, failure_execution_manifest, failure_execution_context, "stopped_environment")
     assert (failure_execution_root / "stages" / "calibrate.json").is_file()
     failed_row_paths = [

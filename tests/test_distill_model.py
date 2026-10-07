@@ -102,6 +102,142 @@ def test_model_placement_rejects_cpu_or_disk_offload() -> None:
         validate_cuda_placement(Placed())
 
 
+def test_model_placement_accepts_actual_cuda0_tensors_without_hf_map() -> None:
+    from types import SimpleNamespace
+
+    class Placed:
+        def named_parameters(self):
+            return [("weight", SimpleNamespace(device="cuda:0", quant_state=None))]
+
+        def named_buffers(self):
+            return [("buffer", SimpleNamespace(device="cuda:0"))]
+
+    assert validate_cuda_placement(Placed()) == {
+        "parameter_count": 1, "buffer_count": 1, "quant_state_tensor_count": 0,
+        "devices": ["cuda:0"],
+    }
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta", None, "cuda:1"])
+def test_model_placement_rejects_any_non_cuda0_actual_tensor(device) -> None:
+    from types import SimpleNamespace
+
+    class Placed:
+        hf_device_map = {"model": 0}
+        def named_parameters(self):
+            return [("weight", SimpleNamespace(device="cuda:0", quant_state=None))]
+
+        def named_buffers(self):
+            return [("buffer", SimpleNamespace(device=device))]
+
+    with pytest.raises(ValueError, match="CUDA device 0"):
+        validate_cuda_placement(Placed())
+
+
+def test_model_placement_rejects_nested_quant_state_tensor_on_other_device() -> None:
+    from types import SimpleNamespace
+
+    class Placed:
+        def named_parameters(self):
+            quant_state = SimpleNamespace(absmax=SimpleNamespace(device="cuda:0"))
+            quant_state.state2 = SimpleNamespace(code=SimpleNamespace(device="cpu"))
+            quant_state.offset = SimpleNamespace(device="cuda:0")
+            return [("weight", SimpleNamespace(device="cuda:0", quant_state=quant_state))]
+
+        def named_buffers(self):
+            return []
+
+    with pytest.raises(ValueError, match="CUDA device 0"):
+        validate_cuda_placement(Placed())
+
+
+def test_model_placement_requires_parameters_and_rejects_misleading_maps() -> None:
+    from types import SimpleNamespace
+
+    class Empty:
+        hf_device_map = {"model": 0}
+        def named_parameters(self): return []
+        def named_buffers(self): return []
+
+    with pytest.raises(ValueError, match="parameter"):
+        validate_cuda_placement(Empty())
+
+    class Misleading:
+        hf_device_map = {"model": "cuda:1"}
+        def named_parameters(self): return [("weight", SimpleNamespace(device="cuda:0"))]
+        def named_buffers(self): return []
+
+    with pytest.raises(ValueError, match="device map"):
+        validate_cuda_placement(Misleading())
+
+
+@pytest.mark.parametrize("device_map", [{"model": True}, {"model": "somewhere"}, {}, [0]])
+def test_model_placement_rejects_malformed_or_unknown_present_device_map(device_map) -> None:
+    from types import SimpleNamespace
+
+    class Placed:
+        hf_device_map = device_map
+        def named_parameters(self): return [("weight", SimpleNamespace(device="cuda:0"))]
+        def named_buffers(self): return []
+
+    with pytest.raises(ValueError, match="device map"):
+        validate_cuda_placement(Placed())
+
+
+def test_load_worker_emits_bounded_placement_summary_after_validation(monkeypatch, tmp_path: Path, capsys) -> None:
+    import sys
+    import types
+    from types import SimpleNamespace
+    from ppmoe.distill.model import load_hf_worker
+
+    class FakeTorch:
+        bfloat16 = object()
+        class cuda:
+            @staticmethod
+            def get_device_properties(_index): return SimpleNamespace(total_memory=16 * 1024**3)
+            @staticmethod
+            def max_memory_allocated(): return 10
+            @staticmethod
+            def max_memory_reserved(): return 20
+
+    class Model:
+        hf_device_map = {"model": 0}
+        generation_config = SimpleNamespace(eos_token_id=2)
+        training = False
+        def eval(self): pass
+        def named_parameters(self): return [("weight", SimpleNamespace(device="cuda:0", requires_grad=False, quant_state=None))]
+        def named_buffers(self): return [("buffer", SimpleNamespace(device="cuda:0"))]
+
+    class AutoModel:
+        @staticmethod
+        def from_pretrained(*_args, **_kwargs): return Model()
+
+    class AutoTokenizer:
+        @staticmethod
+        def from_pretrained(*_args, **_kwargs): return FakeTokenizer()
+
+    transformers = types.ModuleType("transformers")
+    transformers.AutoModelForCausalLM = AutoModel
+    transformers.AutoTokenizer = AutoTokenizer
+    transformers.BitsAndBytesConfig = lambda **_kwargs: object()
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch)
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    teacher_dir = tmp_path / ".cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/teacher-pin"
+    teacher_dir.mkdir(parents=True)
+    config = SimpleNamespace(
+        teacher=SimpleNamespace(repo_id="teacher", revision="teacher-pin"),
+        resources=SimpleNamespace(vram_reserve_bytes=2 * 1024**3),
+        prompt=FakePromptConfig(),
+    )
+
+    load_hf_worker("teacher", config, repo_root=tmp_path, snapshot_path=teacher_dir)
+    emitted = json.loads(capsys.readouterr().out.strip())
+    assert emitted == {
+        "event": "model_placement", "role": "teacher", "parameter_count": 1,
+        "buffer_count": 1, "quant_state_tensor_count": 0, "devices": ["cuda:0"],
+    }
+
+
 def test_student_base_must_have_no_trainable_parameters() -> None:
     verify_student_is_frozen(FakeModel())
     with pytest.raises(ValueError, match="trainable"):

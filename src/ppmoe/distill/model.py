@@ -44,13 +44,74 @@ def validate_cuda_memory(*, allocated: int, reserved: int, memory_cap: int) -> N
         raise ValueError(f"CUDA peak reserved bytes {reserved} exceed cap {memory_cap}")
 
 
-def validate_cuda_placement(model: Any) -> None:
-    """Reject Transformers CPU/disk offload, which is outside this study's contract."""
-    device_map = getattr(model, "hf_device_map", None)
-    if not isinstance(device_map, Mapping) or not device_map:
-        raise ValueError("model device placement is unavailable for offload validation")
-    if any(str(device).lower() in {"cpu", "disk", "meta"} for device in device_map.values()):
-        raise ValueError("CPU/disk offload is not permitted for calibration")
+def validate_cuda_placement(model: Any) -> dict[str, Any]:
+    """Require every model tensor and known bitsandbytes quant-state tensor on CUDA:0."""
+    missing = object()
+    device_map = getattr(model, "hf_device_map", missing)
+    if device_map is not missing:
+        if not isinstance(device_map, Mapping) or not device_map:
+            raise ValueError("model device map is malformed for CUDA placement validation")
+        for device in device_map.values():
+            if isinstance(device, bool):
+                valid = False
+            elif type(device) is int:
+                valid = device == 0
+            else:
+                valid = str(device).strip().lower() in {"cuda", "cuda:0"}
+            if not valid:
+                raise ValueError("model device map contains CPU/disk offload or a non-CUDA:0 placement")
+
+    parameter_count = 0
+    buffer_count = 0
+    quant_state_tensor_count = 0
+    devices: set[str] = set()
+
+    def validate_tensor(tensor: Any, *, quant_state: bool = False) -> None:
+        nonlocal quant_state_tensor_count
+        device = getattr(tensor, "device", missing)
+        if device is missing:
+            raise ValueError("model tensor has no device for CUDA device 0 validation")
+        normalized = str(device).strip().lower()
+        if normalized not in {"cuda", "cuda:0"}:
+            raise ValueError(f"model tensor is not on CUDA device 0: {normalized or 'malformed device'}")
+        devices.add("cuda:0")
+        if quant_state:
+            quant_state_tensor_count += 1
+
+    def inspect_quant_state(value: Any, visited: set[int]) -> None:
+        if value is None:
+            return
+        identity = id(value)
+        if identity in visited:
+            return
+        visited.add(identity)
+        if hasattr(value, "device"):
+            validate_tensor(value, quant_state=True)
+            return
+        for field in ("absmax", "code", "offset", "state2"):
+            if hasattr(value, field):
+                inspect_quant_state(getattr(value, field), visited)
+
+    try:
+        parameters = list(model.named_parameters())
+        buffers = list(model.named_buffers())
+    except (AttributeError, TypeError) as exc:
+        raise ValueError("model parameters and buffers are unavailable for CUDA placement validation") from exc
+    if not parameters:
+        raise ValueError("model has no parameters for CUDA placement validation")
+    parameter_count = len(parameters)
+    buffer_count = len(buffers)
+    for _name, parameter in parameters:
+        validate_tensor(parameter)
+        inspect_quant_state(getattr(parameter, "quant_state", None), set())
+    for _name, buffer in buffers:
+        validate_tensor(buffer)
+    return {
+        "parameter_count": parameter_count,
+        "buffer_count": buffer_count,
+        "quant_state_tensor_count": quant_state_tensor_count,
+        "devices": sorted(devices),
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,7 +396,7 @@ def load_hf_worker(
         tokenizer_snapshot_path or snapshot, local_files_only=True,
     )
     model.eval()
-    validate_cuda_placement(model)
+    placement_summary = validate_cuda_placement(model)
     validate_cuda_memory(
         allocated=int(torch.cuda.max_memory_allocated()),
         reserved=int(torch.cuda.max_memory_reserved()),
@@ -343,6 +404,7 @@ def load_hf_worker(
     )
     if role == "student":
         verify_student_is_frozen(model)
+    print(json.dumps({"event": "model_placement", "role": role, **placement_summary}, sort_keys=True, separators=(",", ":")), flush=True)
     return HuggingFaceWorker(role, model, tokenizer, config.prompt, torch, eos_token_ids=eos_token_ids, memory_cap_bytes=memory_cap)
 
 
