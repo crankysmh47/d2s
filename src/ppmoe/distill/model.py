@@ -9,6 +9,7 @@ import json
 import multiprocessing
 from pathlib import Path
 import time
+from numbers import Integral
 from typing import Any, Callable, Mapping, Sequence
 
 
@@ -138,15 +139,24 @@ def build_prompt_ids(tokenizer: Any, prompt_config: Any, question: str) -> list[
         tokenize=True,
         add_generation_prompt=True,
         enable_thinking=False,
+        return_dict=False,
     )
     if hasattr(encoded, "tolist"):
         encoded = encoded.tolist()
-    if encoded and isinstance(encoded[0], list):
+    if isinstance(encoded, Mapping) or not isinstance(encoded, Sequence) or isinstance(encoded, (str, bytes)):
+        raise ValueError("chat template did not return token IDs")
+    if not encoded:
+        raise ValueError("chat template returned no token IDs")
+    if isinstance(encoded[0], Sequence) and not isinstance(encoded[0], (str, bytes)):
         if len(encoded) != 1:
             raise ValueError("chat template returned a non-singleton batch")
         encoded = encoded[0]
-    if not isinstance(encoded, Sequence) or isinstance(encoded, (str, bytes)):
+    if isinstance(encoded, Mapping) or not isinstance(encoded, Sequence) or isinstance(encoded, (str, bytes)):
         raise ValueError("chat template did not return token IDs")
+    if not encoded:
+        raise ValueError("chat template returned no token IDs")
+    if any(isinstance(token, bool) or not isinstance(token, Integral) or token < 0 for token in encoded):
+        raise ValueError("chat template returned invalid token IDs")
     return [int(token) for token in encoded]
 
 

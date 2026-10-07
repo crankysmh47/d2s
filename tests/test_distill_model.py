@@ -22,10 +22,15 @@ from ppmoe.distill.model import (
 class FakeTokenizer:
     def __init__(self) -> None:
         self.calls: list[dict] = []
+        self.encoded = [10, 11, 12]
 
     def apply_chat_template(self, messages, **kwargs):
         self.calls.append({"messages": messages, **kwargs})
-        return [10, 11, 12]
+        from transformers.tokenization_utils_base import BatchEncoding
+
+        if kwargs.get("return_dict", True):
+            return BatchEncoding({"input_ids": self.encoded})
+        return self.encoded
 
 
 class FakeParam:
@@ -59,6 +64,45 @@ def test_prompt_uses_chat_template_once_without_duplicate_special_tokens() -> No
     assert tokenizer.calls[0]["tokenize"] is True
     assert tokenizer.calls[0]["add_generation_prompt"] is True
     assert tokenizer.calls[0]["enable_thinking"] is False
+    assert tokenizer.calls[0]["return_dict"] is False
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        [],
+        {"input_ids": [1, 2]},
+        "12",
+        [True],
+        [-1],
+        [1.0],
+        ["1"],
+        [[1], [2]],
+        [1, [2]],
+    ],
+    ids=["empty", "mapping", "string", "bool", "negative", "float", "numeric-string", "two-batches", "nested-invalid"],
+)
+def test_prompt_rejects_malformed_token_id_outputs(encoded) -> None:
+    tokenizer = FakeTokenizer()
+    tokenizer.encoded = encoded
+    with pytest.raises(ValueError):
+        build_prompt_ids(tokenizer, FakePromptConfig(), "2+5?")
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        pytest.param([10, 11, 12], id="plain-list"),
+        pytest.param([[10, 11, 12]], id="singleton-list-batch"),
+        pytest.param(__import__("torch").tensor([10, 11, 12]), id="tensor"),
+        pytest.param(__import__("torch").tensor([[10, 11, 12]]), id="tensor-singleton-batch"),
+        pytest.param(__import__("numpy").array([10, 11, 12], dtype="int64"), id="numpy-integer-ids"),
+    ],
+)
+def test_prompt_accepts_integer_id_sequence_after_supported_normalization(encoded) -> None:
+    tokenizer = FakeTokenizer()
+    tokenizer.encoded = encoded
+    assert build_prompt_ids(tokenizer, FakePromptConfig(), "2+5?") == [10, 11, 12]
 
 
 def test_prompt_overflow_is_rejected_before_generation() -> None:
