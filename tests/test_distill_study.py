@@ -780,6 +780,10 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
         monkeypatch.setattr(study, "_execution_job_intervals", lambda *_a, **_k: {})
         return execution_root, manifest_record, context
 
+    # This parametrized producer test uses a supplied manifest mapping for the
+    # broad replay/download cases below. The separate schema-2 integration test
+    # exercises the real recovery and execution validators end to end.
+
     def assert_authenticated_producer_artifact(execution_root: Path, execution_manifest: dict, context, status: str):
         from ppmoe.distill.background import _authenticated_stage_artifact
         from hashlib import sha256
@@ -975,6 +979,119 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
         if path.is_file() and (base == overcap_root / "calibration" or path.name.startswith("calibrate"))
     )
     assert saved_terminal["resource_ledger"]["artifact_bytes"] == measured
+
+
+def _real_schema2_recovery_execution(tmp_path: Path, monkeypatch):
+    import shutil
+    from hashlib import sha256
+    from ppmoe.distill import recovery
+    from ppmoe.distill.execution import validate_execution
+    from ppmoe.distill.recovery import register_recovery
+
+    repo_root = Path(__file__).parents[1]
+    config_path = repo_root / "configs/distillation-v1.toml"
+    predecessor_id = "fc901bb0766a9c79fb205302d220fe727a99ebbd0b315e6ee4ad4e66e6733634"
+    original_predecessor = repo_root / "artifacts/distillation-v1-executions" / predecessor_id
+    executions_root = tmp_path / "executions"
+    executions_root.mkdir()
+    predecessor = executions_root / predecessor_id
+    shutil.copytree(original_predecessor, predecessor)
+    reviewed_files = {
+        path.relative_to(predecessor).as_posix(): sha256(path.read_bytes()).hexdigest()
+        for path in predecessor.rglob("*")
+        if path.is_file() and path.name not in {"status.json", "status.md"}
+    }
+    monkeypatch.setattr(recovery, "REVIEWED_IMMUTABLE_FILES", reviewed_files)
+    execution_root = register_recovery(
+        predecessor, executions_root, repo_root=repo_root, config_path=config_path,
+    )
+    manifest = validate_execution(execution_root, repo_root=repo_root, config_path=config_path)
+    return execution_root, manifest, repo_root, config_path
+
+
+def test_real_schema2_validation_seeds_producer_and_rejects_rebound_costs(monkeypatch, tmp_path: Path) -> None:
+    import json
+    import time
+    from ppmoe.distill import execution
+    from ppmoe.distill.config import load_config
+    from ppmoe.distill.evaluate import ResourceLimitError
+    from ppmoe.distill.execution import ActiveJobContext
+    import ppmoe.distill.study as study
+
+    execution_root, manifest, repo_root, config_path = _real_schema2_recovery_execution(tmp_path, monkeypatch)
+    assert manifest["schema_version"] == 2
+    assert manifest["inherited_costs"] == {"cuda_seconds": 1199, "download_bytes": 8066717862}
+
+    tamper_parent = tmp_path / "tampered"
+    tamper_parent.mkdir()
+    tampered_root = tamper_parent / execution_root.name
+    import shutil
+    shutil.copytree(execution_root, tampered_root)
+    tampered_manifest = json.loads((tampered_root / "execution.json").read_text(encoding="utf-8"))
+    tampered_manifest["inherited_costs"]["cuda_seconds"] = 1228
+    unsigned = {key: value for key, value in tampered_manifest.items() if key != "execution_id"}
+    tampered_manifest["execution_id"] = execution._sha(unsigned)
+    rebound_root = tamper_parent / tampered_manifest["execution_id"]
+    (tampered_root / "execution.json").write_bytes(execution._canonical(tampered_manifest) + b"\n")
+    tampered_root.rename(rebound_root)
+    source_root = Path(manifest["source_root"])
+    config = load_config(config_path)
+    altered_context = ActiveJobContext(
+        execution_id=rebound_root.name, attempt_id="altered-cost-attempt",
+        stage="calibrate", prior_active_seconds=31,
+        started_monotonic_ns=time.monotonic_ns(), supervisor_pid=os.getpid(),
+        supervisor_created_utc="2026-10-07T00:00:00.000000Z", stage_signature="s" * 64,
+    )
+    with pytest.raises(ValueError, match="inherited|recovery"):
+        study.run_calibration_stage(
+            source_root, config, repo_root=repo_root, config_path=config_path,
+            execution_root=rebound_root, active_job=altered_context,
+            worker_loader=lambda *_a: pytest.fail("altered inherited costs reached worker construction"),
+        )
+
+    stage_signature = execution.execution_stage_signature(
+        execution_root, "calibrate", repo_root=repo_root,
+    )
+    active_job = ActiveJobContext(
+        execution_id=execution_root.name, attempt_id="task1-schema2-attempt",
+        stage="calibrate", prior_active_seconds=manifest["inherited_active_seconds"],
+        started_monotonic_ns=time.monotonic_ns(), supervisor_pid=os.getpid(),
+        supervisor_created_utc="2026-10-07T00:00:00.000000Z",
+        stage_signature=stage_signature,
+    )
+    real_validate_execution = execution.validate_execution
+    validation_calls = []
+
+    def observe_real_validation(*args, **kwargs):
+        result = real_validate_execution(*args, **kwargs)
+        validation_calls.append(result)
+        return result
+
+    monkeypatch.setattr(execution, "validate_execution", observe_real_validation)
+    monkeypatch.setattr(execution, "load_active_job", lambda *_a, **_k: active_job)
+    monkeypatch.setattr(study, "_execution_job_intervals", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        study, "preflight_disk",
+        lambda *_a, **_k: (_ for _ in ()).throw(ResourceLimitError("synthetic pre-model stop")),
+    )
+    result = study.run_calibration_stage(
+        source_root, config, repo_root=repo_root, config_path=config_path,
+        execution_root=execution_root,
+        active_job=active_job,
+        worker_loader=lambda *_a: pytest.fail("pre-model stop constructed a worker"),
+    )
+
+    assert validation_calls
+    assert any(
+        item.get("schema_version") == 2 and item["inherited_costs"] == manifest["inherited_costs"]
+        for item in validation_calls
+    )
+    assert result["status"] == "stopped_environment"
+    assert result["resource_ledger"]["cuda_seconds"] == 1199
+    assert result["resource_ledger"]["download_bytes"] == 8066717862
+    saved = json.loads((execution_root / "stages/calibrate.json").read_text(encoding="utf-8"))
+    assert saved["resource_ledger"]["cuda_seconds"] == 1199
+    assert saved["resource_ledger"]["download_bytes"] == 8066717862
 
 
 def test_calibration_terminal_rejects_conflicting_preexisting_stage(tmp_path: Path) -> None:
