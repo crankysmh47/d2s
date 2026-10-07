@@ -77,13 +77,9 @@ def test_calibration_code_signature_binds_task1_and_task2_transitive_files(tmp_p
 
 def _copy_calibration_test_repo(repo_root: Path) -> Path:
     source_repo = Path(__file__).parents[1]
-    from ppmoe.distill.study import ACTIVE_FILES, CALIBRATION_FILES
+    from ppmoe.distill.study import ACTIVE_FILES, CALIBRATION_FILES, EXECUTION_COMMON_FILES
 
-    active = set(ACTIVE_FILES) | set(CALIBRATION_FILES) | {
-        "src/ppmoe/distill/execution.py",
-        "tests/test_distill_execution.py",
-        "tests/test_distill_evaluate.py",
-        "tests/test_distill_study.py",
+    active = set(ACTIVE_FILES) | set(CALIBRATION_FILES) | set(EXECUTION_COMMON_FILES) | {
         "scripts/run_distillation_v1.py",
     }
     for relative in active | {"uv.lock", "pyproject.toml"}:

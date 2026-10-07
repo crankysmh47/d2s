@@ -65,6 +65,18 @@ CALIBRATION_FILES = (
     "pyproject.toml",
     "uv.lock",
 )
+EXECUTION_COMMON_FILES = (
+    "src/ppmoe/distill/execution.py",
+    "src/ppmoe/distill/background.py",
+    "src/ppmoe/distill/windows_job.py",
+    "scripts/run_distillation_background.py",
+    "tests/test_distill_execution.py",
+    "tests/test_distill_background.py",
+    "tests/test_distill_windows_job.py",
+    "tests/distill_background_cpu_fixture.py",
+    "tests/test_distill_evaluate.py",
+    "tests/test_distill_study.py",
+)
 TASK1_RUN_ID = "acd8dfc400c8f079d0403da5d4b981b8aac8e94226db8760f632c8307ff785c2"
 TASK1_MANIFEST_SHA256 = "bf0233bc65cd7f6554c7ab5269f17e051c31ff3903751ef7a24297ee203370ed"
 TASK1_PREPARE_SHA256 = "970f1f669326ac26bb08af7c929180a61ba72915e5a1fb081b69914835ccfe9e"
@@ -73,6 +85,15 @@ TASK1_ORIGINATING_COMMIT = "4bd6d6ab0a66f4753799d45a6bc6f5bb4fb70c63"
 
 class StageError(RuntimeError):
     """A registered stage is unavailable or its prerequisites are invalid."""
+
+
+def execution_stage_files(stage: str) -> tuple[str, ...]:
+    """Return the closed source surface for an implemented execution stage."""
+    if stage not in KNOWN_STAGES:
+        raise StageError(f"unknown stage {stage}")
+    if stage != "calibrate":
+        raise StageError(f"execution stage {stage} is registered but not implemented")
+    return tuple(sorted(set(CALIBRATION_FILES) | set(EXECUTION_COMMON_FILES)))
 
 
 @dataclass(frozen=True, slots=True)

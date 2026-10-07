@@ -335,6 +335,9 @@ def read_events(execution_root: Path) -> list[dict[str, Any]]:
 
 def validate_job_intervals(execution_root: Path) -> dict[str, dict[str, Any]]:
     """Validate the ordered cumulative job clock and return its authenticated state."""
+    from .study import KNOWN_STAGES
+
+    compute_stages = KNOWN_STAGES - {"preflight", "prepare"}
     root = _checked_path(Path(execution_root)).resolve(strict=True)
     try:
         manifest = json.loads(_checked_path(root / "execution.json").read_text(encoding="utf-8"))
@@ -365,7 +368,7 @@ def validate_job_intervals(execution_root: Path) -> dict[str, dict[str, Any]]:
         attempt_id = payload.get("attempt_id")
         if (
             payload.get("execution_id") != execution_id
-            or payload.get("stage") != "calibrate"
+            or payload.get("stage") not in compute_stages
             or not isinstance(attempt_id, str) or not attempt_id
         ):
             raise ValueError("execution job event has invalid execution/stage/attempt identity")
@@ -418,6 +421,7 @@ def validate_job_intervals(execution_root: Path) -> dict[str, dict[str, Any]]:
             or payload.get("supervisor_created_utc") != start.get("supervisor_created_utc")
             or payload.get("stage_pid") != start.get("stage_pid")
             or payload.get("stage_created_utc") != start.get("stage_created_utc")
+            or payload.get("stage") != start.get("stage")
             or payload.get("stage_signature") != start.get("stage_signature")
         ):
             raise ValueError("execution job settlement is out of order or has changed owner/interval identity")
@@ -467,18 +471,14 @@ def active_elapsed_seconds(context: ActiveJobContext, *, now_ns: int | None = No
 
 def execution_stage_signature(execution_root: Path, stage: str, *, repo_root: Path) -> str:
     """Hash the prelaunch source, policy, config/lock, and implemented code surface."""
-    if stage != "calibrate":
-        raise ValueError(f"execution stage {stage} is not implemented for production")
+    from .study import StageError, execution_stage_files
+    try:
+        files = execution_stage_files(stage)
+    except StageError as exc:
+        raise ValueError(str(exc)) from exc
     root = Path(execution_root)
     manifest = json.loads((root / "execution.json").read_text(encoding="utf-8"))
     repo = Path(repo_root)
-    from .study import CALIBRATION_FILES
-    files = sorted(set(CALIBRATION_FILES) | {
-        "src/ppmoe/distill/execution.py",
-        "tests/test_distill_execution.py",
-        "tests/test_distill_evaluate.py",
-        "tests/test_distill_study.py",
-    })
     code_signatures: dict[str, str] = {}
     for relative in files:
         path = _checked_path(repo / relative)

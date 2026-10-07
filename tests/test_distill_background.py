@@ -1,0 +1,306 @@
+from __future__ import annotations
+
+import json
+import os
+import importlib.util
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+import pytest
+
+from ppmoe.distill import execution, study
+from ppmoe.distill.background import execution_status, launch_stage, supervise_stage
+from ppmoe.distill import background
+from ppmoe.distill.windows_job import WindowsJob
+
+CPU_FIXTURE = Path(__file__).with_name("distill_background_cpu_fixture.py")
+
+
+def _canonical(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def _registered(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    spec = importlib.util.spec_from_file_location(
+        "test_distill_execution_fixture", Path(__file__).with_name("test_distill_execution.py"),
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _repo_and_config = module._repo_and_config
+
+    source_root, repo_root, config = _repo_and_config(tmp_path, monkeypatch)
+    root = execution.register_execution(source_root, tmp_path / "executions", repo_root=repo_root, config_path=config)
+    return root, source_root, repo_root, config
+
+
+def test_registered_future_stage_is_signed_but_not_launchable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root, _, repo, _ = _registered(tmp_path, monkeypatch)
+    assert "src/ppmoe/distill/background.py" in study.execution_stage_files("calibrate")
+    with pytest.raises(ValueError, match="not implemented"):
+        execution.execution_stage_signature(root, "qualify", repo_root=repo)
+    with pytest.raises(study.StageError, match="not implemented"):
+        launch_stage(root, "qualify", repo_root=repo, config_path=repo / "config.toml")
+
+
+def test_status_ignores_stale_snapshot_and_explains_corrupt_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root, _, repo, config = _registered(tmp_path, monkeypatch)
+    (root / "status.json").write_text('{"state":"completed"}\n', encoding="utf-8")
+    status = execution_status(root, repo_root=repo, config_path=config)
+    assert status["state"] == "registered"
+    assert status["snapshot_stale"] is True
+    (root / "events.jsonl").write_bytes(b"{truncated")
+    broken = execution_status(root, repo_root=repo, config_path=config)
+    assert broken["state"] == "stopped_environment"
+    assert "truncated" in broken["diagnostic"].lower()
+
+
+def test_settled_clock_chain_allows_future_registered_stage_names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root, _, _, _ = _registered(tmp_path, monkeypatch)
+    owner = {"supervisor_pid": os.getpid(), "supervisor_created_utc": "2026-10-07T00:00:00.000000Z"}
+    for attempt, stage, start, end, prior, settled in (
+        ("a", "calibrate", 10, 1_000_000_010, 0, 1),
+        ("b", "train47", 9_000_000_010, 10_000_000_010, 1, 2),
+    ):
+        common = {
+            "execution_id": root.name, "attempt_id": attempt, "stage": stage,
+            "prior_active_seconds": prior, "started_monotonic_ns": start,
+            **owner, "stage_pid": os.getpid(), "stage_created_utc": "2026-10-07T00:00:01.000000Z",
+            "stage_signature": "f" * 64,
+        }
+        execution.append_event(root, {"type": "job_started", **common})
+        execution.append_event(root, {
+            "type": "job_settled", **common, "ended_monotonic_ns": end,
+            "settled_active_seconds": settled,
+        })
+    jobs = execution.validate_job_intervals(root)
+    assert jobs["b"]["settled_active_seconds"] == 2
+
+
+class _FakeJob:
+    def __init__(self, root: Path, result: dict[str, object] | None, *, log_bytes: int = 0) -> None:
+        self.root = root
+        self.result = result
+        self.log_bytes = log_bytes
+        self.active_processes = 0
+        self.terminated = False
+        self.poll_calls = 0
+
+    def start(self, _argv, *, stdout_path: Path, stderr_path: Path, cwd: Path):
+        del cwd
+        stdout_path.write_bytes(b"x" * self.log_bytes)
+        stderr_path.write_bytes(b"")
+        return {"pid": os.getpid(), "created_utc": "2026-10-07T00:00:00.000000Z"}
+
+    def resume(self):
+        if self.result is not None:
+            (self.root / "stages" / "calibrate.json").write_bytes(_canonical(self.result) + b"\n")
+
+    def poll(self):
+        self.poll_calls += 1
+        return 0
+
+    def terminate_and_wait(self, timeout_seconds=10):
+        self.terminated = True
+        self.active_processes = 0
+        return True
+
+    def close(self):
+        pass
+
+
+def _supervisor_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, result_status: str | None = "awaiting_review", artifact_cap: int = 10_000_000, log_bytes: int = 0):
+    root = tmp_path / ("e" * 64)
+    root.mkdir()
+    (root / "events.jsonl").touch()
+    (root / "execution.json").write_bytes(_canonical({"execution_id": root.name}) + b"\n")
+    (root / "stages").mkdir()
+    (root / "logs").mkdir()
+    manifest = {
+        "execution_id": root.name, "source_root": str(tmp_path / "source"),
+        "policy": {"active_runtime_seconds": 172800, "artifact_bytes": artifact_cap},
+        "artifact_baseline": {"source_bytes": 0, "feasibility_files": []},
+    }
+    monkeypatch.setattr(background, "validate_execution", lambda *_a, **_k: manifest)
+    monkeypatch.setattr(background, "validate_job_intervals", lambda _root: {})
+    signature = "a" * 64
+    monkeypatch.setattr(background, "execution_stage_signature", lambda *_a, **_k: signature)
+    result = None if result_status is None else {
+        "execution_id": root.name, "execution_stage_signature": signature,
+        "status": result_status, "reason": "fixture outcome",
+        "review_packet": "calibration/review/packet.csv",
+        "private_review_map": "calibration/review/private-map.json",
+    }
+    job = _FakeJob(root, result, log_bytes=log_bytes)
+    monkeypatch.setattr(background, "process_creation_utc", lambda _pid: "2026-10-07T00:00:00.000000Z")
+    return root, manifest, job
+
+
+@pytest.mark.parametrize(
+    ("result_status", "expected_state", "terminal"),
+    [("awaiting_review", "awaiting_review", False),
+     ("completed", "completed", False),
+     ("stopped_scientific", "stopped_scientific", True),
+     (None, "stopped_environment", True)],
+)
+def test_stage_outcome_is_authenticated_and_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    result_status: str | None, expected_state: str, terminal: bool,
+):
+    root, _manifest, job = _supervisor_fixture(tmp_path, monkeypatch, result_status=result_status)
+    result = supervise_stage(
+        root, "calibrate", repo_root=tmp_path, config_path=tmp_path / "config.toml",
+        _job_factory=lambda: job, _argv_builder=lambda *_a: ["cpu-fixture"],
+        _attempt_id="test-attempt", _clock_ns=lambda: 10_000_000_000,
+    )
+    assert result in {0, 2}
+    status = json.loads((root / "status.json").read_text(encoding="utf-8"))
+    assert status["state"] == expected_state
+    assert (root / "terminal.json").exists() is terminal
+    events = execution.read_events(root)
+    assert any(event["payload"].get("type") == "job_settled" for event in events)
+    assert job.poll_calls == 1
+
+
+def test_log_growth_triggers_owned_termination(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root, _manifest, job = _supervisor_fixture(
+        tmp_path, monkeypatch, result_status=None, artifact_cap=1024 * 1024 + 100, log_bytes=4096,
+    )
+    supervise_stage(
+        root, "calibrate", repo_root=tmp_path, config_path=tmp_path / "config.toml",
+        _job_factory=lambda: job, _argv_builder=lambda *_a: ["cpu-fixture"],
+        _attempt_id="growth-attempt", _clock_ns=lambda: 10_000_000_000,
+    )
+    assert job.terminated is True
+    status = json.loads((root / "status.json").read_text(encoding="utf-8"))
+    assert status["state"] == "stopped_environment"
+    assert "artifact" in status["reason"]
+
+
+def test_settled_or_reviewed_stage_cannot_launch_twice_or_skip_to_future_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    root, _manifest, job = _supervisor_fixture(tmp_path, monkeypatch)
+    kwargs = {
+        "repo_root": tmp_path, "config_path": tmp_path / "config.toml",
+        "_job_factory": lambda: job, "_argv_builder": lambda *_a: ["cpu-fixture"],
+        "_attempt_id": "first", "_clock_ns": lambda: 20_000_000_000,
+    }
+    supervise_stage(root, "calibrate", **kwargs)
+    with pytest.raises(RuntimeError, match="already has a settled attempt"):
+        supervise_stage(root, "calibrate", **{**kwargs, "_attempt_id": "second"})
+    with pytest.raises(study.StageError, match="not implemented"):
+        supervise_stage(root, "train47", **kwargs)
+    assert job.poll_calls == 1
+
+
+def test_invalid_policy_or_stage_signature_refuses_before_child_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    root, _manifest, _job = _supervisor_fixture(tmp_path, monkeypatch)
+    def forbidden_factory():
+        raise AssertionError("worker must not be created after signature validation fails")
+    monkeypatch.setattr(background, "execution_stage_signature", lambda *_a, **_k: (_ for _ in ()).throw(ValueError("signature drift")))
+    with pytest.raises(ValueError, match="signature drift"):
+        supervise_stage(root, "calibrate", repo_root=tmp_path, config_path=tmp_path / "config.toml",
+                        _job_factory=forbidden_factory, _argv_builder=lambda *_a: ["unused"])
+
+
+@pytest.mark.skipif(os.name != "nt", reason="watchdog process-tree test requires Windows Job Objects")
+def test_watchdog_deadline_terminates_real_cpu_child_and_grandchild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    root, _manifest, _job = _supervisor_fixture(tmp_path, monkeypatch, result_status=None)
+    work = tmp_path / "watchdog child path with spaces"
+    work.mkdir()
+    child = work / "parent.py"
+    marker = work / "grandchild marker.txt"
+    child.write_text(
+        "import subprocess,sys,time\n"
+        f"subprocess.Popen([sys.executable, '-c', \"import time; from pathlib import Path; time.sleep(1); Path({str(marker)!r}).write_text('escaped')\"])\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+
+    class AdvancingClock:
+        def __init__(self):
+            self.value = time.monotonic_ns()
+
+        def __call__(self):
+            return self.value
+
+        def advance(self, _seconds: float):
+            self.value += 172800 * 1_000_000_000
+
+    clock = AdvancingClock()
+    result = supervise_stage(
+        root, "calibrate", repo_root=tmp_path, config_path=tmp_path / "config.toml",
+        _job_factory=WindowsJob,
+        _argv_builder=lambda *_a: [sys.executable, str(child)],
+        _clock_ns=clock, _sleep=clock.advance, _attempt_id="watchdog-attempt",
+    )
+    assert result == 2
+    status = json.loads((root / "terminal.json").read_text(encoding="utf-8"))
+    assert status["state"] == "stopped_environment"
+    assert "runtime" in status["reason"]
+    time.sleep(1.2)
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires detached Windows supervisor process")
+def test_detached_cpu_launcher_exits_before_stage_and_other_invocation_reads_status(tmp_path: Path):
+    workspace = tmp_path / "cpu fixture path with spaces"
+    prepared = subprocess.run(
+        [sys.executable, str(CPU_FIXTURE), "prepare", "--workspace", str(workspace)],
+        cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=15,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    launched = subprocess.run(
+        [sys.executable, str(CPU_FIXTURE), "start", "--workspace", str(workspace)],
+        cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=15,
+    )
+    assert launched.returncode == 0, launched.stderr
+    start_record = json.loads(launched.stdout)
+    stdout_path = Path(start_record["stdout_path"])
+    assert "finished" not in stdout_path.read_text(encoding="utf-8")
+
+    deadline = time.monotonic() + 10
+    status: dict[str, object] = {}
+    while time.monotonic() < deadline:
+        result = subprocess.run(
+            [sys.executable, str(CPU_FIXTURE), "status", "--workspace", str(workspace)],
+            cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        status = json.loads(result.stdout)
+        if status["state"] == "awaiting_review":
+            break
+        time.sleep(0.2)
+    assert status["state"] == "awaiting_review"
+    assert "finished" in stdout_path.read_text(encoding="utf-8")
+    assert status["runtime_remaining_seconds"] < 172800
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires real concurrent detached Windows supervisors")
+def test_concurrent_detached_launchers_have_one_attempt_owner(tmp_path: Path):
+    workspace = tmp_path / "concurrent cpu fixture"
+    prepared = subprocess.run(
+        [sys.executable, str(CPU_FIXTURE), "prepare", "--workspace", str(workspace)],
+        cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=15,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    command = [sys.executable, str(CPU_FIXTURE), "start", "--workspace", str(workspace)]
+    launches = [subprocess.Popen(command, cwd=Path(__file__).resolve().parents[1],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                for _ in range(2)]
+    results = [process.communicate(timeout=15) for process in launches]
+    assert sorted(process.returncode for process in launches) == [0, 1]
+    succeeded = json.loads(next(stdout for process, (stdout, _stderr) in zip(launches, results) if process.returncode == 0))
+    fixture = json.loads((workspace / "fixture.json").read_text(encoding="utf-8"))
+    root = Path(fixture["execution_root"])
+    events = execution.read_events(root)
+    starts = [event["payload"] for event in events if event["payload"].get("type") == "job_started"]
+    assert len(starts) == 1
+    assert starts[0]["attempt_id"] == succeeded["attempt_id"]
