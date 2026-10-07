@@ -10,6 +10,8 @@
 
 **Spec:** docs/superpowers/specs/2026-10-07-production-path-repair-design.md.
 
+**Execution closeout (2026-10-07):** Tasks1/2 and engineering release completed after independent reviews, final fixes `f76ebe7`, root CPU1293passed/7skip/3CUDA deselected. Task3 registered/launched its single diagnostic on `da8a158`; execution `3116768bd90444328e1ec0e4f8b518a18c238ed74e643d24ae0a69affd0683eb` is terminal environment-stop before answers due to chat-template return type. Actual student CUDA0 placement and producer inherited-cost propagation passed; teacher/scientific quality untested. Final cumulative91active/1250CUDA/8066717862downloads; retained status/evidence in [execution state](../../distillation-v1-execution-state.md). Approval consumed; scientific continuation now requires separately authorized tokenization repair/new bounded execution, not an automatic retry under this plan.
+
 ## Global constraints
 
 - Work on exp; preserve unrelated task-14*.md, prepared source and both stopped executions.
