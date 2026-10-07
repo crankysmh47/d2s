@@ -17,7 +17,7 @@ def _canonical(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
 
-def _execution_fixture(workspace: Path, *, recovery: bool = False, repair: bool = False) -> dict[str, str]:
+def _execution_fixture(workspace: Path, *, recovery: bool = False, repair: bool = False, tokenizer_recovery: bool = False) -> dict[str, str]:
     spec = importlib.util.spec_from_file_location(
         "distill_task1_fixture", TESTS / "test_distill_execution.py",
     )
@@ -33,6 +33,14 @@ def _execution_fixture(workspace: Path, *, recovery: bool = False, repair: bool 
         source.parent.mkdir(parents=True)
         shutil.copytree(REPO_ROOT / "artifacts" / "distillation-v1-executions" / predecessor_id, source)
         root = register_repair_cli(source, source.parent, repo_root=REPO_ROOT, config_path=config)
+        source_root = Path(json.loads((source / "execution.json").read_text(encoding="utf-8"))["source_root"])
+    elif tokenizer_recovery:
+        from ppmoe.distill.background import register_tokenizer_recovery_cli
+        predecessor_id = "3116768bd90444328e1ec0e4f8b518a18c238ed74e643d24ae0a69affd0683eb"
+        source = workspace / "executions" / predecessor_id
+        source.parent.mkdir(parents=True)
+        shutil.copytree(REPO_ROOT / "artifacts" / "distillation-v1-executions" / predecessor_id, source)
+        root = register_tokenizer_recovery_cli(source, source.parent, repo_root=REPO_ROOT, config_path=config)
         source_root = Path(json.loads((source / "execution.json").read_text(encoding="utf-8"))["source_root"])
     elif recovery:
         from ppmoe.distill.background import register_recovery_cli
@@ -81,7 +89,7 @@ def _execution_fixture(workspace: Path, *, recovery: bool = False, repair: bool 
     fixture = {
         "execution_root": str(root), "repo_root": str(REPO_ROOT),
         "config_path": str(config), "source_root": str(source_root),
-        "schema_version": 3 if repair else (2 if recovery else 1),
+        "schema_version": 4 if tokenizer_recovery else (3 if repair else (2 if recovery else 1)),
         "manifest_sha256": study.TASK1_MANIFEST_SHA256 if not recovery else "",
         "prepare_sha256": study.TASK1_PREPARE_SHA256 if not recovery else "",
         "stop_sha256": execution.TASK1_STOP_SHA256 if not recovery else "",
@@ -173,6 +181,8 @@ def main() -> int:
     prepare_recovery.add_argument("--workspace", type=Path, required=True)
     prepare_repair = sub.add_parser("prepare-repair")
     prepare_repair.add_argument("--workspace", type=Path, required=True)
+    prepare_tokenizer = sub.add_parser("prepare-tokenizer-recovery")
+    prepare_tokenizer.add_argument("--workspace", type=Path, required=True)
     start = sub.add_parser("start")
     start.add_argument("--workspace", type=Path, required=True)
     start.add_argument("--duration", type=float)
@@ -182,9 +192,10 @@ def main() -> int:
     run.add_argument("--workspace", type=Path, required=True)
     run.add_argument("--attempt-id", required=True)
     args = parser.parse_args()
-    if args.action in {"prepare", "prepare-recovery", "prepare-repair"}:
+    if args.action in {"prepare", "prepare-recovery", "prepare-repair", "prepare-tokenizer-recovery"}:
         print(json.dumps(_execution_fixture(
             args.workspace, recovery=args.action == "prepare-recovery", repair=args.action == "prepare-repair",
+            tokenizer_recovery=args.action == "prepare-tokenizer-recovery",
         ), sort_keys=True))
         return 0
     if args.action == "start":

@@ -104,15 +104,20 @@ def artifact_baseline_bytes(manifest: Mapping[str, Any]) -> int:
     total = int(baseline.get("source_bytes", 0)) + sum(
         int(row["size_bytes"]) for row in baseline.get("feasibility_files", [])
     )
-    if manifest.get("schema_version") in {2, 3}:
+    if manifest.get("schema_version") in {2, 3, 4}:
         total += int(baseline.get("predecessor_immutable_bytes", 0))
         total += int(baseline.get("predecessor_status_reserve_bytes", 0))
         reservation = baseline.get("authorization_reservation", {})
         total += int(reservation.get("size_bytes", 0))
-    if manifest.get("schema_version") == 3:
+    if manifest.get("schema_version") in {3, 4}:
         total += int(baseline.get("repair_predecessor_immutable_bytes", 0))
         total += int(baseline.get("repair_predecessor_status_reserve_bytes", 0))
         reservation = baseline.get("repair_authorization_reservation", {})
+        total += int(reservation.get("size_bytes", 0))
+    if manifest.get("schema_version") == 4:
+        total += int(baseline.get("tokenizer_predecessor_immutable_bytes", 0))
+        total += int(baseline.get("tokenizer_predecessor_status_reserve_bytes", 0))
+        reservation = baseline.get("tokenizer_authorization_reservation", {})
         total += int(reservation.get("size_bytes", 0))
     return total
 
@@ -130,6 +135,9 @@ def initial_active_seconds(manifest: Mapping[str, Any]) -> int:
     elif schema == 3:
         context = manifest.get("repair")
         expected = 60
+    elif schema == 4:
+        context = manifest.get("tokenizer_recovery")
+        expected = 91
     else:
         raise ValueError("unsupported execution manifest schema for active clock")
     inherited = manifest.get("inherited_active_seconds")
@@ -319,6 +327,10 @@ def validate_execution(execution_root: Path, *, repo_root: Path, config_path: Pa
         from .repair_recovery import validate_repair_manifest
         validate_repair_manifest(manifest, repo_root=repo, config_path=config)
         expected_inherited_costs = {"cuda_seconds": 1228, "download_bytes": 8066717862}
+    elif manifest.get("schema_version") == 4:
+        from .tokenizer_recovery import validate_tokenizer_recovery_manifest
+        validate_tokenizer_recovery_manifest(manifest, repo_root=repo, config_path=config)
+        expected_inherited_costs = {"cuda_seconds": 1250, "download_bytes": 8066717862}
     else:
         raise ValueError("unsupported execution manifest schema")
     if manifest.get("inherited_costs") != expected_inherited_costs:

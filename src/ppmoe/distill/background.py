@@ -1087,3 +1087,31 @@ def register_repair_cli(
         "reason": None,
     })
     return root
+
+
+def register_tokenizer_recovery_cli(
+    previous_execution_root: Path,
+    executions_root: Path,
+    *,
+    repo_root: Path,
+    config_path: Path,
+) -> Path:
+    from .tokenizer_recovery import register_tokenizer_recovery
+
+    root = register_tokenizer_recovery(
+        previous_execution_root, executions_root,
+        repo_root=repo_root, config_path=config_path,
+    )
+    manifest = validate_execution(root, repo_root=repo_root, config_path=config_path)
+    append_event(root, {
+        "type": "registered", "execution_id": manifest["execution_id"],
+        "created_utc": manifest["created_utc"], "tokenizer_recovery": True,
+    })
+    initial = initial_active_seconds(manifest)
+    _write_status(root, {
+        "execution_id": manifest["execution_id"], "state": "registered",
+        "runtime_used_seconds": initial,
+        "runtime_remaining_seconds": max(0, ACTIVE_RUNTIME_SECONDS - initial),
+        "reason": None,
+    })
+    return root
