@@ -26,7 +26,7 @@ from .execution import (
     validate_job_intervals,
     execution_stage_signature,
 )
-from .study import StageError, execution_stage_files
+from .study import StageError, execution_stage_files, safe_output_path
 from .windows_job import direct_venv_launch
 
 
@@ -76,6 +76,12 @@ def _atomic_json(path: Path, value: Mapping[str, Any], *, immutable: bool = Fals
 
 def _write_status(root: Path, status: Mapping[str, Any]) -> None:
     record = dict(status)
+    if "costs" not in record:
+        try:
+            manifest = json.loads((root / "execution.json").read_text(encoding="utf-8"))
+            record.update(_resource_projection(root, manifest))
+        except Exception as exc:
+            record.update(_resource_projection(root, {}, measurement_error=str(exc)))
     record["updated_utc"] = _utc_now()
     _atomic_json(root / "status.json", record)
     lines = [
@@ -85,6 +91,15 @@ def _write_status(root: Path, status: Mapping[str, Any]) -> None:
         f"- Runtime used: `{record.get('runtime_used_seconds', 0)}` seconds",
         f"- Runtime remaining: `{record.get('runtime_remaining_seconds', 0)}` seconds",
         f"- Stop reason: {record.get('reason') or 'none'}",
+        f"- Diagnostic: {record.get('diagnostic') or 'none'}",
+        f"- CUDA: {_format_cost(record.get('costs', {}).get('cuda_seconds'))}",
+        f"- Download: {_format_cost(record.get('costs', {}).get('download_bytes'))}",
+        f"- Inherited costs: `{json.dumps(record.get('inherited_costs', {}), sort_keys=True)}`",
+        f"- Artifact usage: `{json.dumps(record.get('artifact_usage', {}), sort_keys=True)}`",
+        f"- Resource caps: `{json.dumps(record.get('resource_caps', {}), sort_keys=True)}`",
+        f"- Cost provenance: `{json.dumps(record.get('cost_provenance', {}), sort_keys=True)}`",
+        f"- Review packet: `{', '.join(record.get('review_packet_paths', [])) or 'none'}`",
+        f"- Next action: {record.get('next_action') or 'inspect status and diagnostics'}",
         f"- Logs: `{root / 'logs'}`",
     ]
     body = ("\n".join(lines) + "\n").encode("utf-8")
@@ -132,6 +147,202 @@ def _record_payload(root: Path, record_name: str) -> dict[str, Any] | None:
     return value
 
 
+def _format_cost(value: Mapping[str, Any] | None) -> str:
+    if not value or value.get("total") is None:
+        return "unavailable/incomplete"
+    state = "complete" if value.get("complete") else "incomplete"
+    return f"{value['total']} ({state})"
+
+
+def _resource_projection(
+    root: Path,
+    manifest: Mapping[str, Any],
+    *,
+    artifact: Mapping[str, Any] | None = None,
+    artifact_authenticated: bool = False,
+    artifact_sha256: str | None = None,
+    measurement_error: str | None = None,
+) -> dict[str, Any]:
+    inherited = manifest.get("inherited_costs", {}) if isinstance(manifest, Mapping) else {}
+    inherited_cuda = inherited.get("cuda_seconds") if isinstance(inherited, Mapping) else None
+    inherited_download = inherited.get("download_bytes") if isinstance(inherited, Mapping) else None
+    ledger = artifact.get("resource_ledger") if artifact_authenticated and artifact else None
+    ledger = ledger if isinstance(ledger, Mapping) else {}
+    values: dict[str, int | None] = {}
+    cost_fields_valid = artifact_authenticated
+    for field in ("cuda_seconds", "download_bytes"):
+        value = ledger.get(field)
+        valid = isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        if field == "cuda_seconds" and isinstance(inherited_cuda, int) and not isinstance(inherited_cuda, bool):
+            valid = valid and value >= inherited_cuda if valid else False
+        if field == "download_bytes" and isinstance(inherited_download, int) and not isinstance(inherited_download, bool):
+            valid = valid and value >= inherited_download if valid else False
+        values[field] = int(value) if valid else None
+        cost_fields_valid = cost_fields_valid and valid
+    policy = manifest.get("policy", {}) if isinstance(manifest, Mapping) else {}
+    caps = {
+        "active_runtime_seconds": policy.get("active_runtime_seconds"),
+        "cuda_seconds": policy.get("cuda_seconds"),
+        "download_bytes": policy.get("download_bytes"),
+        "artifact_bytes": policy.get("artifact_bytes"),
+        "artifact_terminal_reserve_bytes": policy.get("artifact_terminal_reserve_bytes"),
+        "memory_reserve_bytes": policy.get("memory_reserve_bytes"),
+    }
+    baseline = manifest.get("artifact_baseline", {}) if isinstance(manifest, Mapping) else {}
+    try:
+        inherited_artifact = int(baseline.get("source_bytes", 0)) + sum(
+            int(item["size_bytes"]) for item in baseline.get("feasibility_files", [])
+        )
+        measured_new = _artifact_bytes(root)
+        measurement_complete = measurement_error is None
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        inherited_artifact = 0
+        measured_new = None
+        measurement_complete = False
+        measurement_error = measurement_error or str(exc)
+    total_artifact = inherited_artifact + measured_new if measured_new is not None else None
+    now = _utc_now()
+    return {
+        "costs": {
+            "complete": bool(cost_fields_valid),
+            "source": "authenticated settled calibration stage artifact" if cost_fields_valid else "unavailable; no authenticated complete stage ledger",
+            "cuda_seconds": {"total": values["cuda_seconds"], "complete": values["cuda_seconds"] is not None},
+            "download_bytes": {"total": values["download_bytes"], "complete": values["download_bytes"] is not None},
+        },
+        "inherited_costs": {
+            "cuda_seconds": inherited_cuda,
+            "download_bytes": inherited_download,
+            "complete": type(inherited_cuda) is int and type(inherited_download) is int,
+            "provenance": "immutable execution.json inherited_costs",
+        },
+        "artifact_usage": {
+            "new_subtree_bytes": measured_new,
+            "inherited_artifact_baseline_bytes": inherited_artifact,
+            "total_bytes": total_artifact,
+            "cap_bytes": caps["artifact_bytes"],
+            "complete": measurement_complete,
+            "measured_at_utc": now,
+            "provenance": "measured execution-root subtree plus immutable execution.json artifact_baseline",
+            "diagnostic": measurement_error,
+        },
+        "resource_caps": caps,
+        "cost_provenance": {
+            "execution_id": manifest.get("execution_id"),
+            "source_run_id": manifest.get("source_run_id"),
+            "source_manifest_sha256": manifest.get("source_manifest_sha256"),
+            "policy_sha256": _sha(policy) if policy else None,
+            "stage_artifact_sha256": artifact_sha256 if artifact_authenticated else None,
+            "measured_at_utc": now,
+        },
+        "review_packet_paths": [],
+    }
+
+
+def _authenticated_stage_artifact(
+    root: Path,
+    manifest: Mapping[str, Any],
+    jobs: Mapping[str, Mapping[str, Any]],
+    result_event: Mapping[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Authenticate the saved producer artifact against its lifecycle digest and nested signature."""
+    digest = result_event.get("artifact_sha256")
+    stage = result_event.get("stage")
+    attempt_id = result_event.get("attempt_id")
+    if not isinstance(digest, str) or not isinstance(stage, str) or not isinstance(attempt_id, str):
+        return None, "stage result has no authenticated artifact digest or identity"
+    path = root / "stages" / f"{stage}.json"
+    try:
+        body = path.read_bytes()
+        if sha256(body).hexdigest() != digest:
+            return None, "authenticated stage artifact changed after settlement"
+        artifact = json.loads(body)
+        if not isinstance(artifact, dict) or body != _canonical(artifact) + b"\n":
+            return None, "authenticated stage artifact is not canonical JSON"
+        if (
+            artifact.get("execution_id") != manifest.get("execution_id")
+            or artifact.get("stage") != stage
+            or artifact.get("status") != result_event.get("state")
+        ):
+            return None, "authenticated stage artifact execution/stage identity mismatch"
+        signature = artifact.get("signature")
+        if not isinstance(signature, dict):
+            return None, "authenticated stage artifact lacks nested producer signature"
+        code_signatures = signature.get("code_signatures")
+        if not isinstance(code_signatures, Mapping) or any(
+            not isinstance(value, str) or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in code_signatures.values()
+        ):
+            return None, "authenticated stage artifact has malformed nested code signatures"
+        signature_digest = signature.get("stage_signature")
+        unsigned_signature = {key: item for key, item in signature.items() if key != "stage_signature"}
+        job_state = jobs.get(attempt_id)
+        start = job_state.get("start") if isinstance(job_state, Mapping) else None
+        predecessor = signature.get("predecessors", {})
+        if (
+            not isinstance(signature_digest, str)
+            or _sha(unsigned_signature) != signature_digest
+            or artifact.get("stage_signature") != signature_digest
+            or signature.get("stage") != stage
+            or signature.get("source_run_id") != manifest.get("source_run_id")
+            or not isinstance(predecessor, Mapping)
+            or predecessor.get("prepare_manifest_sha256") != manifest.get("source_manifest_sha256")
+            or predecessor.get("prepare_stage_sha256") != manifest.get("source_prepare_sha256")
+            or not isinstance(start, Mapping)
+            or start.get("stage") != stage
+            or signature.get("execution_stage_signature") != start.get("stage_signature")
+            or signature.get("execution_policy_sha256") != _sha(manifest.get("policy", {}))
+            or artifact.get("reason") != result_event.get("reason")
+        ):
+            return None, "stage artifact nested signature digest/context is invalid"
+        resource_caps = artifact.get("resource_caps")
+        policy = manifest.get("policy", {})
+        if not isinstance(resource_caps, Mapping) or any(
+            resource_caps.get(result_key) != policy.get(policy_key)
+            for result_key, policy_key in (
+                ("cuda_seconds", "cuda_seconds"),
+                ("wall_seconds", "active_runtime_seconds"),
+                ("download_bytes", "download_bytes"),
+                ("artifact_bytes", "artifact_bytes"),
+            )
+        ):
+            return None, "stage artifact resource caps do not match immutable execution policy"
+        return artifact, None
+    except (OSError, ValueError, TypeError) as exc:
+        return None, f"authenticated stage artifact cannot be read: {exc}"
+
+
+def _safe_review_packet(root: Path, artifact: Mapping[str, Any]) -> str:
+    relative = artifact.get("review_packet")
+    digest = artifact.get("review_packet_sha256")
+    if not isinstance(relative, str) or not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
+        raise ValueError("review packet path is missing or unsafe")
+    if not isinstance(digest, str):
+        raise ValueError("review packet digest is missing")
+    path = safe_output_path(root, root / relative)
+    if not path.is_file() or sha256(path.read_bytes()).hexdigest() != digest:
+        raise ValueError("review packet is missing or changed")
+    return path.relative_to(root).as_posix()
+
+
+def _next_action(state: str, *, accounting_valid: bool = True) -> str:
+    if not accounting_valid:
+        return "Preserve the stop and inspect lifecycle/accounting diagnostics; do not resume compute."
+    if state == "registered":
+        return "Await root authorization; the only implemented production stage is calibrate."
+    if state == "running":
+        return "Monitor this execution's status and logs; do not start another worker."
+    if state == "awaiting_review":
+        return "Review the authenticated public packet; do not launch another stage before review gates."
+    if state == "completed":
+        return "Preserve this stage result; any later stage requires its own reviewed adapter and prerequisites."
+    if state == "stopped_scientific":
+        return "Preserve the scientific stop and evidence; no further compute is allowed."
+    if state == "stopped_environment":
+        return "Preserve the environment stop and inspect diagnostics; no automatic retry is allowed."
+    return "Inspect authenticated status, costs, and diagnostics before taking action."
+
+
 def _base_status(root: Path, manifest: Mapping[str, Any], jobs: Mapping[str, Mapping[str, Any]], *, events: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     settled = [
         state["settled_active_seconds"] for state in jobs.values()
@@ -176,6 +387,23 @@ def _base_status(root: Path, manifest: Mapping[str, Any], jobs: Mapping[str, Map
             used = active_elapsed_seconds(context)
     limit = int(manifest["policy"]["active_runtime_seconds"])
     last_event = events[-1]["payload"] if events else {}
+    result_event = next((
+        item["payload"] for item in reversed(events)
+        if item["payload"].get("type") == "attempt_result"
+    ), None)
+    artifact: dict[str, Any] | None = None
+    artifact_diagnostic: str | None = None
+    artifact_authenticated = False
+    review_packet_paths: list[str] = []
+    if result_event and result_event.get("artifact_sha256"):
+        artifact, artifact_diagnostic = _authenticated_stage_artifact(root, manifest, jobs, result_event)
+        artifact_authenticated = artifact is not None
+        if artifact is not None and artifact.get("status") == "awaiting_review":
+            try:
+                review_packet_paths = [_safe_review_packet(root, artifact)]
+            except (OSError, ValueError, TypeError) as exc:
+                artifact_diagnostic = f"authenticated review handoff is invalid: {exc}"
+                artifact_authenticated = False
     terminal = _record_payload(root, "terminal.json")
     if terminal:
         state_name = terminal.get("state", "stopped_environment")
@@ -187,15 +415,11 @@ def _base_status(root: Path, manifest: Mapping[str, Any], jobs: Mapping[str, Map
         else:
             state_name, reason = "running", None
     else:
-        result = next((item["payload"] for item in reversed(events) if item["payload"].get("type") == "attempt_result"), None)
-        if result:
-            state_name = result.get("state", "stopped_environment")
-            reason = result.get("reason")
-            digest = result.get("artifact_sha256")
-            stage = result.get("stage")
-            artifact_path = root / "stages" / f"{stage}.json" if isinstance(stage, str) else None
-            if digest and (artifact_path is None or not artifact_path.is_file() or sha256(artifact_path.read_bytes()).hexdigest() != digest):
-                state_name, reason = "stopped_environment", "authenticated stage artifact is missing or changed"
+        if result_event:
+            state_name = result_event.get("state", "stopped_environment")
+            reason = result_event.get("reason")
+            if result_event.get("artifact_sha256") and artifact_diagnostic:
+                state_name, reason = "stopped_environment", artifact_diagnostic
         elif last_event.get("type") == "registered":
             state_name, reason = "registered", None
         elif any(item["payload"].get("type") == "job_settled" for item in events):
@@ -221,7 +445,8 @@ def _base_status(root: Path, manifest: Mapping[str, Any], jobs: Mapping[str, Map
         status_lease_stale = False
     status = {
         "execution_id": manifest["execution_id"], "state": state_name,
-        "stage": last_event.get("stage"), "attempt_id": last_event.get("attempt_id"),
+        "stage": current["start"].get("stage") if current is not None else (result_event or last_event).get("stage"),
+        "attempt_id": current["start"].get("attempt_id") if current is not None else (result_event or last_event).get("attempt_id"),
         "runtime_used_seconds": min(used, limit),
         "runtime_remaining_seconds": max(0, limit - used),
         "reason": reason, "logs_path": str(root / "logs"),
@@ -229,8 +454,21 @@ def _base_status(root: Path, manifest: Mapping[str, Any], jobs: Mapping[str, Map
         "status_json_path": str(root / "status.json"), "status_md_path": str(root / "status.md"),
         "snapshot_stale": True,
     }
+    status.update(_resource_projection(
+        root, manifest, artifact=artifact, artifact_authenticated=artifact_authenticated,
+        artifact_sha256=result_event.get("artifact_sha256") if result_event else None,
+    ))
+    status["review_packet_paths"] = review_packet_paths
+    if artifact_diagnostic:
+        status["diagnostic"] = artifact_diagnostic
+    status["cost_provenance"].update({
+        "attempt_id": result_event.get("attempt_id") if result_event else None,
+        "result_event_digest": result_event.get("artifact_sha256") if result_event else None,
+        "result_state": result_event.get("state") if result_event else None,
+    })
     if state_name == "stopped_environment" and current is not None and reason and "uncertain" in reason:
         status["accounting_valid"] = False
+    status["next_action"] = _next_action(status["state"], accounting_valid=status.get("accounting_valid", True))
     if status_lease_stale:
         status["supervisor_lease_stale"] = True
     return status
@@ -265,6 +503,9 @@ def execution_status(
             "terminal_path": str(root / "terminal.json"), "status_json_path": str(root / "status.json"),
             "status_md_path": str(root / "status.md"), "snapshot_stale": True,
         }
+        status.update(_resource_projection(root, manifest if "manifest" in locals() else {}, measurement_error=str(exc)))
+        status["next_action"] = _next_action("stopped_environment", accounting_valid=False)
+        status["diagnostic"] = str(exc)
     try:
         convenience = _record_payload(root, "status.json")
     except (OSError, ValueError, TypeError):
@@ -278,6 +519,7 @@ def execution_status(
                 status["snapshot_stale"] = age > 10
             except (KeyError, ValueError, TypeError):
                 status["snapshot_stale"] = True
+    _write_status(root, status)
     return status
 
 
@@ -551,16 +793,30 @@ def supervise_stage(
             artifact = json.loads(artifact_bytes)
             if artifact_bytes != _canonical(artifact) + b"\n":
                 stage_reason = "stage result is not canonical JSON"
-            elif (
-                artifact.get("execution_id") != root.name
-                or artifact.get("execution_stage_signature") != signature
-                or artifact.get("status") not in {"awaiting_review", "completed", "stopped_environment", "stopped_scientific"}
-            ):
-                stage_reason = "zero exit lacked an authenticated expected stage result"
             else:
-                stage_state = str(artifact["status"])
-                stage_reason = artifact.get("reason")
-                artifact_digest = sha256(artifact_bytes).hexdigest()
+                candidate_digest = sha256(artifact_bytes).hexdigest()
+                candidate_event = {
+                    "attempt_id": attempt_id, "stage": stage,
+                    "state": artifact.get("status"), "reason": artifact.get("reason"),
+                    "artifact_sha256": candidate_digest,
+                }
+                checked_artifact, signature_error = _authenticated_stage_artifact(
+                    root, manifest, {attempt_id: {"start": start_payload}}, candidate_event,
+                )
+                if checked_artifact is None or artifact.get("status") not in {
+                    "awaiting_review", "completed", "stopped_environment", "stopped_scientific",
+                }:
+                    stage_reason = signature_error or "zero exit lacked an authenticated expected stage result"
+                else:
+                    try:
+                        if artifact["status"] == "awaiting_review":
+                            _safe_review_packet(root, checked_artifact)
+                    except (OSError, ValueError, TypeError) as exc:
+                        stage_reason = f"review packet handoff is invalid: {exc}"
+                    else:
+                        stage_state = str(artifact["status"])
+                        stage_reason = artifact.get("reason")
+                        artifact_digest = candidate_digest
         elif stage_reason is None:
             stage_reason = "stage exited without its expected signed result" if returncode == 0 else f"stage process exited with code {returncode}"
         if settled >= limit and stage_state not in {"stopped_environment", "stopped_scientific"}:
@@ -571,33 +827,27 @@ def supervise_stage(
             "reason": stage_reason, "artifact_sha256": artifact_digest,
         })
         if stage_state == "awaiting_review":
-            packet_paths = [
-                artifact.get("review_packet"), artifact.get("private_review_map"),
-            ]
             final_record = {
                 "execution_id": root.name, "attempt_id": attempt_id, "stage": stage,
                 "state": "awaiting_review", "reason": stage_reason,
                 "runtime_used_seconds": settled, "runtime_remaining_seconds": max(0, limit - settled),
-                "artifact_sha256": artifact_digest, "review_packet_paths": [p for p in packet_paths if p],
+                "artifact_sha256": artifact_digest,
+                "review_packet_paths": [artifact["review_packet"]],
             }
             append_event(root, {"type": "stage_stopped", **final_record})
-            _write_status(root, final_record)
         elif stage_state in _EXECUTION_STOP_STATES:
             _save_terminal_state(root, owner, attempt_id, stage_state, stage_reason,
                                  runtime_used=settled, stage=stage, artifact_sha256=artifact_digest)
         elif stage_state == "completed":
-            _write_status(root, {
-                "execution_id": root.name, "attempt_id": attempt_id,
-                "stage": stage, "state": "completed", "reason": stage_reason,
-                "runtime_used_seconds": settled,
-                "runtime_remaining_seconds": max(0, limit - settled),
-                "artifact_sha256": artifact_digest,
-            })
+            pass
         else:
             stage_state = "stopped_environment"
             stage_reason = stage_reason or "stage produced an unrecognized outcome"
             _save_terminal_state(root, owner, attempt_id, stage_state, stage_reason,
                                  runtime_used=settled, stage=stage, artifact_sha256=artifact_digest)
+        projected_status = execution_status(root, repo_root=repo_root, config_path=config_path)
+        projected_status["snapshot_stale"] = False
+        _write_status(root, projected_status)
         _write_ack(root, attempt_id, owner, stage_state, stage_reason)
         job.close()
         _release_lease(root, owner)

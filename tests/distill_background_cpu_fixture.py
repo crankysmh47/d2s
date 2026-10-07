@@ -45,11 +45,13 @@ def _execution_fixture(workspace: Path) -> dict[str, str]:
     runner_dir.mkdir(parents=True, exist_ok=True)
     runner = runner_dir / "fake stage.py"
     runner.write_text(
-        "import json,sys,time\n"
+        "import hashlib,json,sys,time\n"
         "from pathlib import Path\n"
-        "root=Path(sys.argv[1]); signature=sys.argv[2]\n"
+        "root=Path(sys.argv[1]); signature=json.loads(sys.argv[2])\n"
         "print('started', flush=True); time.sleep(float(sys.argv[3]))\n"
-        "record={'execution_id':root.name,'execution_stage_signature':signature,'status':'awaiting_review','reason':'CPU fixture complete','review_packet':'calibration/review/fixture.csv','private_review_map':'calibration/review/private-map.json'}\n"
+        "packet=root/'calibration'/'review'/'fixture.csv'; packet.parent.mkdir(parents=True,exist_ok=True)\n"
+        "packet.write_text('opaque_id,answer\\nfixture,42\\n',encoding='utf-8'); packet_sha=hashlib.sha256(packet.read_bytes()).hexdigest()\n"
+        "record={'execution_id':root.name,'stage':'calibrate','stage_signature':signature['stage_signature'],'signature':signature,'status':'awaiting_review','reason':'CPU fixture complete','resource_ledger':{'cuda_seconds':1168,'download_bytes':8066699435,'artifact_bytes':packet.stat().st_size},'resource_caps':{'cuda_seconds':86400,'wall_seconds':172800,'download_bytes':21474836480,'artifact_bytes':21474836480},'inherited_artifact_bytes':0,'review_packet':'calibration/review/fixture.csv','review_packet_sha256':packet_sha,'private_review_map':'calibration/review/private-map.json'}\n"
         "target=root/'stages'/'calibrate.json'; target.parent.mkdir(parents=True,exist_ok=True)\n"
         "target.write_bytes(json.dumps(record,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()+b'\\n')\n"
         "print('finished', flush=True)\n",
@@ -83,11 +85,21 @@ def _patch_fixture_constants(fixture: dict[str, str]) -> None:
 def _argv_builder(fixture: dict[str, str]):
     def build(_repo_root: Path, _manifest: dict[str, object], _attempt_id: str) -> list[str]:
         from ppmoe.distill.execution import execution_stage_signature
+        from ppmoe.distill.study import calibration_stage_signature
 
-        signature = execution_stage_signature(
+        execution_signature = execution_stage_signature(
             Path(fixture["execution_root"]), "calibrate", repo_root=Path(fixture["repo_root"]),
         )
-        return [sys.executable, fixture["runner"], fixture["execution_root"], signature,
+        manifest = json.loads((Path(fixture["execution_root"]) / "execution.json").read_text(encoding="utf-8"))
+        signature = calibration_stage_signature(
+            Path(fixture["repo_root"]), source_run_id=manifest["source_run_id"],
+            manifest_sha256=manifest["source_manifest_sha256"],
+            prepare_sha256=manifest["source_prepare_sha256"],
+            execution_stage_signature=execution_signature,
+            execution_policy_sha256=__import__("hashlib").sha256(_canonical(manifest["policy"])).hexdigest(),
+        )
+        return [sys.executable, fixture["runner"], fixture["execution_root"],
+                json.dumps(signature, sort_keys=True, separators=(",", ":")),
                 str(fixture.get("duration_seconds", 2.5))]
     return build
 

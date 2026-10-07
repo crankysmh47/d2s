@@ -120,17 +120,41 @@ def _supervisor_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, resu
     (root / "logs").mkdir()
     manifest = {
         "execution_id": root.name, "source_root": str(tmp_path / "source"),
-        "policy": {"active_runtime_seconds": 172800, "artifact_bytes": artifact_cap},
+        "policy": {"active_runtime_seconds": 172800, "cuda_seconds": 86400,
+                   "download_bytes": 21474836480, "artifact_bytes": artifact_cap},
         "artifact_baseline": {"source_bytes": 0, "feasibility_files": []},
+        "source_run_id": "source-fixture",
+        "source_manifest_sha256": "b" * 64,
+        "source_prepare_sha256": "c" * 64,
+        "inherited_costs": {"cuda_seconds": 1168, "download_bytes": 8066699435},
     }
     monkeypatch.setattr(background, "validate_execution", lambda *_a, **_k: manifest)
-    monkeypatch.setattr(background, "validate_job_intervals", lambda _root: {})
     signature = "a" * 64
     monkeypatch.setattr(background, "execution_stage_signature", lambda *_a, **_k: signature)
+    policy_sha256 = __import__("hashlib").sha256(_canonical(manifest["policy"])).hexdigest()
+    signature_record = study.calibration_stage_signature(
+        Path(__file__).parents[1], source_run_id=manifest["source_run_id"],
+        manifest_sha256=manifest["source_manifest_sha256"],
+        prepare_sha256=manifest["source_prepare_sha256"],
+        execution_stage_signature=signature, execution_policy_sha256=policy_sha256,
+    )
+    review = root / "calibration" / "review" / "packet.csv"
+    review.parent.mkdir(parents=True)
+    review.write_bytes(b"opaque-row,answer\n")
     result = None if result_status is None else {
-        "execution_id": root.name, "execution_stage_signature": signature,
-        "status": result_status, "reason": "fixture outcome",
+        "execution_id": root.name, "stage": "calibrate", "status": result_status,
+        "reason": "fixture outcome", "stage_signature": signature_record["stage_signature"],
+        "signature": signature_record,
+        "resource_ledger": {
+            "cuda_seconds": 1175, "download_bytes": 8066699999,
+            "artifact_bytes": 4096,
+        },
+        "resource_caps": {"cuda_seconds": 86400, "wall_seconds": 172800,
+                          "download_bytes": 21474836480,
+                          "artifact_bytes": artifact_cap},
+        "inherited_artifact_bytes": 0,
         "review_packet": "calibration/review/packet.csv",
+        "review_packet_sha256": __import__("hashlib").sha256(review.read_bytes()).hexdigest(),
         "private_review_map": "calibration/review/private-map.json",
     }
     job = _FakeJob(root, result, log_bytes=log_bytes)
@@ -162,6 +186,92 @@ def test_stage_outcome_is_authenticated_and_scoped(
     events = execution.read_events(root)
     assert any(event["payload"].get("type") == "job_settled" for event in events)
     assert job.poll_calls == 1
+    reconstructed = execution_status(root, repo_root=tmp_path, config_path=tmp_path / "config.toml")
+    if expected_state == "awaiting_review":
+        assert reconstructed["costs"]["complete"] is True
+        assert reconstructed["costs"]["cuda_seconds"]["total"] == 1175
+        assert reconstructed["costs"]["download_bytes"]["total"] == 8066699999
+        assert reconstructed["inherited_costs"]["cuda_seconds"] == 1168
+        assert reconstructed["artifact_usage"]["total_bytes"] >= reconstructed["artifact_usage"]["new_subtree_bytes"]
+        assert reconstructed["review_packet_paths"] == ["calibration/review/packet.csv"]
+        assert reconstructed["cost_provenance"]["stage_artifact_sha256"] == next(
+            event["payload"]["artifact_sha256"] for event in events
+            if event["payload"].get("type") == "attempt_result"
+        )
+        markdown = (root / "status.md").read_text(encoding="utf-8")
+        assert "CUDA" in markdown and "Download" in markdown and "Review packet" in markdown
+        assert "private_review_map" not in markdown
+        handoff = next(event["payload"] for event in events if event["payload"].get("type") == "stage_stopped")
+        assert handoff["review_packet_paths"] == ["calibration/review/packet.csv"]
+    elif result_status is None:
+        assert reconstructed["costs"]["complete"] is False
+        assert reconstructed["costs"]["cuda_seconds"]["total"] is None
+        assert reconstructed["inherited_costs"]["cuda_seconds"] == 1168
+
+
+@pytest.mark.parametrize("tamper", ["missing", "digest", "context"])
+def test_producer_shaped_result_signature_mismatch_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str,
+):
+    root, _manifest, job = _supervisor_fixture(tmp_path, monkeypatch)
+    assert job.result is not None
+    signature = job.result["signature"]
+    if tamper == "missing":
+        job.result.pop("signature")
+    elif tamper == "digest":
+        signature["stage_signature"] = "f" * 64
+    else:
+        signature["execution_stage_signature"] = "e" * 64
+    job.result = dict(job.result)
+    supervise_stage(
+        root, "calibrate", repo_root=tmp_path, config_path=tmp_path / "config.toml",
+        _job_factory=lambda: job, _argv_builder=lambda *_a: ["cpu-fixture"],
+        _attempt_id=f"bad-signature-{tamper}", _clock_ns=lambda: 10_000_000_000,
+    )
+    events = execution.read_events(root)
+    outcome = next(event["payload"] for event in events if event["payload"].get("type") == "attempt_result")
+    assert outcome["state"] == "stopped_environment"
+    assert outcome["artifact_sha256"] is None
+
+
+def test_status_rejects_tampered_stage_artifact_and_withholds_review_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    root, _manifest, job = _supervisor_fixture(tmp_path, monkeypatch)
+    supervise_stage(
+        root, "calibrate", repo_root=tmp_path, config_path=tmp_path / "config.toml",
+        _job_factory=lambda: job, _argv_builder=lambda *_a: ["cpu-fixture"],
+        _attempt_id="tamper-after-settlement", _clock_ns=lambda: 10_000_000_000,
+    )
+    artifact = root / "stages" / "calibrate.json"
+    artifact.write_bytes(artifact.read_bytes() + b" ")
+    status = execution_status(root, repo_root=tmp_path, config_path=tmp_path / "config.toml")
+    assert status["state"] == "stopped_environment"
+    assert status["costs"]["complete"] is False
+    assert status["review_packet_paths"] == []
+    assert "changed" in status["diagnostic"].lower()
+
+
+def test_unsafe_review_packet_is_not_settled_as_awaiting_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    root, _manifest, job = _supervisor_fixture(tmp_path, monkeypatch)
+    assert job.result is not None
+    job.result["review_packet"] = "..\\outside.csv"
+    result = supervise_stage(
+        root, "calibrate", repo_root=tmp_path, config_path=tmp_path / "config.toml",
+        _job_factory=lambda: job, _argv_builder=lambda *_a: ["cpu-fixture"],
+        _attempt_id="unsafe-review-packet", _clock_ns=lambda: 10_000_000_000,
+    )
+    assert result == 2
+    events = execution.read_events(root)
+    outcome = next(event["payload"] for event in events if event["payload"].get("type") == "attempt_result")
+    assert outcome["state"] == "stopped_environment"
+    assert outcome["artifact_sha256"] is None
+    assert not any(event["payload"].get("type") == "stage_stopped" for event in events)
+    status = execution_status(root, repo_root=tmp_path, config_path=tmp_path / "config.toml")
+    assert status["review_packet_paths"] == []
+    assert "unsafe" in status["reason"]
 
 
 def test_log_growth_triggers_owned_termination(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
