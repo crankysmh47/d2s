@@ -522,6 +522,10 @@ def _persist_calibration_terminal(
     started_at: str, artifact_cap: int,
 ) -> dict[str, Any]:
     """Commit one immutable terminal record, including its event/stage bytes."""
+    existing_stage = result.get("stage")
+    if existing_stage is not None and existing_stage != "calibrate":
+        raise StageError("calibration terminal stage conflicts with supplied stage")
+    result["stage"] = "calibrate"
     ended_at = _utc_now()
     result["started_at_utc"] = started_at
     result["ended_at_utc"] = ended_at

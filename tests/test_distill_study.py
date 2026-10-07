@@ -595,6 +595,7 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
     import json
     import ppmoe.distill.study as study
     from ppmoe.distill.evaluate import RawRowJournal
+    from ppmoe.distill.execution import ActiveJobContext
 
     repo_root = tmp_path / "repo"
     import shutil
@@ -657,12 +658,13 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
             sizes = {"config.json": 1, "README.md": 2, ".gitattributes": 3}
             return SimpleNamespace(sha=revision, siblings=[SimpleNamespace(rfilename=name, size=sizes[name]) for name in names])
     snapshot_calls = []
+    active_reservation_root = [root]
     def fake_snapshot_download(**kwargs):
         snapshot_calls.append(kwargs["local_files_only"])
         return tmp_path / kwargs["revision"]
     def fake_hf_hub_download(**kwargs):
         assert any(item.get("event_type") == "download_reservation" and item.get("role") == "teacher"
-                   for item in map(json.loads, (root / "stages" / "calibrate-reservations.jsonl").read_text().splitlines()))
+                   for item in map(json.loads, (active_reservation_root[0] / "stages" / "calibrate-reservations.jsonl").read_text().splitlines()))
         target = tmp_path / "downloads" / kwargs["filename"]
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(b"x" * {"README.md": 2, ".gitattributes": 3}[kwargs["filename"]])
@@ -688,6 +690,60 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
         student=SimpleNamespace(repo_id="student", revision="student-pin"),
         teacher=SimpleNamespace(repo_id="teacher", revision="teacher-pin"),
     )
+    execution_policy = {
+        "active_runtime_seconds": 172800, "cuda_seconds": 86400,
+        "download_bytes": 21474836480, "artifact_bytes": 21474836480,
+    }
+    execution_signature = "a" * 64
+
+    def bind_execution(source_root: Path, suffix: str):
+        execution_root = tmp_path / (suffix * 64)
+        (execution_root / "stages").mkdir(parents=True)
+        (execution_root / "execution.json").write_text(json.dumps({"artifact_baseline": {"source_bytes": 0, "feasibility_files": []}}), encoding="utf-8")
+        execution_id = execution_root.name
+        manifest_record = {
+            "execution_id": execution_id,
+            "source_root": str(source_root.resolve()),
+            "source_run_id": source_root.name,
+            "source_manifest_sha256": sha256_file(source_root / "manifest.json"),
+            "source_prepare_sha256": sha256_file(source_root / "stages" / "prepare.json"),
+            "policy": execution_policy,
+            "artifact_baseline": {"source_bytes": 0, "feasibility_files": []},
+            "runtime_identity": {"synthetic": True},
+        }
+        context = ActiveJobContext(
+            execution_id=execution_id, attempt_id=f"attempt-{suffix}", stage="calibrate",
+            prior_active_seconds=0, started_monotonic_ns=time.monotonic_ns(),
+            supervisor_pid=1, supervisor_created_utc="2026-10-07T00:00:00.000000Z",
+            stage_signature=execution_signature,
+        )
+        monkeypatch.setattr("ppmoe.distill.execution.validate_execution", lambda *_a, **_k: manifest_record)
+        monkeypatch.setattr("ppmoe.distill.execution.load_active_job", lambda *_a, **_k: context)
+        monkeypatch.setattr("ppmoe.distill.execution.execution_stage_signature", lambda *_a, **_k: execution_signature)
+        monkeypatch.setattr(study, "_execution_job_intervals", lambda *_a, **_k: {})
+        return execution_root, manifest_record, context
+
+    def assert_authenticated_producer_artifact(execution_root: Path, execution_manifest: dict, context, status: str):
+        from ppmoe.distill.background import _authenticated_stage_artifact
+        from hashlib import sha256
+
+        artifact_path = execution_root / "stages" / "calibrate.json"
+        artifact_bytes = artifact_path.read_bytes()
+        saved = json.loads(artifact_bytes)
+        assert saved["stage"] == "calibrate"
+        authenticated, error = _authenticated_stage_artifact(
+            execution_root, execution_manifest,
+            {context.attempt_id: {"start": {"stage": "calibrate", "stage_signature": execution_signature}}},
+            {
+                "artifact_sha256": sha256(artifact_bytes).hexdigest(),
+                "stage": "calibrate", "attempt_id": context.attempt_id,
+                "state": status, "reason": saved.get("reason"),
+            },
+        )
+        assert error is None
+        assert authenticated == saved
+    execution_root, execution_manifest, execution_context = bind_execution(root, "x")
+    active_reservation_root[0] = execution_root
     original_signature = study.calibration_stage_signature
     # Seed a digest-authenticated single-row completed prefix to model crash recovery.
     student_inventory_hash = sha256(json.dumps(inventory_by_role["student"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -696,19 +752,25 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
         repo_root, source_run_id=root.name, manifest_sha256=manifest_digest, prepare_sha256=prepare_digest,
         model_inventory_sha256={"student": student_inventory_hash, "teacher": teacher_inventory_hash},
         effective_eos_token_ids=(2,), originating_git_commit="c" * 40,
+        execution_stage_signature=execution_signature,
+        execution_policy_sha256=sha256(json.dumps(execution_policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
     )
     stage_signature = prepared_signature["stage_signature"]
     candidates = (256, 768)
-    journal = RawRowJournal(root / "calibration" / "raw" / "256-768-student.jsonl", expected_ids=ids, stage_signature=stage_signature)
+    journal = RawRowJournal(execution_root / "calibration" / "raw" / "256-768-student.jsonl", expected_ids=ids, stage_signature=stage_signature)
     journal.append({"source_id": ids[0], "role": "student", "candidate": list(candidates), "question": questions[0]["question"],
                     "text": "Final answer: 0", "stop_reason": "eos", "generated_tokens": 2, "wall_seconds": 0.01,
                     "cuda_seconds": 0.01, "worker_startup_wall_seconds": 0.01, "attempt_id": "old-attempt", "stage_signature": stage_signature})
     reserved_at = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
     journal.record_attempt({"attempt_id": "old-attempt", "status": "worker_reserved", "role": "student", "candidate": list(candidates),
-                            "stage_signature": stage_signature, "reserved_at_utc": reserved_at})
+                            "stage_signature": stage_signature, "reserved_at_utc": reserved_at,
+                            "job_attempt_id": execution_context.attempt_id,
+                            "reserved_monotonic_ns": execution_context.started_monotonic_ns})
     journal.record_attempt({"attempt_id": "old-attempt", "status": "worker_started", "role": "student", "candidate": list(candidates),
-                            "stage_signature": stage_signature, "startup_wall_seconds": 0.01, "reserved_at_utc": reserved_at})
-    reservation_history = root / "stages" / "calibrate-reservations.jsonl"
+                            "stage_signature": stage_signature, "startup_wall_seconds": 0.01, "reserved_at_utc": reserved_at,
+                            "job_attempt_id": execution_context.attempt_id,
+                            "reserved_monotonic_ns": execution_context.started_monotonic_ns})
+    reservation_history = execution_root / "stages" / "calibrate-reservations.jsonl"
     reservation_history.write_text(json.dumps({
         "event_type": "reservation", "status": "reserved", "stage": "calibrate",
         "stage_signature": stage_signature, "signature": prepared_signature,
@@ -726,10 +788,12 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
                     "wall_seconds": 0.01, "cuda_seconds": 0.01, "peak_allocated_bytes": 100, "peak_reserved_bytes": 200}
         def close(self): pass
     result = study.run_calibration_stage(root, config, repo_root=repo_root, config_path=tmp_path / "config.toml",
+                                         execution_root=execution_root, active_job=execution_context,
                                          worker_loader=lambda role, candidate: FakeWorker(role))
     assert result["status"] == "awaiting_review"
+    assert_authenticated_producer_artifact(execution_root, execution_manifest, execution_context, "awaiting_review")
     assert generated == {"student": 59, "teacher": 60}
-    packet = root / result["review_packet"]
+    packet = execution_root / result["review_packet"]
     packet_text = packet.read_text(encoding="utf-8")
     assert '"gold"' not in packet_text and '"role"' not in packet_text and "private" not in packet_text
     assert result["originating_git_commit"] == "c" * 40
@@ -737,12 +801,13 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
     assert snapshot_calls == []
     assert ("student", artifact_student, ".cache") in authenticated_paths
     assert any(repo == "teacher" and path == teacher_cache and excluded is None for repo, path, excluded in authenticated_paths)
-    reservation_events = [json.loads(line) for line in (root / "stages" / "calibrate-reservations.jsonl").read_text().splitlines()]
+    reservation_events = [json.loads(line) for line in (execution_root / "stages" / "calibrate-reservations.jsonl").read_text().splitlines()]
     teacher_reservation = next(item for item in reservation_events if item.get("event_type") == "download_reservation" and item.get("role") == "teacher")
     assert teacher_reservation["reserved_bytes"] == 5
     assert teacher_reservation["missing_files"] == [".gitattributes", "README.md"]
     with pytest.raises(FileExistsError, match="immutable"):
         study.run_calibration_stage(root, config, repo_root=repo_root, config_path=tmp_path / "config.toml",
+                                    execution_root=execution_root, active_job=execution_context,
                                     worker_loader=lambda role, candidate: pytest.fail("terminal stage must not rerun"))
 
     failure_root = tmp_path / ("f" * 64)
@@ -752,28 +817,44 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
     shutil.copyfile(prepare_path, failure_root / "stages" / "prepare.json")
     shutil.copyfile(data_path, failure_root / "data" / "calibration.jsonl")
     monkeypatch.setattr(study, "TASK1_RUN_ID", failure_root.name)
+    failure_execution_root, failure_execution_manifest, failure_execution_context = bind_execution(failure_root, "y")
+    active_reservation_root[0] = failure_execution_root
     failed_result = study.run_calibration_stage(
         failure_root, config, repo_root=repo_root, config_path=tmp_path / "config.toml",
-        worker_loader=lambda role, candidate: (_ for _ in ()).throw(RuntimeError("synthetic startup failure")),
+        execution_root=failure_execution_root, active_job=failure_execution_context,
+        worker_loader=lambda role, candidate: (_ for _ in ()).throw(RuntimeError(
+            "isolated model worker failed: ValueError: actionable load cause"
+        )),
     )
     assert failed_result["status"] == "stopped_environment"
-    assert (failure_root / "stages" / "calibrate.json").is_file()
+    assert_authenticated_producer_artifact(failure_execution_root, failure_execution_manifest, failure_execution_context, "stopped_environment")
+    assert (failure_execution_root / "stages" / "calibrate.json").is_file()
     failed_row_paths = [
         Path(str(path)[:-len(".attempts.jsonl")])
-        for path in (failure_root / "calibration" / "raw").glob("*.attempts.jsonl")
+        for path in (failure_execution_root / "calibration" / "raw").glob("*.attempts.jsonl")
     ]
     assert failed_row_paths
     assert all(not path.exists() or not path.read_text(encoding="utf-8").strip() for path in failed_row_paths)
     failed_attempts = [
         json.loads(line)
-        for path in (failure_root / "calibration" / "raw").glob("*.attempts.jsonl")
+        for path in (failure_execution_root / "calibration" / "raw").glob("*.attempts.jsonl")
         for line in path.read_text(encoding="utf-8").splitlines()
     ]
     assert any(item["status"] == "worker_load_failed" for item in failed_attempts)
     assert not any(item["status"] == "worker_complete" for item in failed_attempts)
+    failed_load = next(item for item in failed_attempts if item["status"] == "worker_load_failed")
+    assert failed_load["error_type"] == "RuntimeError"
+    assert failed_load["error_message"] == "isolated model worker failed: ValueError: actionable load cause"
+    failure_journal_path = next((failure_execution_root / "calibration" / "raw").glob("*.attempts.jsonl"))
+    verified_failures = RawRowJournal(
+        Path(str(failure_journal_path)[:-len(".attempts.jsonl")]),
+        expected_ids=ids, stage_signature=failed_result["stage_signature"],
+    ).attempts()
+    assert any(item.get("error_message") == failed_load["error_message"] for item in verified_failures)
     with pytest.raises(FileExistsError, match="immutable"):
         study.run_calibration_stage(
             failure_root, config, repo_root=repo_root, config_path=tmp_path / "config.toml",
+            execution_root=failure_execution_root, active_job=failure_execution_context,
             worker_loader=lambda role, candidate: pytest.fail("terminal failure must not be retried"),
         )
 
@@ -801,6 +882,19 @@ def test_cpu_calibration_stage_recovers_prefix_exports_blind_packet_and_is_termi
         if path.is_file() and (base == overcap_root / "calibration" or path.name.startswith("calibrate"))
     )
     assert saved_terminal["resource_ledger"]["artifact_bytes"] == measured
+
+
+def test_calibration_terminal_rejects_conflicting_preexisting_stage(tmp_path: Path) -> None:
+    from ppmoe.distill.study import StageError, _persist_calibration_terminal
+
+    root = tmp_path / "execution"
+    (root / "stages").mkdir(parents=True)
+    with pytest.raises(StageError, match="stage conflicts"):
+        _persist_calibration_terminal(
+            root, root / "stages" / "calibrate-reservations.jsonl",
+            {"stage": "prepare", "status": "awaiting_review", "resource_ledger": {}},
+            started_at="2026-10-07T00:00:00Z", artifact_cap=10_000_000,
+        )
 
 
 def _early_resource_stage(monkeypatch, tmp_path: Path):

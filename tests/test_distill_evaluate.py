@@ -176,6 +176,7 @@ def test_failed_row_is_persisted_via_explicit_failure_sink_before_retry(unexpire
     )
     assert result["status"] == "awaiting_review"
     assert failures[0]["status"] == "failed"
+    assert failures[0]["error_message"] == "synthetic row failure"
     assert failures[0]["wall_seconds"] >= 0
     assert reservations[0]["status"] == "worker_reserved"
 
@@ -199,6 +200,42 @@ def test_aggregate_worker_retry_exhaustion_is_environment_stop(unexpired_test_le
         ledger=unexpired_test_ledger,
     )
     assert result["status"] == "stopped_environment"
+
+
+def test_worker_load_failure_journal_keeps_bounded_redacted_actionable_message(
+    tmp_path: Path, unexpired_test_ledger: ResourceLedger,
+) -> None:
+    from ppmoe.distill.evaluate import RawRowJournal
+
+    journal = RawRowJournal(tmp_path / "rows.jsonl", expected_ids=["x"], stage_signature="sig")
+    message = (
+        "isolated model worker failed: ValueError: actionable load cause; Bearer abcdef "
+        f"hf_{'a' * 30} token=secretvalue password: secretvalue " + "x" * 10000
+    )
+
+    def broken_factory(_role, _candidate):
+        raise RuntimeError(message)
+
+    result = calibrate_candidates(
+        [{"id": "x", "question": "q?"}], candidates=((256, 768),),
+        worker_factory=broken_factory, minimum_eos=1, max_retries=0,
+        failure_sink=journal, stage_signature="sig", ledger=unexpired_test_ledger,
+    )
+
+    assert result["status"] == "stopped_environment"
+    failed = next(item for item in journal.attempts() if item["status"] == "worker_load_failed")
+    assert failed["status"] == "worker_load_failed"
+    assert failed["error_type"] == "RuntimeError"
+    assert failed["error_message"].startswith("isolated model worker failed: ValueError: actionable load cause")
+    assert len(failed["error_message"]) <= 512
+    assert "Bearer [REDACTED]" in failed["error_message"]
+    assert "hf_[REDACTED]" in failed["error_message"]
+    assert "token=[REDACTED]" in failed["error_message"]
+    assert "password=[REDACTED]" in failed["error_message"]
+    assert "abcdef" not in failed["error_message"]
+    assert "secretvalue" not in failed["error_message"]
+    assert "a" * 30 not in failed["error_message"]
+    assert len(failed["payload_sha256"]) == 64
 
 
 def test_review_reconciliation_accepts_only_exact_substring_evidence(tmp_path: Path) -> None:
@@ -327,6 +364,7 @@ def test_worker_close_failure_has_no_worker_complete_and_carries_cost(unexpired_
     assert caught.value.ledger is not None
     assert not any(item["status"] == "worker_complete" for item in attempts)
     assert failures[-1]["status"] == "worker_close_failed"
+    assert failures[-1]["error_message"] == "synthetic teardown failure"
 
 
 def test_last_durable_row_over_artifact_cap_preserves_attempted_total(unexpired_test_ledger: ResourceLedger) -> None:

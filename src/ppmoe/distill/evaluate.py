@@ -10,6 +10,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import time
 import uuid
@@ -266,6 +267,19 @@ def _has_valid_payload_digest(row: Mapping[str, Any]) -> bool:
     return isinstance(digest, str) and hmac.compare_digest(digest, _payload_digest(row))
 
 
+def _sanitized_error_message(exc: Exception) -> str:
+    """Keep a bounded actionable failure cause without persisting common credentials."""
+    message = re.sub(r"\s+", " ", str(exc)).strip()
+    message = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer [REDACTED]", message)
+    message = re.sub(r"\bhf_[A-Za-z0-9]{20,}\b", "hf_[REDACTED]", message)
+    message = re.sub(
+        r"(?i)\b(token|password)\s*[:=]\s*[^\s,;]+",
+        lambda match: f"{match.group(1)}=[REDACTED]",
+        message,
+    )
+    return message if len(message) <= 512 else message[:509] + "..."
+
+
 def calibrate_candidates(
     rows: Sequence[Mapping[str, str]], *, candidates: Sequence[Sequence[int]],
     worker_factory: Callable[[str, Sequence[int]], Any], minimum_eos: int,
@@ -374,7 +388,8 @@ def calibrate_candidates(
                             failed = {
                                 "source_id": source["id"], "role": role,
                                 "candidate": pair, "status": "failed",
-                                "error_type": type(exc).__name__, "wall_seconds": failed_wall,
+                                "error_type": type(exc).__name__, "error_message": _sanitized_error_message(exc),
+                                "wall_seconds": failed_wall,
                                 "cuda_seconds": None, "stage_signature": stage_signature,
                                 "attempt_id": attempt_id,
                                 "worker_startup_wall_seconds": startup_wall if worker_rows == 0 else 0.0,
@@ -396,7 +411,8 @@ def calibrate_candidates(
                     failed_wall = time.perf_counter() - worker_started
                     failed = {
                         "role": role, "candidate": pair, "status": "worker_load_failed",
-                        "error_type": type(exc).__name__, "wall_seconds": failed_wall,
+                        "error_type": type(exc).__name__, "error_message": _sanitized_error_message(exc),
+                        "wall_seconds": failed_wall,
                         "cuda_seconds": None, "stage_signature": stage_signature,
                         "attempt_id": attempt_id,
                         "worker_startup_wall_seconds": 0.0,
@@ -422,7 +438,8 @@ def calibrate_candidates(
                             close_wall = time.perf_counter() - close_started
                             failed = {
                                 **reservation, "status": "worker_close_failed",
-                                "error_type": type(exc).__name__, "wall_seconds": close_wall,
+                                "error_type": type(exc).__name__, "error_message": _sanitized_error_message(exc),
+                                "wall_seconds": close_wall,
                                 "cuda_seconds": None,
                                 "ended_at_utc": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
                             }

@@ -209,7 +209,7 @@ def test_stage_outcome_is_authenticated_and_scoped(
         assert reconstructed["inherited_costs"]["cuda_seconds"] == 1168
 
 
-@pytest.mark.parametrize("tamper", ["missing", "digest", "context"])
+@pytest.mark.parametrize("tamper", ["missing", "digest", "context", "stage"])
 def test_producer_shaped_result_signature_mismatch_is_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str,
 ):
@@ -220,8 +220,10 @@ def test_producer_shaped_result_signature_mismatch_is_rejected(
         job.result.pop("signature")
     elif tamper == "digest":
         signature["stage_signature"] = "f" * 64
-    else:
+    elif tamper == "context":
         signature["execution_stage_signature"] = "e" * 64
+    else:
+        job.result["stage"] = "prepare"
     job.result = dict(job.result)
     supervise_stage(
         root, "calibrate", repo_root=tmp_path, config_path=tmp_path / "config.toml",
