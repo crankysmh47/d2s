@@ -17,7 +17,7 @@ def _canonical(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
 
-def _execution_fixture(workspace: Path, *, recovery: bool = False) -> dict[str, str]:
+def _execution_fixture(workspace: Path, *, recovery: bool = False, repair: bool = False) -> dict[str, str]:
     spec = importlib.util.spec_from_file_location(
         "distill_task1_fixture", TESTS / "test_distill_execution.py",
     )
@@ -26,7 +26,15 @@ def _execution_fixture(workspace: Path, *, recovery: bool = False) -> dict[str, 
     spec.loader.exec_module(module)
     config = REPO_ROOT / "configs" / "distillation-v1.toml"
     from ppmoe.distill import execution, study
-    if recovery:
+    if repair:
+        from ppmoe.distill.background import register_repair_cli
+        predecessor_id = "b0c082cba66a37f6f49bacc4bee182102b926ac5ac3af4c0a657823213e1802f"
+        source = workspace / "executions" / predecessor_id
+        source.parent.mkdir(parents=True)
+        shutil.copytree(REPO_ROOT / "artifacts" / "distillation-v1-executions" / predecessor_id, source)
+        root = register_repair_cli(source, source.parent, repo_root=REPO_ROOT, config_path=config)
+        source_root = Path(json.loads((source / "execution.json").read_text(encoding="utf-8"))["source_root"])
+    elif recovery:
         from ppmoe.distill.background import register_recovery_cli
         predecessor_id = "fc901bb0766a9c79fb205302d220fe727a99ebbd0b315e6ee4ad4e66e6733634"
         source = workspace / "executions" / predecessor_id
@@ -56,7 +64,7 @@ def _execution_fixture(workspace: Path, *, recovery: bool = False) -> dict[str, 
     runner.write_text(
         "import hashlib,json,sys,time\n"
         "from pathlib import Path\n"
-        "from ppmoe.distill.study import _persist_calibration_terminal,_utc_now\n"
+        "from ppmoe.distill.study import shared_persist_calibration_terminal,_utc_now\n"
         "root=Path(sys.argv[1]); signature=json.loads(sys.argv[2]); manifest=json.loads((root/'execution.json').read_text(encoding='utf-8'))\n"
         "started_at=_utc_now()\n"
         "print('started', flush=True); time.sleep(float(sys.argv[3]))\n"
@@ -66,14 +74,14 @@ def _execution_fixture(workspace: Path, *, recovery: bool = False) -> dict[str, 
         "record={'execution_id':root.name,'stage':'calibrate','stage_signature':signature['stage_signature'],'signature':signature,'status':'awaiting_review','reason':'CPU fixture complete','resource_ledger':{'cuda_seconds':manifest.get('inherited_costs',{}).get('cuda_seconds',1168),'download_bytes':manifest.get('inherited_costs',{}).get('download_bytes',8066699435),'artifact_bytes':packet.stat().st_size},'resource_caps':{'cuda_seconds':86400,'wall_seconds':172800,'download_bytes':21474836480,'artifact_bytes':21474836480},'inherited_artifact_bytes':artifact_baseline_bytes(manifest),'review_packet':'calibration/review/fixture.csv','review_packet_sha256':packet_sha,'private_review_map':'calibration/review/private-map.json'}\n"
         "record.pop('stage',None)\n"
         "reservation_path=root/'stages'/'calibrate-reservations.jsonl'; reservation_path.parent.mkdir(parents=True,exist_ok=True); reservation_path.touch(exist_ok=True)\n"
-        "_persist_calibration_terminal(root,reservation_path,record,started_at=started_at,artifact_cap=record['resource_caps']['artifact_bytes'])\n"
+        "shared_persist_calibration_terminal(root,reservation_path,record,started_at=started_at,artifact_cap=record['resource_caps']['artifact_bytes'])\n"
         "print('finished', flush=True)\n",
         encoding="utf-8",
     )
     fixture = {
         "execution_root": str(root), "repo_root": str(REPO_ROOT),
         "config_path": str(config), "source_root": str(source_root),
-        "schema_version": 2 if recovery else 1,
+        "schema_version": 3 if repair else (2 if recovery else 1),
         "manifest_sha256": study.TASK1_MANIFEST_SHA256 if not recovery else "",
         "prepare_sha256": study.TASK1_PREPARE_SHA256 if not recovery else "",
         "stop_sha256": execution.TASK1_STOP_SHA256 if not recovery else "",
@@ -89,7 +97,7 @@ def _load_fixture(workspace: Path) -> dict[str, str]:
 
 
 def _patch_fixture_constants(fixture: dict[str, str]) -> None:
-    if fixture.get("schema_version") == 2:
+    if fixture.get("schema_version") in {2, 3}:
         return
     from ppmoe.distill import execution, study
 
@@ -163,6 +171,8 @@ def main() -> int:
     prepare.add_argument("--workspace", type=Path, required=True)
     prepare_recovery = sub.add_parser("prepare-recovery")
     prepare_recovery.add_argument("--workspace", type=Path, required=True)
+    prepare_repair = sub.add_parser("prepare-repair")
+    prepare_repair.add_argument("--workspace", type=Path, required=True)
     start = sub.add_parser("start")
     start.add_argument("--workspace", type=Path, required=True)
     start.add_argument("--duration", type=float)
@@ -172,8 +182,10 @@ def main() -> int:
     run.add_argument("--workspace", type=Path, required=True)
     run.add_argument("--attempt-id", required=True)
     args = parser.parse_args()
-    if args.action in {"prepare", "prepare-recovery"}:
-        print(json.dumps(_execution_fixture(args.workspace, recovery=args.action == "prepare-recovery"), sort_keys=True))
+    if args.action in {"prepare", "prepare-recovery", "prepare-repair"}:
+        print(json.dumps(_execution_fixture(
+            args.workspace, recovery=args.action == "prepare-recovery", repair=args.action == "prepare-repair",
+        ), sort_keys=True))
         return 0
     if args.action == "start":
         print(json.dumps(_start(args.workspace, args.duration), sort_keys=True))

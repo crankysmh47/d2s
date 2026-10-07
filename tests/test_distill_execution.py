@@ -325,7 +325,7 @@ def _lifecycle_settlement(start: dict[str, object], *, ended: int) -> dict[str, 
 def _execution_with_events(tmp_path: Path, events: list[dict[str, object]]) -> Path:
     root = tmp_path / "execution"
     root.mkdir()
-    (root / "execution.json").write_bytes(_canonical({"execution_id": "execution-id"}) + b"\n")
+    (root / "execution.json").write_bytes(_canonical({"execution_id": "execution-id", "schema_version": 1}) + b"\n")
     (root / "events.jsonl").touch()
     for event in events:
         append_event(root, event)

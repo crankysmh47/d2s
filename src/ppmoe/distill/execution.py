@@ -99,17 +99,45 @@ def _inventory(root: Path) -> tuple[list[dict[str, Any]], int]:
 
 
 def artifact_baseline_bytes(manifest: Mapping[str, Any]) -> int:
-    """Count the authenticated original baseline and, for schema 2, retained recovery evidence."""
+    """Count the authenticated baseline and each retained authorization exactly once."""
     baseline = manifest.get("artifact_baseline", {})
     total = int(baseline.get("source_bytes", 0)) + sum(
         int(row["size_bytes"]) for row in baseline.get("feasibility_files", [])
     )
-    if manifest.get("schema_version") == 2:
+    if manifest.get("schema_version") in {2, 3}:
         total += int(baseline.get("predecessor_immutable_bytes", 0))
         total += int(baseline.get("predecessor_status_reserve_bytes", 0))
         reservation = baseline.get("authorization_reservation", {})
         total += int(reservation.get("size_bytes", 0))
+    if manifest.get("schema_version") == 3:
+        total += int(baseline.get("repair_predecessor_immutable_bytes", 0))
+        total += int(baseline.get("repair_predecessor_status_reserve_bytes", 0))
+        reservation = baseline.get("repair_authorization_reservation", {})
+        total += int(reservation.get("size_bytes", 0))
     return total
+
+
+def initial_active_seconds(manifest: Mapping[str, Any]) -> int:
+    """Return the strict authenticated initial runtime for a supported manifest schema."""
+    schema = manifest.get("schema_version")
+    if type(schema) is not int:
+        raise ValueError("unsupported execution manifest schema for active clock")
+    if schema == 1:
+        return 0
+    if schema == 2:
+        context = manifest.get("recovery")
+        expected = 31
+    elif schema == 3:
+        context = manifest.get("repair")
+        expected = 60
+    else:
+        raise ValueError("unsupported execution manifest schema for active clock")
+    inherited = manifest.get("inherited_active_seconds")
+    if type(inherited) is not int or inherited != expected or not isinstance(context, Mapping):
+        raise ValueError("execution inherited active clock is missing or unauthenticated")
+    if context.get("inherited_active_seconds") != inherited:
+        raise ValueError("execution inherited active clock differs from its authorization context")
+    return inherited
 
 
 def _validate_old_terminal(source_root: Path, manifest: Mapping[str, Any], config_path: Path, repo_root: Path) -> tuple[Path, str]:
@@ -286,6 +314,10 @@ def validate_execution(execution_root: Path, *, repo_root: Path, config_path: Pa
         from .recovery import validate_recovery_manifest
         validate_recovery_manifest(manifest, repo_root=repo, config_path=config)
         expected_inherited_costs = {"cuda_seconds": 1199, "download_bytes": 8066717862}
+    elif manifest.get("schema_version") == 3:
+        from .repair_recovery import validate_repair_manifest
+        validate_repair_manifest(manifest, repo_root=repo, config_path=config)
+        expected_inherited_costs = {"cuda_seconds": 1228, "download_bytes": 8066717862}
     else:
         raise ValueError("unsupported execution manifest schema")
     if manifest.get("inherited_costs") != expected_inherited_costs:
@@ -380,15 +412,8 @@ def validate_job_intervals(execution_root: Path) -> dict[str, dict[str, Any]]:
 
     jobs: dict[str, dict[str, Any]] = {}
     open_attempt: str | None = None
-    initial_active_seconds = 0
-    if manifest.get("schema_version") == 2:
-        inherited = manifest.get("inherited_active_seconds")
-        recovery = manifest.get("recovery")
-        if (type(inherited) is not int or inherited < 0 or not isinstance(recovery, Mapping)
-                or recovery.get("inherited_active_seconds") != inherited):
-            raise ValueError("execution inherited active clock is missing or unauthenticated")
-        initial_active_seconds = inherited
-    latest_settled_seconds = initial_active_seconds
+    initial_active = initial_active_seconds(manifest)
+    latest_settled_seconds = initial_active
     last_ended_ns: int | None = None
     for event in read_events(root):
         payload = event["payload"]

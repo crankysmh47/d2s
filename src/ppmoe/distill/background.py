@@ -20,6 +20,7 @@ from .execution import (
     active_elapsed_seconds,
     append_event,
     artifact_baseline_bytes,
+    initial_active_seconds,
     process_creation_utc,
     read_events,
     register_execution,
@@ -346,8 +347,8 @@ def _base_status(root: Path, manifest: Mapping[str, Any], jobs: Mapping[str, Map
         state["settled_active_seconds"] for state in jobs.values()
         if state.get("settled_active_seconds") is not None
     ]
-    initial_active_seconds = manifest.get("inherited_active_seconds", 0)
-    used = settled[-1] if settled else initial_active_seconds
+    initial_active = initial_active_seconds(manifest)
+    used = settled[-1] if settled else initial_active
     current = next((state for state in jobs.values() if state.get("settlement") is None), None)
     current_owner_valid = True
     if current is not None:
@@ -669,7 +670,7 @@ def supervise_stage(
             raise RuntimeError(f"stage {stage} already has a settled attempt; review its saved outcome")
         prior = max(
             (int(state["settled_active_seconds"]) for state in intervals.values()),
-            default=int(manifest.get("inherited_active_seconds", 0)),
+            default=initial_active_seconds(manifest),
         )
         if prior >= ACTIVE_RUNTIME_SECONDS:
             raise RuntimeError("cumulative active runtime budget is exhausted")
@@ -988,21 +989,26 @@ def launch_stage(
     ack_path = root / "launches" / f"{attempt_id}.json"
     while time.monotonic() < deadline:
         if ack_path.is_file():
-            ack = json.loads(ack_path.read_text(encoding="utf-8"))
-            if ack.get("attempt_id") != attempt_id or ack.get("supervisor_pid") != expected["pid"] or ack.get("supervisor_created_utc") != expected["created_utc"]:
-                raise RuntimeError("launch acknowledgment does not match this launcher’s supervisor")
-            state = ack.get("state")
-            if state == "running" and process_creation_utc(process.pid) == created:
-                return {"state": "running", "execution_root": str(root), "attempt_id": attempt_id,
-                        "supervisor_pid": process.pid, "supervisor_created_utc": created,
-                        "status_path": str(root / "status.md"), "logs_path": str(root / "logs")}
-            if state in _TERMINAL_STATES or state == "awaiting_review":
-                return {"state": state, "execution_root": str(root), "attempt_id": attempt_id,
-                        "supervisor_pid": process.pid, "supervisor_created_utc": created,
-                        "reason": ack.get("reason"), "status_path": str(root / "status.md"),
-                        "logs_path": str(root / "logs")}
-            if state == "refused":
-                raise RuntimeError(ack.get("reason") or "another supervisor owns this execution")
+            try:
+                ack_text = ack_path.read_text(encoding="utf-8")
+            except (FileNotFoundError, PermissionError):
+                pass
+            else:
+                ack = json.loads(ack_text)
+                if ack.get("attempt_id") != attempt_id or ack.get("supervisor_pid") != expected["pid"] or ack.get("supervisor_created_utc") != expected["created_utc"]:
+                    raise RuntimeError("launch acknowledgment does not match this launcher’s supervisor")
+                state = ack.get("state")
+                if state == "running" and process_creation_utc(process.pid) == created:
+                    return {"state": "running", "execution_root": str(root), "attempt_id": attempt_id,
+                            "supervisor_pid": process.pid, "supervisor_created_utc": created,
+                            "status_path": str(root / "status.md"), "logs_path": str(root / "logs")}
+                if state in _TERMINAL_STATES or state == "awaiting_review":
+                    return {"state": state, "execution_root": str(root), "attempt_id": attempt_id,
+                            "supervisor_pid": process.pid, "supervisor_created_utc": created,
+                            "reason": ack.get("reason"), "status_path": str(root / "status.md"),
+                            "logs_path": str(root / "logs")}
+                if state == "refused":
+                    raise RuntimeError(ack.get("reason") or "another supervisor owns this execution")
         if process.poll() is not None and (root / "terminal.json").is_file():
             terminal = json.loads((root / "terminal.json").read_text(encoding="utf-8"))
             if terminal.get("attempt_id") == attempt_id:
@@ -1045,7 +1051,34 @@ def register_recovery_cli(
         "type": "registered", "execution_id": manifest["execution_id"],
         "created_utc": manifest["created_utc"], "recovery": True,
     })
-    initial = int(manifest["inherited_active_seconds"])
+    initial = initial_active_seconds(manifest)
+    _write_status(root, {
+        "execution_id": manifest["execution_id"], "state": "registered",
+        "runtime_used_seconds": initial,
+        "runtime_remaining_seconds": max(0, ACTIVE_RUNTIME_SECONDS - initial),
+        "reason": None,
+    })
+    return root
+
+
+def register_repair_cli(
+    previous_execution_root: Path,
+    executions_root: Path,
+    *, repo_root: Path,
+    config_path: Path,
+) -> Path:
+    from .repair_recovery import register_repair
+
+    root = register_repair(
+        previous_execution_root, executions_root,
+        repo_root=repo_root, config_path=config_path,
+    )
+    manifest = validate_execution(root, repo_root=repo_root, config_path=config_path)
+    append_event(root, {
+        "type": "registered", "execution_id": manifest["execution_id"],
+        "created_utc": manifest["created_utc"], "repair": True,
+    })
+    initial = initial_active_seconds(manifest)
     _write_status(root, {
         "execution_id": manifest["execution_id"], "state": "registered",
         "runtime_used_seconds": initial,

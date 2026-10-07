@@ -320,7 +320,7 @@ def test_execution_replay_bounds_incomplete_worker_to_settled_job_interval(monke
     root = tmp_path / "execution"
     (root / "calibration" / "raw").mkdir(parents=True)
     (root / "stages").mkdir()
-    (root / "execution.json").write_text('{"execution_id":"execution-id"}', encoding="utf-8")
+    (root / "execution.json").write_text('{"execution_id":"execution-id","schema_version":1}', encoding="utf-8")
     (root / "events.jsonl").touch()
     old_start = 1_000_000_000
     old_end = 5_000_000_000
@@ -1200,6 +1200,8 @@ def test_expired_wall_persists_premodel_stop_without_hub_disk_or_worker(monkeypa
         def __getattr__(self, name):
             raise AssertionError(f"expired stop accessed Hub API {name}")
     monkeypatch.setitem(sys.modules, "huggingface_hub", PoisonHub())
+    frozen_utc = study._utc_now()
+    monkeypatch.setattr(study, "_utc_now", lambda: frozen_utc)
 
     result = study.run_calibration_stage(
         root, config, repo_root=repo_root, config_path=tmp_path / "config.toml",
@@ -1216,8 +1218,10 @@ def test_expired_wall_persists_premodel_stop_without_hub_disk_or_worker(monkeypa
     assert saved["resource_ledger"]["download_bytes"] == 8066699435 + 321
     assert saved["resource_ledger"]["cuda_seconds"] == 1179
     assert saved["originating_git_commit"] == "c" * 40
-    assert saved["started_at_utc"] < saved["ended_at_utc"]
-    assert any(item.get("event_type") == "terminal" and item.get("status") == "stopped_environment" for item in events)
+    assert saved["started_at_utc"] == saved["ended_at_utc"] == frozen_utc
+    terminal_event = next(item for item in events if item.get("event_type") == "terminal")
+    assert terminal_event["status"] == "stopped_environment"
+    assert terminal_event["started_at_utc"] == terminal_event["ended_at_utc"] == frozen_utc
     with pytest.raises(FileExistsError, match="immutable"):
         study.run_calibration_stage(root, config, repo_root=repo_root, config_path=tmp_path / "config.toml")
 

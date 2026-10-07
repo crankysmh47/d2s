@@ -9,7 +9,8 @@ import sys
 from typing import Sequence
 
 from ppmoe.distill.background import (
-    execution_status, launch_stage, register_execution_cli, register_recovery_cli, supervise_stage,
+    execution_status, launch_stage, register_execution_cli, register_recovery_cli,
+    register_repair_cli, supervise_stage,
 )
 
 
@@ -26,6 +27,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     recover.add_argument("--executions-root", type=Path, required=True)
     recover.add_argument("--config", type=Path, required=True)
     recover.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
+    repair = subparsers.add_parser("register-repair")
+    repair.add_argument("--previous-execution-root", type=Path, required=True)
+    repair.add_argument("--executions-root", type=Path, required=True)
+    repair.add_argument("--config", type=Path, required=True)
+    repair.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     launch = subparsers.add_parser("launch")
     launch.add_argument("stage")
     launch.add_argument("--config", type=Path, required=True)
@@ -52,6 +58,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.action == "register-recovery":
             root = register_recovery_cli(
+                args.previous_execution_root, args.executions_root,
+                repo_root=args.repo_root, config_path=args.config,
+            )
+            print(json.dumps({"execution_root": str(root), "status_path": str(root / "status.md")}, sort_keys=True))
+            return 0
+        if args.action == "register-repair":
+            root = register_repair_cli(
                 args.previous_execution_root, args.executions_root,
                 repo_root=args.repo_root, config_path=args.config,
             )

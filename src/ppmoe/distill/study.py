@@ -69,11 +69,13 @@ EXECUTION_COMMON_FILES = (
     "src/ppmoe/distill/execution.py",
     "src/ppmoe/distill/background.py",
     "src/ppmoe/distill/recovery.py",
+    "src/ppmoe/distill/repair_recovery.py",
     "src/ppmoe/distill/windows_job.py",
     "scripts/run_distillation_background.py",
     "tests/test_distill_execution.py",
     "tests/test_distill_background.py",
     "tests/test_distill_recovery.py",
+    "tests/test_distill_repair_recovery.py",
     "tests/test_distill_windows_job.py",
     "tests/distill_background_cpu_fixture.py",
     "tests/test_distill_evaluate.py",
@@ -540,7 +542,7 @@ def _resource_limit_reason(ledger: ResourceLedger) -> str | None:
     return None
 
 
-def _persist_calibration_terminal(
+def shared_persist_calibration_terminal(
     root: Path, reservation_path: Path, result: dict[str, Any], *,
     started_at: str, artifact_cap: int,
 ) -> dict[str, Any]:
@@ -583,6 +585,16 @@ def _persist_calibration_terminal(
     _append_stage_event(reservation_path, terminal_event)
     atomic_write_json(stage_path(root, "calibrate"), result)
     return result
+
+
+def _persist_calibration_terminal(
+    root: Path, reservation_path: Path, result: dict[str, Any], *,
+    started_at: str, artifact_cap: int,
+) -> dict[str, Any]:
+    """Compatibility wrapper for the shared calibration terminal contract."""
+    return shared_persist_calibration_terminal(
+        root, reservation_path, result, started_at=started_at, artifact_cap=artifact_cap,
+    )
 
 
 def _persist_pre_model_stop(
