@@ -273,7 +273,7 @@ def _sanitized_error_message(exc: Exception) -> str:
     message = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer [REDACTED]", message)
     message = re.sub(r"\bhf_[A-Za-z0-9]{20,}\b", "hf_[REDACTED]", message)
     message = re.sub(
-        r"(?i)\b(token|password)\s*[:=]\s*[^\s,;]+",
+        r"(?i)\b(token|password|secret)\s*[:=]\s*[^\s,;]+",
         lambda match: f"{match.group(1)}=[REDACTED]",
         message,
     )

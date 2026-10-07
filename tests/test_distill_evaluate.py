@@ -202,15 +202,20 @@ def test_aggregate_worker_retry_exhaustion_is_environment_stop(unexpired_test_le
     assert result["status"] == "stopped_environment"
 
 
+@pytest.mark.parametrize(
+    ("secret_assignment", "secret_value"),
+    [("secret=abc123", "abc123"), ("secret: xyz789", "xyz789")],
+)
 def test_worker_load_failure_journal_keeps_bounded_redacted_actionable_message(
     tmp_path: Path, unexpired_test_ledger: ResourceLedger,
+    secret_assignment: str, secret_value: str,
 ) -> None:
     from ppmoe.distill.evaluate import RawRowJournal
 
     journal = RawRowJournal(tmp_path / "rows.jsonl", expected_ids=["x"], stage_signature="sig")
     message = (
         "isolated model worker failed: ValueError: actionable load cause; Bearer abcdef "
-        f"hf_{'a' * 30} token=secretvalue password: secretvalue " + "x" * 10000
+        f"hf_{'a' * 30} token=secretvalue password: secretvalue {secret_assignment} " + "x" * 10000
     )
 
     def broken_factory(_role, _candidate):
@@ -232,8 +237,10 @@ def test_worker_load_failure_journal_keeps_bounded_redacted_actionable_message(
     assert "hf_[REDACTED]" in failed["error_message"]
     assert "token=[REDACTED]" in failed["error_message"]
     assert "password=[REDACTED]" in failed["error_message"]
+    assert "secret=[REDACTED]" in failed["error_message"]
     assert "abcdef" not in failed["error_message"]
     assert "secretvalue" not in failed["error_message"]
+    assert secret_value not in failed["error_message"]
     assert "a" * 30 not in failed["error_message"]
     assert len(failed["payload_sha256"]) == 64
 
