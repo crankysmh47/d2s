@@ -306,6 +306,11 @@ def test_stage_outcome_is_authenticated_and_scoped(
             event["payload"]["artifact_sha256"] for event in events
             if event["payload"].get("type") == "attempt_result"
         )
+        result_envelope = next(
+            event for event in events if event["payload"].get("type") == "attempt_result"
+        )
+        assert reconstructed["cost_provenance"]["result_event_digest"] == result_envelope["payload_sha256"]
+        assert reconstructed["cost_provenance"]["result_event_digest"] != result_envelope["payload"]["artifact_sha256"]
         markdown = (root / "status.md").read_text(encoding="utf-8")
         assert "CUDA" in markdown and "Download" in markdown and "Review packet" in markdown
         assert "private_review_map" not in markdown

@@ -387,10 +387,11 @@ def _base_status(root: Path, manifest: Mapping[str, Any], jobs: Mapping[str, Map
             used = active_elapsed_seconds(context)
     limit = int(manifest["policy"]["active_runtime_seconds"])
     last_event = events[-1]["payload"] if events else {}
-    result_event = next((
-        item["payload"] for item in reversed(events)
+    result_envelope = next((
+        item for item in reversed(events)
         if item["payload"].get("type") == "attempt_result"
     ), None)
+    result_event = result_envelope["payload"] if result_envelope is not None else None
     artifact: dict[str, Any] | None = None
     artifact_diagnostic: str | None = None
     artifact_authenticated = False
@@ -463,7 +464,7 @@ def _base_status(root: Path, manifest: Mapping[str, Any], jobs: Mapping[str, Map
         status["diagnostic"] = artifact_diagnostic
     status["cost_provenance"].update({
         "attempt_id": result_event.get("attempt_id") if result_event else None,
-        "result_event_digest": result_event.get("artifact_sha256") if result_event else None,
+        "result_event_digest": result_envelope.get("payload_sha256") if result_envelope else None,
         "result_state": result_event.get("state") if result_event else None,
     })
     if state_name == "stopped_environment" and current is not None and reason and "uncertain" in reason:

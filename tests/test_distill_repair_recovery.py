@@ -72,6 +72,11 @@ def test_schema3_pre_model_stop_uses_real_manifest_clock_and_cost_seed(tmp_path:
     from ppmoe.distill.background import _base_status
 
     root, manifest = _real_schema3_execution(tmp_path)
+    reservation_history = root / "stages" / "calibrate-reservations.jsonl"
+    reservation_history.write_text(json.dumps({
+        "event_type": "download_reservation", "status": "reserved",
+        "reserved_bytes": 37, "stage": "calibrate", "role": "student",
+    }) + "\n", encoding="utf-8")
     projection = _base_status(root, manifest, {}, events=[])
     assert projection["runtime_used_seconds"] == 60
     assert projection["runtime_remaining_seconds"] == 172740
@@ -99,7 +104,13 @@ def test_schema3_pre_model_stop_uses_real_manifest_clock_and_cost_seed(tmp_path:
 
     assert result["status"] == "stopped_environment"
     assert result["resource_ledger"]["cuda_seconds"] == 1228
-    assert result["resource_ledger"]["download_bytes"] == 8066717862
+    assert result["resource_ledger"]["download_bytes"] == 8066717862 + 37
+    reservations = [json.loads(line) for line in reservation_history.read_text(encoding="utf-8").splitlines()]
+    stage_reservation = next(item for item in reservations if item.get("event_type") == "reservation")
+    assert stage_reservation["initial_cuda_seconds"] == 1228
+    assert stage_reservation["initial_download_bytes"] == 8066717862
+    resource_stop = next(item for item in reservations if item.get("event_type") == "resource_stop")
+    assert resource_stop["resource_ledger"]["download_bytes"] == 8066717862 + 37
     saved = json.loads((root / "stages/calibrate.json").read_text(encoding="utf-8"))
     assert saved["inherited_artifact_bytes"] == 2094882 + manifest["artifact_baseline"]["repair_authorization_reservation"]["size_bytes"]
     assert saved["resource_ledger"]["wall_seconds"] >= 60

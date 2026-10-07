@@ -601,11 +601,16 @@ def _persist_pre_model_stop(
     root: Path, reservation_path: Path, *, config: Any, manifest_hash: str,
     prepare_hash: str, originating_commit: str, started_at: str,
     signature_record: Mapping[str, Any], ledger: ResourceLedger,
+    inherited_costs: Mapping[str, Any] | None = None,
     reason: str, detail: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     stage_signature = str(signature_record["stage_signature"])
     inventory_status = str((detail or {}).get("model_inventory_status", "not_authenticated"))
     if not any(item.get("event_type") == "reservation" for item in _read_stage_events(reservation_path)):
+        initial_ledger = (
+            _initial_resource_ledger() if inherited_costs is None
+            else _initial_resource_ledger(inherited_costs=inherited_costs)
+        )
         _append_stage_event(reservation_path, {
             "status": "reserved", "event_type": "reservation", "event_id": uuid4().hex,
             "stage": "calibrate", "stage_signature": stage_signature,
@@ -614,6 +619,8 @@ def _persist_pre_model_stop(
             "signature": dict(signature_record),
             "config": canonical_config(config), "phase_state": "pre_model",
             "model_inventory_status": inventory_status,
+            "initial_cuda_seconds": initial_ledger.cuda_seconds,
+            "initial_download_bytes": initial_ledger.download_bytes,
         })
     _append_stage_event(reservation_path, {
         "status": "stopped_environment", "event_type": "resource_stop", "event_id": uuid4().hex,
@@ -658,6 +665,7 @@ def _refresh_pre_model_ledger(
     root: Path, reservation_path: Path, *, config: Any, manifest_hash: str,
     prepare_hash: str, originating_commit: str, started_at: str,
     signature_record: Mapping[str, Any], ledger: ResourceLedger,
+    inherited_costs: Mapping[str, Any] | None = None,
     detail: Mapping[str, Any],
 ) -> tuple[ResourceLedger, dict[str, Any] | None]:
     """Refresh the wall boundary and durably stop if the refresh crosses a cap."""
@@ -671,7 +679,7 @@ def _refresh_pre_model_ledger(
             root, reservation_path, config=config, manifest_hash=manifest_hash,
             prepare_hash=prepare_hash, originating_commit=originating_commit,
             started_at=started_at, signature_record=signature_record,
-            ledger=attempted, reason=str(exc), detail=detail,
+            ledger=attempted, inherited_costs=inherited_costs, reason=str(exc), detail=detail,
         )
     reason = _resource_limit_reason(refreshed)
     if reason:
@@ -679,7 +687,7 @@ def _refresh_pre_model_ledger(
             root, reservation_path, config=config, manifest_hash=manifest_hash,
             prepare_hash=prepare_hash, originating_commit=originating_commit,
             started_at=started_at, signature_record=signature_record,
-            ledger=refreshed, reason=reason, detail=detail,
+            ledger=refreshed, inherited_costs=inherited_costs, reason=reason, detail=detail,
         )
     return refreshed, None
 
@@ -811,14 +819,14 @@ def run_calibration_stage(
             root, reservation_path, config=config, manifest_hash=manifest_hash,
             prepare_hash=prepare_hash, originating_commit=originating_commit,
             started_at=started_at, signature_record=signature_record,
-            ledger=pre_model_ledger, reason=resource_reason,
+            ledger=pre_model_ledger, inherited_costs=inherited_costs, reason=resource_reason,
             detail={"phase": "preflight", "model_inventory_status": "not_authenticated"},
         )
     pre_model_ledger, refresh_stop = _refresh_pre_model_ledger(
         root, reservation_path, config=config, manifest_hash=manifest_hash,
         prepare_hash=prepare_hash, originating_commit=originating_commit,
         started_at=started_at, signature_record=signature_record,
-        ledger=pre_model_ledger,
+        ledger=pre_model_ledger, inherited_costs=inherited_costs,
         detail={"phase": "disk_preflight", "model_inventory_status": "not_authenticated"},
     )
     if refresh_stop is not None:
@@ -831,7 +839,7 @@ def run_calibration_stage(
             root, reservation_path, config=config, manifest_hash=manifest_hash,
             prepare_hash=prepare_hash, originating_commit=originating_commit,
             started_at=started_at, signature_record=signature_record,
-            ledger=attempted_ledger, reason=str(exc),
+            ledger=attempted_ledger, inherited_costs=inherited_costs, reason=str(exc),
             detail={"phase": "disk_preflight", "model_inventory_status": "not_authenticated"},
         )
     from huggingface_hub import HfApi, hf_hub_download, snapshot_download
@@ -850,7 +858,7 @@ def run_calibration_stage(
             root, reservation_path, config=config, manifest_hash=manifest_hash,
             prepare_hash=prepare_hash, originating_commit=originating_commit,
             started_at=started_at, signature_record=signature_record,
-            ledger=pre_model_ledger,
+            ledger=pre_model_ledger, inherited_costs=inherited_costs,
             detail={"phase": "model_metadata", "role": role,
                     "model_inventory_status": "not_authenticated"},
         )
@@ -901,7 +909,8 @@ def run_calibration_stage(
                         root, reservation_path, config=config, manifest_hash=manifest_hash,
                         prepare_hash=prepare_hash, originating_commit=originating_commit,
                         started_at=started_at, signature_record=signature_record,
-                        ledger=attempted_ledger, reason=f"student projected download exceeds resource budget: {exc}",
+                        ledger=attempted_ledger, inherited_costs=inherited_costs,
+                        reason=f"student projected download exceeds resource budget: {exc}",
                         detail={"phase": "model_source_preflight", "role": role,
                                 "estimated_download_bytes": estimated,
                                 "model_inventory_status": "not_authenticated"},
@@ -911,7 +920,8 @@ def run_calibration_stage(
                         root, reservation_path, config=config, manifest_hash=manifest_hash,
                         prepare_hash=prepare_hash, originating_commit=originating_commit,
                         started_at=started_at, signature_record=signature_record,
-                        ledger=pre_model_ledger, reason="insufficient disk for the pinned student model snapshot",
+                        ledger=pre_model_ledger, inherited_costs=inherited_costs,
+                        reason="insufficient disk for the pinned student model snapshot",
                         detail={"phase": "student_download_preflight", "estimated_download_bytes": estimated,
                                 "disk_free_bytes": shutil.disk_usage(repo_root).free,
                                 "model_inventory_status": "not_authenticated"},
@@ -963,7 +973,8 @@ def run_calibration_stage(
                         root, reservation_path, config=config, manifest_hash=manifest_hash,
                         prepare_hash=prepare_hash, originating_commit=originating_commit,
                         started_at=started_at, signature_record=signature_record,
-                        ledger=attempted_ledger, reason=f"teacher projected download exceeds resource budget: {exc}",
+                        ledger=attempted_ledger, inherited_costs=inherited_costs,
+                        reason=f"teacher projected download exceeds resource budget: {exc}",
                         detail={"phase": "model_source_preflight", "role": role,
                                 "estimated_download_bytes": estimated,
                                 "missing_files": missing_names,
@@ -975,7 +986,8 @@ def run_calibration_stage(
                         root, reservation_path, config=config, manifest_hash=manifest_hash,
                         prepare_hash=prepare_hash, originating_commit=originating_commit,
                         started_at=started_at, signature_record=signature_record,
-                        ledger=pre_model_ledger, reason="insufficient disk for missing pinned teacher metadata",
+                        ledger=pre_model_ledger, inherited_costs=inherited_costs,
+                        reason="insufficient disk for missing pinned teacher metadata",
                         detail={"phase": "teacher_download_preflight", "estimated_download_bytes": estimated,
                                 "missing_files": missing_names,
                                 "disk_free_bytes": shutil.disk_usage(repo_root).free,
@@ -1053,7 +1065,7 @@ def run_calibration_stage(
             root, reservation_path, config=config, manifest_hash=manifest_hash,
             prepare_hash=prepare_hash, originating_commit=originating_commit,
             started_at=started_at, signature_record=signature_record,
-            ledger=pre_model_ledger, reason=str(exc),
+            ledger=pre_model_ledger, inherited_costs=inherited_costs, reason=str(exc),
             detail={"phase": "post_source_disk_preflight", "model_inventory_status": "authenticated"},
         )
     rows = load_split(source_root, "calibration")
