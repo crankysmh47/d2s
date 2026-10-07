@@ -12,6 +12,8 @@ Plan: [revision 3](superpowers/plans/2026-09-27-verified-distillation-qlora.md).
 
 ## Task status
 
+**Recovery authorization — 2026-10-07:** user approved the recommended bounded repair, independent review and one new evidence-linked execution. [Recovery design](superpowers/specs/2026-10-07-distillation-recovery-design.md) and [implementation plan](superpowers/plans/2026-10-07-distillation-recovery.md) retain all scientific gates. The original stop below remains immutable. Recovery starts with31 already-spent active seconds,1199 conservative cumulative CUDA seconds (1168 +full31-second failed job),8066717862 downloads and retained artifact costs; caps are not reset. Repairs/review are in progress; no recovery registration or second production launch yet.
+
 **Current state — 2026-10-07 01:39 UTC:** the whole-change engineering review cleared, one separate production execution was registered and launched, and it is now terminal `stopped_environment`. It is **not running** and calibration did not pass. Historical milestone paragraphs below are chronological evidence, not the current state.
 
 Execution: `artifacts/distillation-v1-executions/fc901bb0766a9c79fb205302d220fe727a99ebbd0b315e6ee4ad4e66e6733634`; attempt `dd45bbdd2ecf45cb8d8fcc653132ee0a`. Launch on `1c867f8` at `2026-10-07T01:34:54Z` returned a live supervisor ACK; a separate terminal check verified supervisor3916/stage30236 continuing after launcher exit. The authenticated lifecycle settled **31 active seconds**; terminal end `2026-10-07T01:35:24.309082Z`, remaining172769 seconds. Later read-only process checks found none of the recorded supervisor/stage/model-worker PIDs alive. This proves background lifetime and saved failure evidence, not successful calibration.
